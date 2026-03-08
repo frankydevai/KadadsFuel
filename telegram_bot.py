@@ -134,38 +134,54 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
                          alt_stop: dict | None,
                          savings_usd: float | None) -> int | None:
 
-    emoji   = _urgency_emoji(fuel_pct)
-    compass = _compass(heading)
+    emoji     = _urgency_emoji(fuel_pct)
     truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
+    compass   = _compass(heading)
 
     lines = [
-        f"{emoji} *LOW FUEL ALERT — {vehicle_name}*",
-        f"─────────────────────────────",
-        f"🚛 Truck:      *{vehicle_name}*",
-        f"⛽ Fuel:       *{fuel_pct:.0f}%*",
-        f"📍 Location:  [{truck_lat:.4f}, {truck_lng:.4f}]({truck_url})",
-        f"🧭 {speed_mph:.0f} mph · heading {compass}",
+        f"{emoji} *Low Fuel Alert*",
+        "",
+        f"🚛 Truck:          *{vehicle_name}*",
+        f"⛽ Current fuel:  *{fuel_pct:.0f}%*",
+        f"📍 [{truck_lat:.4f}, {truck_lng:.4f}]({truck_url})  ·  {speed_mph:.0f} mph {compass}",
     ]
 
     if best_stop:
-        lines.append(f"─────────────────────────────")
-        lines.append(f"🏁 *Nearest Cheapest Stop:*")
-        lines.append(_format_stop_card(best_stop))
+        name    = best_stop.get("store_name", "Unknown")
+        address = best_stop.get("address", "")
+        city    = best_stop.get("city", "")
+        state   = best_stop.get("state", "")
+        zip_    = best_stop.get("zip", "")
+        dist    = best_stop.get("distance_miles", 0)
+        price   = best_stop.get("diesel_price")
+        lat     = best_stop.get("latitude")
+        lng     = best_stop.get("longitude")
+
+        full_address = ", ".join(filter(None, [address, city, state, zip_]))
+        maps_url     = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None
+
+        lines += [
+            "",
+            "*Recommended Fuel Stop*",
+            f"*{name}*",
+            f"Address: {full_address}",
+            f"{dist:.1f} mi away",
+            f"Diesel #2: *${price:.3f}/gal*" if price else "Diesel #2: Price N/A",
+        ]
+        if maps_url:
+            lines.append(f"🗺 [Open in Google Maps]({maps_url})")
     else:
-        lines.append(f"─────────────────────────────")
-        lines.append("❌ No diesel stops found within range.")
-        lines.append("📞 Dispatcher notified.")
+        lines += [
+            "",
+            "❌ No diesel stops found within range.",
+            "📞 Dispatcher notified.",
+        ]
+        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND")
 
-    chat_id = DISPATCHER_GROUP_ID
-    msg_id  = _send_to(chat_id, "\n".join(lines))
+    if fuel_pct <= 15 and best_stop:
+        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — critically low at {fuel_pct:.0f}%")
 
-    if not best_stop or fuel_pct <= 15:
-        _send_to_dispatcher(
-            f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% fuel"
-            + (" — NO STOP FOUND" if not best_stop else "")
-        )
-
-    return msg_id
+    return _send_to(DISPATCHER_GROUP_ID, "\n".join(lines))
 
 
 def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
@@ -343,10 +359,6 @@ def poll_for_uploads() -> None:
 
             if count > 0:
                 log.info(f"Admin uploaded {filename} — {count} stops updated.")
-                _send_to_dispatcher(
-                    f"⛽ *Fuel prices updated by admin*\n"
-                    f"File: `{filename}`  ·  {count} stops loaded"
-                )
 
     except Exception as e:
         log.error(f"poll_for_uploads error: {e}", exc_info=True)

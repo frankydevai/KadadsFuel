@@ -23,6 +23,31 @@ URGENCY TIERS:
   <10%    EMERGENCY  Absolute nearest stop, price ignored
 """
 
+"""
+truck_stop_finder.py  -  Find the best 2 diesel stops for a truck.
+
+SCORING:
+  Uses true cost formula — not just cheapest price or nearest stop.
+
+  true_cost = (diesel_price × gallons_to_fill)
+            + (detour_miles × 2 × diesel_price / mpg)
+
+  This means a stop that is cheaper but far off-route might actually
+  cost MORE than a slightly pricier stop that is directly on the route.
+
+CORRIDOR:
+  For MOVING trucks, only considers stops within CORRIDOR_WIDTH_MILES
+  either side of the truck's heading direction, up to SEARCH_CORRIDOR_MILES.
+  Stops behind the truck get a distance penalty instead of being excluded,
+  to handle bad heading data from Samsara gracefully.
+
+URGENCY TIERS:
+  35–26%  ADVISORY   Search full corridor, price-optimized
+  25–16%  WARNING    Shorter corridor, still price-optimized
+  15–10%  CRITICAL   Nearest reachable stop, price ignored
+  <10%    EMERGENCY  Absolute nearest stop, price ignored
+"""
+
 import math
 import logging
 from config import (
@@ -97,11 +122,17 @@ def get_urgency(fuel_pct: float) -> str:
 
 def get_search_radius(urgency: str) -> float:
     return {
-        "ADVISORY":  SEARCH_CORRIDOR_MILES,
-        "WARNING":   150.0,
-        "CRITICAL":  80.0,
-        "EMERGENCY": 50.0,
+        "ADVISORY":  50.0,    # 35-26% — 50mi ahead, price-optimize
+        "WARNING":   80.0,    # 25-16% — 80mi
+        "CRITICAL":  120.0,   # 15-10% — 120mi nearest reachable
+        "EMERGENCY": 150.0,   # <10%   — 150mi absolute nearest
     }[urgency]
+
+
+def reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
+    """How far the truck can actually drive on current fuel (minus 10% reserve)."""
+    usable = usable_gallons(fuel_pct, tank_gal)
+    return usable * mpg
 
 
 # -- Usable range -------------------------------------------------------------
@@ -149,6 +180,103 @@ def true_cost(stop: dict, truck_lat: float, truck_lng: float,
 
 # -- Main finder --------------------------------------------------------------
 
+def find_current_stop(truck_lat: float, truck_lng: float) -> dict | None:
+    """
+    Check if truck is currently parked at a known fuel stop.
+    Returns the stop dict if found, None otherwise.
+    """
+    all_stops = get_all_diesel_stops()
+    for stop in all_stops:
+        dist = haversine_miles(truck_lat, truck_lng,
+                               float(stop["latitude"]), float(stop["longitude"]))
+        if dist <= _AT_STOP_RADIUS:
+            slat = float(stop["latitude"])
+            slng = float(stop["longitude"])
+            return {
+                **stop,
+                "distance_miles":  round(dist, 2),
+                "detour_miles":    0.0,
+                "fill_cost":       0.0,
+                "true_cost":       0.0,
+                "_score":          0.0,
+                "_ahead":          True,
+                "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
+            }
+    return None
+
+
+_NEARBY_SEARCH_MILES = 20   # radius to compare prices when already at a stop
+_MIN_SAVINGS_PER_GAL = 0.05 # only recommend nearby if saves at least 5 cents/gal
+
+
+def find_cheaper_nearby(truck_lat: float, truck_lng: float,
+                         current_stop: dict,
+                         fuel_pct: float,
+                         tank_gal: float = DEFAULT_TANK_GAL,
+                         mpg: float = DEFAULT_MPG) -> dict | None:
+    """
+    When truck is already parked at a fuel stop, check if there is a
+    cheaper stop within _NEARBY_SEARCH_MILES. Returns the cheaper stop
+    if the savings are worth the detour, otherwise None.
+    """
+    current_price = current_stop.get("diesel_price")
+    if not current_price or current_price <= 0:
+        return None
+
+    all_stops = get_all_diesel_stops()
+    candidates = []
+
+    for stop in all_stops:
+        # Skip current stop itself
+        if stop.get("id") == current_stop.get("id"):
+            continue
+
+        slat = float(stop["latitude"])
+        slng = float(stop["longitude"])
+        dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+
+        if dist > _NEARBY_SEARCH_MILES:
+            continue
+
+        price = stop.get("diesel_price")
+        if not price or price <= 0:
+            continue
+
+        # Must be meaningfully cheaper
+        if current_price - price < _MIN_SAVINGS_PER_GAL:
+            continue
+
+        fill_gal     = gallons_to_fill(fuel_pct, tank_gal)
+        # true savings = price difference × gallons, minus detour fuel cost
+        detour_cost  = dist * 2 * price / mpg   # drive there and back
+        gross_saving = (current_price - price) * fill_gal
+        net_saving   = gross_saving - detour_cost
+
+        if net_saving <= 0:
+            continue
+
+        candidates.append({
+            **stop,
+            "distance_miles":  round(dist, 2),
+            "detour_miles":    round(dist, 2),
+            "fill_cost":       round(price * fill_gal, 2),
+            "true_cost":       round(price * fill_gal + detour_cost, 2),
+            "net_saving":      round(net_saving, 2),
+            "_score":          -net_saving,   # best = highest net saving
+            "_ahead":          True,
+            "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
+        })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda s: s["_score"])
+    best = candidates[0]
+    log.info(f"Cheaper nearby stop: {best['store_name']} ${best['diesel_price']:.3f} "
+             f"vs current ${current_price:.3f} — saves ${best['net_saving']:.2f}")
+    return best
+
+
 def find_best_stops(
     truck_lat: float,
     truck_lng: float,
@@ -170,22 +298,21 @@ def find_best_stops(
         log.warning("No diesel stops in database.")
         return None, None
 
-    parked   = speed_mph <= _PARKED_SPEED_MPH
-    urgency  = get_urgency(fuel_pct)
-    radius   = get_search_radius(urgency)
+    parked        = speed_mph <= _PARKED_SPEED_MPH
+    urgency       = get_urgency(fuel_pct)
+    radius        = get_search_radius(urgency)
     price_matters = urgency in ("ADVISORY", "WARNING")
+    max_range     = reachable_miles(fuel_pct, tank_gal, mpg)
 
     log.info(f"Stop finder: urgency={urgency} radius={radius:.0f}mi "
-             f"parked={parked} stops_in_db={len(all_stops)}")
+             f"range={max_range:.0f}mi parked={parked} stops_in_db={len(all_stops)}")
 
-    # -- Already at a stop? ---------------------------------------------------
+    # -- Already at a stop? — return it so alert can show current stop ---------
     if parked:
-        for stop in all_stops:
-            dist = haversine_miles(truck_lat, truck_lng,
-                                   float(stop["latitude"]), float(stop["longitude"]))
-            if dist <= _AT_STOP_RADIUS:
-                log.info(f"Truck already at {stop['store_name']} ({dist*5280:.0f} ft)")
-                return None, None  # signal: already at stop, no alert needed
+        current = find_current_stop(truck_lat, truck_lng)
+        if current:
+            log.info(f"Truck already at {current['store_name']} ({current['distance_miles']*5280:.0f} ft)")
+            return current, None
 
     # -- Score all stops in range --------------------------------------------
     candidates = []
@@ -194,11 +321,13 @@ def find_best_stops(
         slng = float(stop["longitude"])
 
         dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+
+        # Must be within search radius AND physically reachable
         if dist > radius:
             continue
+        if dist > max_range:
+            continue
 
-        # For moving trucks: penalise stops behind rather than exclude
-        # (handles bad heading data gracefully)
         ahead = True
         if not parked and truck_heading is not None:
             bear  = bearing(truck_lat, truck_lng, slat, slng)
@@ -213,8 +342,14 @@ def find_best_stops(
         tc        = true_cost(stop, truck_lat, truck_lng,
                               truck_heading or 0, fuel_pct, tank_gal, mpg)
 
-        # Penalty for stops behind truck
-        score = tc if price_matters else dist
+        # Parked: nearest. Moving+price matters: true cost. Critical: distance.
+        if parked:
+            score = dist
+        elif price_matters:
+            score = tc
+        else:
+            score = dist
+
         if not ahead:
             score += BEHIND_PENALTY_MILES * (stop.get("diesel_price") or 4.0)
 
@@ -229,8 +364,42 @@ def find_best_stops(
             "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
         })
 
+    # If nothing found in urgency radius — expand by 30mi steps up to max_range
     if not candidates:
-        log.warning(f"No stops found within {radius:.0f} miles.")
+        expand_radius = radius + 30
+        while not candidates and expand_radius <= max_range:
+            log.warning(f"No stops in {expand_radius - 30:.0f}mi — expanding to {expand_radius:.0f}mi")
+            for stop in all_stops:
+                slat = float(stop["latitude"])
+                slng = float(stop["longitude"])
+                dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+                if dist > expand_radius:
+                    continue
+                ahead = True
+                if not parked and truck_heading is not None:
+                    bear  = bearing(truck_lat, truck_lng, slat, slng)
+                    ahead = angle_diff(truck_heading, bear) <= _AHEAD_ARC_DEGREES
+                detour_mi = perpendicular_distance(truck_lat, truck_lng, truck_heading or 0, slat, slng) if not parked else 0.0
+                fill_gal  = gallons_to_fill(fuel_pct, tank_gal)
+                fill_cost = (stop["diesel_price"] or 0) * fill_gal
+                tc        = true_cost(stop, truck_lat, truck_lng, truck_heading or 0, fuel_pct, tank_gal, mpg)
+                score     = dist if not ahead else (tc if price_matters else dist)
+                if not ahead:
+                    score += BEHIND_PENALTY_MILES * (stop.get("diesel_price") or 4.0)
+                candidates.append({
+                    **stop,
+                    "distance_miles":  round(dist, 2),
+                    "detour_miles":    round(detour_mi, 2),
+                    "fill_cost":       round(fill_cost, 2),
+                    "true_cost":       tc,
+                    "_score":          score,
+                    "_ahead":          ahead,
+                    "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
+                })
+            expand_radius += 30
+
+    if not candidates:
+        log.warning(f"No reachable stops found within {max_range:.0f} miles.")
         return None, None
 
     # Sort by score (true cost for price-matters, distance for critical/emergency)

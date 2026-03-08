@@ -5,6 +5,13 @@ All alerts go to the truck's own Telegram group.
 Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
 """
 
+"""
+telegram_bot.py  -  Telegram message sending for FleetFuel bot.
+
+All alerts go to the truck's own Telegram group.
+Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
+"""
+
 import time
 import logging
 import requests
@@ -216,6 +223,64 @@ def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
     return _send_to(DISPATCHER_GROUP_ID, "\n".join(lines))
 
 
+def send_at_stop_alert(vehicle_name: str, fuel_pct: float,
+                        truck_lat: float, truck_lng: float,
+                        current_stop: dict,
+                        cheaper_stop: dict | None = None) -> None:
+    """Alert when truck is already parked at a Pilot/Love's/Flying J."""
+    emoji     = _urgency_emoji(fuel_pct)
+    truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
+
+    def _stop_lines(stop, label):
+        name    = stop.get("store_name", "Unknown")
+        address = stop.get("address", "")
+        city    = stop.get("city", "")
+        state_  = stop.get("state", "")
+        zip_    = stop.get("zip", "")
+        price   = stop.get("diesel_price")
+        dist    = stop.get("distance_miles", 0)
+        lat     = stop.get("latitude")
+        lng     = stop.get("longitude")
+        full_address = ", ".join(filter(None, [address, city, state_, zip_]))
+        maps_url     = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None
+        lines = [
+            label,
+            f"*{name}*",
+            f"Address: {full_address}",
+        ]
+        if dist and dist > 0.1:
+            lines.append(f"📏 {dist:.1f} mi away")
+        lines.append(f"Diesel #2: *${price:.3f}/gal*" if price else "Diesel #2: Price N/A")
+        if maps_url:
+            lines.append(f"🗺 [Open in Google Maps]({maps_url})")
+        return lines
+
+    lines = [
+        f"{emoji} *Low Fuel Alert*",
+        "",
+        f"🚛 Truck:          *{vehicle_name}*",
+        f"⛽ Current fuel:  *{fuel_pct:.0f}%*",
+        f"📍 [{truck_lat:.4f}, {truck_lng:.4f}]({truck_url})",
+        "",
+    ]
+
+    if cheaper_stop:
+        net_saving = cheaper_stop.get("net_saving", 0)
+        cur_price  = current_stop.get("diesel_price", 0)
+        chp_price  = cheaper_stop.get("diesel_price", 0)
+        lines += _stop_lines(current_stop, "🅿️ *Currently stopped at:*")
+        lines += [
+            "",
+            f"💡 *Cheaper stop nearby — saves ~${net_saving:.2f}:*",
+        ]
+        lines += _stop_lines(cheaper_stop, "")
+    else:
+        lines += _stop_lines(current_stop, "🅿️ *Truck is already stopped at:*")
+        lines.append("✅ This is the best available price nearby.")
+
+    _send_to(DISPATCHER_GROUP_ID, "\n".join(lines))
+
+
 def send_refueled_alert(vehicle_name: str, stop_name: str,
                          fuel_pct: float) -> None:
     text = (
@@ -246,7 +311,7 @@ def send_left_yard_low_fuel(vehicle_name: str, fuel_pct: float,
 
 
 def send_startup_message() -> None:
-    _send_to_dispatcher("🚛 *FleetFuel Bot online.* Monitoring fuel levels.")
+    _send_to(ADMIN_CHAT_ID, "🚛 *FleetFuel Bot online.* Monitoring fuel levels.")
 
 
 def send_price_update_notification(pilot_count: int, loves_count: int) -> None:

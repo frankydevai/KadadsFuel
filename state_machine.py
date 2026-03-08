@@ -23,6 +23,31 @@ ALERT LOGIC:
     → One reminder per approach, resets when truck fills up or crosses
 """
 
+"""
+state_machine.py  -  Core truck state logic.
+
+ALERT LOGIC:
+  MOVING + low fuel:
+    → Find best 2 stops (true cost scored) → send alert once per trip leg
+    → Poll every 10 min
+
+  PARKED + low fuel (sleeping):
+    → Send ONE alert so dispatcher knows
+    → Do NOT re-alert while truck stays parked
+    → Poll every 60 min
+
+  TRUCK WAKES UP (was parked, now moving):
+    → Fuel went UP 5%+  → refueled → close alert, send confirmation
+    → Fuel still low    → fresh alert with current heading
+
+  YARD trucks:
+    → Zero alerts, zero checks, always ignored
+
+  CALIFORNIA BORDER:
+    → Checked on every poll for trucks in NV/AZ/OR heading west
+    → One reminder per approach, resets when truck fills up or crosses
+"""
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -38,7 +63,7 @@ from config import (
     MIN_SAVINGS_DISPLAY,
 )
 from yard_geofence import is_in_yard, get_yard_name
-from truck_stop_finder import find_best_stops, calc_savings, is_near_stop
+from truck_stop_finder import find_best_stops, calc_savings, is_near_stop, get_urgency, find_current_stop, find_cheaper_nearby
 from california import (
     should_send_ca_reminder,
     should_reset_ca_reminder,
@@ -47,6 +72,7 @@ from california import (
 )
 from telegram_bot import (
     send_low_fuel_alert,
+    send_at_stop_alert,
     send_ca_border_reminder,
     send_refueled_alert,
     send_left_yard_low_fuel,
@@ -254,7 +280,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         fuel_when_parked = state.get("fuel_when_parked") or fuel
         log.info(f"  {vname}: woke up — was {fuel_when_parked:.1f}% now {fuel:.1f}%")
 
-        state.update({"sleeping": False, "fuel_when_parked": None, "parked_since": None})
+        state.update({"sleeping": False, "fuel_when_parked": None, "parked_since": None, "last_alerted_fuel": None})
 
         if fuel > fuel_when_parked + 5:
             # Fuel went up — refueled during sleep
@@ -286,9 +312,18 @@ def process_truck(vid, prev_state, current_data, truck_states):
         # Check if truck refueled at assigned stop
         _check_refueled(state, current_data)
 
-        # Fire alert only once per trip leg
-        if not state.get("alert_sent"):
+        # Fire alert on first time, OR if urgency tier got worse since last alert
+        current_urgency = get_urgency(fuel)
+        last_urgency    = state.get("last_alert_urgency")
+        urgency_order   = {"ADVISORY": 0, "WARNING": 1, "CRITICAL": 2, "EMERGENCY": 3}
+        tier_escalated  = (
+            last_urgency is not None and
+            urgency_order.get(current_urgency, 0) > urgency_order.get(last_urgency, 0)
+        )
+
+        if not state.get("alert_sent") or tier_escalated:
             _fire_alert(vid, state, current_data, tank_gal, mpg)
+            state["last_alert_urgency"] = current_urgency
         return
 
     # ── 4c. PARKED + LOW FUEL (sleeping) ─────────────────────────────────────
@@ -301,10 +336,32 @@ def process_truck(vid, prev_state, current_data, truck_states):
     state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_PARKED)
     state["sleeping"]  = True
 
-    # ONE alert only — do NOT re-alert while truck stays parked
-    if not state.get("overnight_alert_sent"):
+    # Only alert if truck has been parked for at least 1 hour
+    parked_since = state.get("parked_since")
+    if parked_since:
+        if parked_since.tzinfo is None:
+            parked_since = parked_since.replace(tzinfo=timezone.utc)
+        parked_minutes = (_utcnow() - parked_since).total_seconds() / 60
+    else:
+        parked_minutes = 0
+
+    if parked_minutes < 60:
+        log.info(f"  {vname}: parked {parked_minutes:.0f}min — waiting for 1hr before alert")
+        return
+
+    # ONE alert only — re-alert only if fuel dropped 5%+ since last alert
+    last_alerted_fuel = state.get("last_alerted_fuel")
+    already_alerted   = state.get("overnight_alert_sent", False)
+
+    fuel_dropped = (
+        last_alerted_fuel is not None and
+        fuel < last_alerted_fuel - 5
+    )
+
+    if not already_alerted or fuel_dropped:
         _fire_alert(vid, state, current_data, tank_gal, mpg)
         state["overnight_alert_sent"] = True
+        state["last_alerted_fuel"]    = fuel
 
 
 # -- Alert firing -------------------------------------------------------------
@@ -330,13 +387,24 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
 
     log.info(f"  {vname}: firing alert — fuel={fuel:.1f}%")
 
-    best, alt = find_best_stops(lat, lng, heading, speed, fuel, tank_gal, mpg)
+    # Check if truck is already parked at a fuel stop
+    current_stop = find_current_stop(lat, lng) if speed <= 5 else None
 
-    # Already at a stop — no alert needed
-    if best is None and alt is None and not data.get("_no_stop"):
-        log.info(f"  {vname}: already at a stop, no alert")
+    if current_stop:
+        log.info(f"  {vname}: already at {current_stop['store_name']} — checking nearby prices")
+        cheaper = find_cheaper_nearby(lat, lng, current_stop, fuel, tank_gal, mpg)
+        send_at_stop_alert(
+            vehicle_name=vname,
+            fuel_pct=fuel,
+            truck_lat=lat,
+            truck_lng=lng,
+            current_stop=current_stop,
+            cheaper_stop=cheaper,
+        )
         state["alert_sent"] = True
         return
+
+    best, alt = find_best_stops(lat, lng, heading, speed, fuel, tank_gal, mpg)
 
     savings = calc_savings(best, alt) if best and alt else None
 

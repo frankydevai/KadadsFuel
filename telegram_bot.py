@@ -1,9 +1,4 @@
-"""
-telegram_bot.py  -  Telegram message sending for FleetFuel bot.
 
-All alerts go to the truck's own Telegram group.
-Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
-"""
 
 
 

@@ -12,6 +12,13 @@ All alerts go to the truck's own Telegram group.
 Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
 """
 
+"""
+telegram_bot.py  -  Telegram message sending for FleetFuel bot.
+
+All alerts go to the truck's own Telegram group.
+Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
+"""
+
 import time
 import logging
 import requests
@@ -59,8 +66,22 @@ def _send_to(chat_id: str, text: str) -> int | None:
 
 
 def _send_to_truck(vehicle_name: str, text: str) -> int | None:
-    """Beta mode: all alerts go to single group. Phase 2: split per truck."""
-    return _send_to_dispatcher(text)
+    """Send to truck's own group (if set) AND dispatcher group."""
+    from database import get_truck_group
+    truck_group = get_truck_group(vehicle_name)
+
+    msg_id = None
+    # Send to truck's own driver group if configured
+    if truck_group:
+        msg_id = _send_to(truck_group, text)
+    else:
+        log.info(f"No group set for {vehicle_name} — dispatcher only")
+
+    # Always also send to dispatcher group (skip if same group)
+    if DISPATCHER_GROUP_ID and truck_group != str(DISPATCHER_GROUP_ID):
+        _send_to_dispatcher(text)
+
+    return msg_id
 
 
 def _send_to_dispatcher(text: str) -> int | None:
@@ -188,7 +209,7 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
     if fuel_pct <= 15 and best_stop:
         _send_to_dispatcher(f"{emoji} *{vehicle_name}* — critically low at {fuel_pct:.0f}%")
 
-    return _send_to(DISPATCHER_GROUP_ID, "\n".join(lines))
+    return _send_to_truck(vehicle_name, "\n".join(lines))
 
 
 def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
@@ -220,7 +241,7 @@ def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
         lines.append(f"🏁 *Fill up before the border:*")
         lines.append(_format_stop_card(best_stop))
 
-    return _send_to(DISPATCHER_GROUP_ID, "\n".join(lines))
+    return _send_to_truck(vehicle_name, "\n".join(lines))
 
 
 def send_at_stop_alert(vehicle_name: str, fuel_pct: float,
@@ -278,7 +299,7 @@ def send_at_stop_alert(vehicle_name: str, fuel_pct: float,
         lines += _stop_lines(current_stop, "🅿️ *Truck is already stopped at:*")
         lines.append("✅ This is the best available price nearby.")
 
-    _send_to(DISPATCHER_GROUP_ID, "\n".join(lines))
+    _send_to_truck(vehicle_name, "\n".join(lines))
 
 
 def send_refueled_alert(vehicle_name: str, stop_name: str,
@@ -315,11 +336,8 @@ def send_startup_message() -> None:
 
 
 def send_price_update_notification(pilot_count: int, loves_count: int) -> None:
-    """Notify dispatcher when fuel prices are updated."""
-    _send_to_dispatcher(
-        f"⛽ *Fuel prices updated*\n"
-        f"Pilot: {pilot_count} stops  ·  Love's: {loves_count} stops"
-    )
+    """No-op — price update notifications suppressed."""
+    log.info(f"Prices updated: Pilot={pilot_count} Love's={loves_count}")
 
 
 # -- File upload handler (admin only) ----------------------------------------

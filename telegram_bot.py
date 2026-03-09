@@ -1,8 +1,3 @@
-
-
-
-
-
 """
 telegram_bot.py  -  Telegram message sending for FleetFuel bot.
 
@@ -416,30 +411,35 @@ def poll_for_uploads() -> None:
 
             # Handle commands first
             if text.startswith("/"):
-                if text.startswith("/addtruck"):
-                    _handle_addtruck(text)
-                elif text.startswith("/setgroup"):
-                    _handle_setgroup(text)
-                elif text.startswith("/listtruck"):
-                    _handle_listtruck()
-                elif text.startswith("/removetruck"):
-                    _handle_removetruck(text)
-                else:
-                    _send_to(ADMIN_CHAT_ID,
-                        "Available commands:\n"
-                        "/addtruck Unit4821 -100123456\n"
-                        "/setgroup Unit4821 -100123456\n"
-                        "/listtruck\n"
-                        "/removetruck Unit4821"
-                    )
+                try:
+                    if text.startswith("/addtruck"):
+                        _handle_addtruck(text)
+                    elif text.startswith("/setgroup"):
+                        _handle_setgroup(text)
+                    elif text.startswith("/listtruck"):
+                        _handle_listtruck()
+                    elif text.startswith("/removetruck"):
+                        _handle_removetruck(text)
+                    else:
+                        _send_to(ADMIN_CHAT_ID,
+                            "Available commands:\n"
+                            "/addtruck Unit4821 -100123456\n"
+                            "/setgroup Unit4821 -100123456\n"
+                            "/listtruck\n"
+                            "/removetruck Unit4821"
+                        )
+                except Exception as e:
+                    log.error(f"Command error: {e}", exc_info=True)
+                    _send_to(ADMIN_CHAT_ID, f"❌ Command failed: `{e}`")
                 continue
 
             if not document:
-                # Non-file text from admin — send to AI assistant
-                from ai_admin import handle_ai_admin_message
-                _send_to(ADMIN_CHAT_ID, "🤔 Thinking...")
-                reply = handle_ai_admin_message(text)
-                _send_to(ADMIN_CHAT_ID, reply)
+                # Non-file text from admin — show help
+                _send_to(ADMIN_CHAT_ID,
+                    "📂 Send a CSV or XLSX file to update fuel prices.\n"
+                    "Or use a command:\n"
+                    "/addtruck /setgroup /listtruck /removetruck"
+                )
                 continue
 
             filename  = document.get("file_name", "upload")
@@ -561,15 +561,18 @@ def _handle_listtruck():
         _send_to(ADMIN_CHAT_ID, "No trucks registered yet.")
         return
 
-    lines = ["🚛 *Registered Trucks*\n"]
+    lines = []
     for t in trucks:
-        name     = t.get("vehicle_name", "?")
-        group    = t.get("telegram_group_id") or "— no group set"
-        tank     = t.get("tank_capacity_gal", 150)
-        mpg      = t.get("avg_mpg", 6.5)
-        lines.append(f"• *{name}*\n  Group: `{group}`  ·  Tank: {tank}gal  ·  MPG: {mpg}")
+        name  = t.get("vehicle_name", "?")
+        group = t.get("telegram_group_id") or "— no group"
+        lines.append(f"• *{name}*  `{group}`")
 
-    _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+    # Split into chunks of 50 trucks to stay under Telegram 4096 char limit
+    chunk_size = 50
+    chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
+    for i, chunk in enumerate(chunks):
+        header = f"🚛 *Trucks ({len(trucks)} total)* — page {i+1}/{len(chunks)}\n" if len(chunks) > 1 else f"🚛 *Trucks ({len(trucks)} total)*\n"
+        _send_to(ADMIN_CHAT_ID, header + "\n".join(chunk))
 
 
 def _handle_removetruck(text: str):

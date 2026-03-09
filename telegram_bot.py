@@ -8,10 +8,17 @@ Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
 
 
 
+"""
+telegram_bot.py  -  Telegram message sending for FleetFuel bot.
+
+All alerts go to the truck's own Telegram group.
+Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
+"""
+
 import time
 import logging
 import requests
-from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY
+from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY, TRIP_GROUP_ID
 
 log = logging.getLogger(__name__)
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -408,6 +415,10 @@ def poll_for_uploads() -> None:
             document = message.get("document")
             text     = message.get("text", "").strip()
 
+            # Strip bot username from commands e.g. /listtruck@FuelAlertBot → /listtruck
+            if text.startswith("/"):
+                text = text.split("@")[0]
+
             # Handle commands first
             if text.startswith("/"):
                 if text.startswith("/addtruck"):
@@ -429,11 +440,11 @@ def poll_for_uploads() -> None:
                 continue
 
             if not document:
-                # Non-file message from admin — send help
-                _send_to(ADMIN_CHAT_ID,
-                    "📂 Send me a CSV or XLSX file to update fuel prices.\n"
-                    "Supported: `pilot_prices.csv`, `loves_prices.xlsx`, or a `.zip`"
-                )
+                # Non-file text from admin — send to AI assistant
+                from ai_admin import handle_ai_admin_message
+                _send_to(ADMIN_CHAT_ID, "🤔 Thinking...")
+                reply = handle_ai_admin_message(text)
+                _send_to(ADMIN_CHAT_ID, reply)
                 continue
 
             filename  = document.get("file_name", "upload")
@@ -580,3 +591,75 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"✅ Truck deactivated: *{vehicle_name}*")
     else:
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
+
+
+# -- Trip message polling -----------------------------------------------------
+
+_last_trip_update_id: int = 0
+
+
+def poll_for_trips() -> None:
+    """
+    Poll Telegram for new messages in the trip/dispatch group.
+    Detects trip assignment messages and saves them to DB.
+    """
+    global _last_trip_update_id
+
+    if not TRIP_GROUP_ID:
+        return
+
+    try:
+        result = _post("getUpdates", {
+            "offset":  _last_trip_update_id + 1,
+            "timeout": 2,
+            "limit":   20,
+            "allowed_updates": ["message"],
+        })
+
+        if not result or not result.get("ok"):
+            return
+
+        for update in result.get("result", []):
+            _last_trip_update_id = update["update_id"]
+
+            message = update.get("message", {})
+            chat_id = str(message.get("chat", {}).get("id", ""))
+
+            # Only process messages from the trip group
+            if chat_id != str(TRIP_GROUP_ID):
+                continue
+
+            text       = message.get("text", "") or ""
+            message_id = message.get("message_id")
+
+            if not text:
+                continue
+
+            # Try to parse as trip message
+            from trip_parser import parse_trip_message, save_trip
+            trip = parse_trip_message(text)
+
+            if not trip:
+                continue
+
+            log.info(f"Trip message detected: truck={trip['truck_name']} "
+                     f"trip={trip.get('trip_number')} stops={len(trip['stops'])}")
+
+            # Save to DB (geocodes stops automatically)
+            trip_id = save_trip(trip, group_id=chat_id, message_id=message_id)
+
+            if trip_id:
+                stop_count    = len(trip["stops"])
+                geocoded      = sum(1 for s in trip["stops"] if s.get("geocoded"))
+                truck_name    = trip["truck_name"]
+                trip_number   = trip.get("trip_number", "?")
+
+                _send_to(ADMIN_CHAT_ID,
+                    f"📋 *Trip {trip_number} parsed for truck {truck_name}*\n"
+                    f"✅ {geocoded}/{stop_count} stops geocoded\n"
+                    f"🗺 Route heading will use stop destinations"
+                )
+                log.info(f"Trip {trip_number} saved — {geocoded}/{stop_count} stops geocoded")
+
+    except Exception as e:
+        log.error(f"poll_for_trips error: {e}", exc_info=True)

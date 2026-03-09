@@ -48,6 +48,31 @@ ALERT LOGIC:
     → One reminder per approach, resets when truck fills up or crosses
 """
 
+"""
+state_machine.py  -  Core truck state logic.
+
+ALERT LOGIC:
+  MOVING + low fuel:
+    → Find best 2 stops (true cost scored) → send alert once per trip leg
+    → Poll every 10 min
+
+  PARKED + low fuel (sleeping):
+    → Send ONE alert so dispatcher knows
+    → Do NOT re-alert while truck stays parked
+    → Poll every 60 min
+
+  TRUCK WAKES UP (was parked, now moving):
+    → Fuel went UP 5%+  → refueled → close alert, send confirmation
+    → Fuel still low    → fresh alert with current heading
+
+  YARD trucks:
+    → Zero alerts, zero checks, always ignored
+
+  CALIFORNIA BORDER:
+    → Checked on every poll for trucks in NV/AZ/OR heading west
+    → One reminder per approach, resets when truck fills up or crosses
+"""
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -327,6 +352,21 @@ def process_truck(vid, prev_state, current_data, truck_states):
         return
 
     # ── 4c. PARKED + LOW FUEL (sleeping) ─────────────────────────────────────
+    # Detect if truck re-parked at a new location
+    prev_lat = state.get("lat")
+    prev_lng = state.get("lng")
+    was_parked = state.get("parked_since") is not None
+
+    if was_parked and prev_lat and prev_lng:
+        from truck_stop_finder import haversine_miles
+        moved_miles = haversine_miles(prev_lat, prev_lng, lat, lng)
+        if moved_miles > 0.5:
+            log.info(f"  {vname}: re-parked at new location ({moved_miles:.1f}mi) — reset sleep state")
+            state["parked_since"]         = None
+            state["overnight_alert_sent"] = False
+            state["last_alerted_fuel"]    = None
+            state["sleeping"]             = False
+
     if not state.get("parked_since"):
         state["parked_since"]     = _utcnow()
         state["fuel_when_parked"] = fuel
@@ -336,32 +376,22 @@ def process_truck(vid, prev_state, current_data, truck_states):
     state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_PARKED)
     state["sleeping"]  = True
 
-    # Only alert if truck has been parked for at least 1 hour
-    parked_since = state.get("parked_since")
-    if parked_since:
-        if parked_since.tzinfo is None:
-            parked_since = parked_since.replace(tzinfo=timezone.utc)
-        parked_minutes = (_utcnow() - parked_since).total_seconds() / 60
-    else:
-        parked_minutes = 0
-
-    if parked_minutes < 60:
-        log.info(f"  {vname}: parked {parked_minutes:.0f}min — waiting for 1hr before alert")
-        return
-
-    # ONE alert only — re-alert only if fuel dropped 5%+ since last alert
-    last_alerted_fuel = state.get("last_alerted_fuel")
     already_alerted   = state.get("overnight_alert_sent", False)
+    last_alerted_fuel = state.get("last_alerted_fuel")
 
+    # Alert if: never alerted yet, OR fuel dropped 5%+ since last alert
     fuel_dropped = (
         last_alerted_fuel is not None and
-        fuel < last_alerted_fuel - 5
+        fuel <= last_alerted_fuel - 5
     )
 
     if not already_alerted or fuel_dropped:
         _fire_alert(vid, state, current_data, tank_gal, mpg)
         state["overnight_alert_sent"] = True
         state["last_alerted_fuel"]    = fuel
+        log.info(f"  {vname}: parked alert fired — fuel={fuel:.1f}% last_alerted={last_alerted_fuel}")
+    else:
+        log.info(f"  {vname}: parked, no new alert — fuel={fuel:.1f}% last_alerted={last_alerted_fuel}")
 
 
 # -- Alert firing -------------------------------------------------------------
@@ -375,17 +405,28 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
     speed   = data["speed_mph"]
     heading = data["heading"]
 
-    # Use movement-based heading if Samsara heading looks wrong
-    prev_lat = state.get("lat")
-    prev_lng = state.get("lng")
-    if (prev_lat and prev_lng and speed > 10 and
-            (abs(lat - prev_lat) > 0.001 or abs(lng - prev_lng) > 0.001)):
-        from truck_stop_finder import bearing as calc_bearing
-        real_heading = calc_bearing(prev_lat, prev_lng, lat, lng)
-        log.info(f"  {vname}: heading corrected {heading:.0f}°→{real_heading:.0f}° from movement")
-        heading = real_heading
+    # Priority 1: Use trip-based heading (most accurate — points to next stop)
+    try:
+        from trip_parser import get_trip_heading
+        trip_heading = get_trip_heading(vname, lat, lng)
+        if trip_heading is not None:
+            log.info(f"  {vname}: using trip heading {trip_heading:.0f}° (next stop)")
+            heading = trip_heading
+        else:
+            raise ValueError("no trip")
+    except Exception:
+        # Priority 2: Movement-based heading from GPS delta
+        prev_lat = state.get("lat")
+        prev_lng = state.get("lng")
+        if (prev_lat and prev_lng and speed > 10 and
+                (abs(lat - prev_lat) > 0.001 or abs(lng - prev_lng) > 0.001)):
+            from truck_stop_finder import bearing as calc_bearing
+            real_heading = calc_bearing(prev_lat, prev_lng, lat, lng)
+            log.info(f"  {vname}: using movement heading {heading:.0f}°→{real_heading:.0f}°")
+            heading = real_heading
+        # Priority 3: Samsara GPS heading (least reliable, use as-is)
 
-    log.info(f"  {vname}: firing alert — fuel={fuel:.1f}%")
+    log.info(f"  {vname}: firing alert — fuel={fuel:.1f}% heading={heading:.0f}°")
 
     # Check if truck is already parked at a fuel stop
     current_stop = find_current_stop(lat, lng) if speed <= 5 else None

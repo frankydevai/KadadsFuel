@@ -1,27 +1,4 @@
-"""
-state_machine.py  -  Core truck state logic.
 
-ALERT LOGIC:
-  MOVING + low fuel:
-    → Find best 2 stops (true cost scored) → send alert once per trip leg
-    → Poll every 10 min
-
-  PARKED + low fuel (sleeping):
-    → Send ONE alert so dispatcher knows
-    → Do NOT re-alert while truck stays parked
-    → Poll every 60 min
-
-  TRUCK WAKES UP (was parked, now moving):
-    → Fuel went UP 5%+  → refueled → close alert, send confirmation
-    → Fuel still low    → fresh alert with current heading
-
-  YARD trucks:
-    → Zero alerts, zero checks, always ignored
-
-  CALIFORNIA BORDER:
-    → Checked on every poll for trucks in NV/AZ/OR heading west
-    → One reminder per approach, resets when truck fills up or crosses
-"""
 
 """
 state_machine.py  -  Core truck state logic.

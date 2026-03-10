@@ -4,11 +4,18 @@ telegram_bot.py  -  Telegram message sending for FleetFuel bot.
 All alerts go to the truck's own Telegram group.
 Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
 """
+"""
+telegram_bot.py  -  Telegram message sending for FleetFuel bot.
+
+All alerts go to the truck's own Telegram group.
+Dispatcher group receives: startup, no-stop emergencies, left-yard-low-fuel.
+"""
 
 import time
 import logging
 import requests
-from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY, TRIP_GROUP_ID
+from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY
+TRIP_GROUP_ID = __import__('os').getenv("TRIP_GROUP_ID", "").strip()
 
 log = logging.getLogger(__name__)
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"

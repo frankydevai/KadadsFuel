@@ -1,17 +1,8 @@
 """
-price_updater.py  -  Auto-download and parse fuel prices from Pilot and Love's.
+price_updater.py  -  Parse and load fuel prices from uploaded files.
 
-Runs daily via scheduler. Also supports manual Telegram upload as fallback.
-
-Hash-based change detection — only updates DB if files actually changed.
-"""
-
-"""
-price_updater.py  -  Auto-download and parse fuel prices from Pilot and Love's.
-
-Runs daily via scheduler. Also supports manual Telegram upload as fallback.
-
-Hash-based change detection — only updates DB if files actually changed.
+Prices are uploaded manually via Telegram by admin.
+Supported: Fuel_Prices.csv, all_locations.csv, LovesSearchResults.xlsx, or .zip
 """
 
 import io
@@ -19,16 +10,11 @@ import os
 import hashlib
 import zipfile
 import logging
-import requests
 import pandas as pd
 from datetime import datetime, timezone
 from database import upsert_fuel_stop, bulk_upsert_fuel_stops, get_stops_count
-from config import PILOT_ZIP_URL, LOVES_ZIP_URL
 
 log = logging.getLogger(__name__)
-
-# Hash cache files (stored in /tmp — only needed for change detection within session)
-_HASH_DIR = os.getenv("HASH_DIR", "/tmp")
 
 # ── Column mappings ──────────────────────────────────────────────────────────
 # UPDATE THESE to match the actual column names in your files.
@@ -68,47 +54,6 @@ LOVES_COLUMNS = {
 
 
 # -- Helpers ------------------------------------------------------------------
-
-def _download(url: str) -> bytes:
-    log.info(f"Downloading: {url}")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    log.info(f"Downloaded {len(resp.content):,} bytes")
-    return resp.content
-
-
-def _extract(zip_bytes: bytes, ext: str) -> bytes:
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        names = z.namelist()
-        log.info(f"ZIP contains: {names}")
-        match = next((n for n in names if n.lower().endswith(ext)), None)
-        if not match:
-            raise FileNotFoundError(f"No {ext} file in ZIP. Files: {names}")
-        log.info(f"Extracting: {match}")
-        return z.read(match)
-
-
-def _md5(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
-
-
-def _load_hash(source: str) -> str:
-    path = os.path.join(_HASH_DIR, f".fuel_hash_{source}.txt")
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
-
-
-def _save_hash(source: str, h: str):
-    path = os.path.join(_HASH_DIR, f".fuel_hash_{source}.txt")
-    with open(path, "w") as f:
-        f.write(h)
-
-
-# Pilot locations cache — stored in DB so it survives Railway redeploys
-_PILOT_LOCATIONS_KEY = "pilot_locations_csv"
 
 def _save_pilot_locations(csv_bytes: bytes):
     """Save all_locations.csv bytes to DB as a blob (base64 encoded)."""
@@ -258,64 +203,6 @@ def _parse_loves(xlsx_bytes: bytes) -> list[dict]:
     return records
 
 
-# -- Main updater functions ---------------------------------------------------
-
-def update_pilot(force: bool = False) -> int:
-    """Download Pilot ZIP, parse, upsert to DB. Returns count of records processed."""
-    if not PILOT_ZIP_URL:
-        log.warning("PILOT_ZIP_URL not set — skipping Pilot update.")
-        return 0
-    try:
-        zip_bytes = _download(PILOT_ZIP_URL)
-        h = _md5(zip_bytes)
-        if not force and h == _load_hash("pilot"):
-            log.info("Pilot: no change detected.")
-            return 0
-        csv_bytes = _extract(zip_bytes, ".csv")
-        records   = _parse_pilot(csv_bytes)
-        bulk_upsert_fuel_stops(records)
-        _save_hash("pilot", h)
-        log.info(f"Pilot: updated {len(records)} stops in DB.")
-        return len(records)
-    except Exception as e:
-        log.error(f"Pilot update failed: {e}", exc_info=True)
-        return 0
-
-
-def update_loves(force: bool = False) -> int:
-    """Download Love's ZIP, parse, upsert to DB. Returns count of records processed."""
-    if not LOVES_ZIP_URL:
-        log.warning("LOVES_ZIP_URL not set — skipping Love's update.")
-        return 0
-    try:
-        zip_bytes = _download(LOVES_ZIP_URL)
-        h = _md5(zip_bytes)
-        if not force and h == _load_hash("loves"):
-            log.info("Love's: no change detected.")
-            return 0
-        xlsx_bytes = _extract(zip_bytes, ".xlsx")
-        records    = _parse_loves(xlsx_bytes)
-        bulk_upsert_fuel_stops(records)
-        _save_hash("loves", h)
-        log.info(f"Love's: updated {len(records)} stops in DB.")
-        return len(records)
-    except Exception as e:
-        log.error(f"Love's update failed: {e}", exc_info=True)
-        return 0
-
-
-def run_price_update(force: bool = False) -> tuple[int, int]:
-    """Run both updates. Returns (pilot_count, loves_count)."""
-    log.info("=" * 40)
-    log.info("Running fuel price update...")
-    pilot = update_pilot(force=force)
-    loves = update_loves(force=force)
-    total = get_stops_count()
-    log.info(f"Price update complete — {total} total diesel stops in DB.")
-    log.info("=" * 40)
-    return pilot, loves
-
-
 def update_from_file(file_bytes: bytes, filename: str) -> tuple[int, str]:
     """
     Manual upload via Telegram.
@@ -401,11 +288,3 @@ def update_from_file(file_bytes: bytes, filename: str) -> tuple[int, str]:
     except Exception as e:
         log.error(f"Manual upload failed: {e}", exc_info=True)
         return 0, f"❌ Failed to parse file: {e}"
-
-
-if __name__ == "__main__":
-    # Run manually: python price_updater.py
-    import sys
-    force = "--force" in sys.argv
-    pilot, loves = run_price_update(force=force)
-    print(f"Done — Pilot: {pilot}  Love's: {loves}")

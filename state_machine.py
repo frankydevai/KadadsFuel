@@ -317,7 +317,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         if last_alert_lat and last_alert_lng:
             from truck_stop_finder import haversine_miles
             moved_since_alert = haversine_miles(last_alert_lat, last_alert_lng, lat, lng)
-        location_changed = moved_since_alert >= 50
+        location_changed = moved_since_alert >= 30
 
         # Re-alert if fuel dropped 5%+ since last alert
         last_alert_fuel = state.get("last_alert_fuel")
@@ -385,20 +385,32 @@ def process_truck(vid, prev_state, current_data, truck_states):
 
     already_alerted   = state.get("overnight_alert_sent", False)
     last_alerted_fuel = state.get("last_alerted_fuel")
+    last_alert_lat    = state.get("last_alert_lat")
+    last_alert_lng    = state.get("last_alert_lng")
 
-    # Alert if: never alerted yet, OR fuel dropped 5%+ since last alert
+    # Only re-alert if fuel dropped 5%+ OR truck moved 1+ mile since last alert
     fuel_dropped = (
         last_alerted_fuel is not None and
         fuel <= last_alerted_fuel - 5
     )
 
-    if not already_alerted or fuel_dropped:
+    moved_since_alert = 0.0
+    if last_alert_lat and last_alert_lng:
+        from truck_stop_finder import haversine_miles
+        moved_since_alert = haversine_miles(last_alert_lat, last_alert_lng, lat, lng)
+    location_changed = moved_since_alert >= 1.0
+
+    if not already_alerted or fuel_dropped or location_changed:
+        if already_alerted:
+            reason = f"fuel dropped {last_alerted_fuel:.0f}%→{fuel:.0f}%" if fuel_dropped else f"moved {moved_since_alert:.1f}mi"
+            log.info(f"  {vname}: parked re-alert — {reason}")
         _fire_alert(vid, state, current_data, tank_gal, mpg)
         state["overnight_alert_sent"] = True
         state["last_alerted_fuel"]    = fuel
-        log.info(f"  {vname}: parked alert fired — fuel={fuel:.1f}% last_alerted={last_alerted_fuel}")
+        state["last_alert_lat"]       = lat
+        state["last_alert_lng"]       = lng
     else:
-        log.info(f"  {vname}: parked, no new alert — fuel={fuel:.1f}% last_alerted={last_alerted_fuel}")
+        log.info(f"  {vname}: parked, skipping alert — fuel={fuel:.1f}% unchanged, same spot")
 
 
 # -- Alert firing -------------------------------------------------------------

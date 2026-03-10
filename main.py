@@ -17,6 +17,7 @@ from config import STATE_SAVE_INTERVAL_SECONDS
 from database import init_db, load_all_truck_states, save_all_truck_states, reset_truck_states, auto_register_truck
 from samsara_client import get_combined_vehicle_data
 from state_machine import process_truck
+import telegram_bot
 from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads
 
 # -- Logging ------------------------------------------------------------------
@@ -26,7 +27,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-import flags
 log = logging.getLogger(__name__)
 
 # -- State --------------------------------------------------------------------
@@ -120,7 +120,7 @@ def main():
                     due_trucks.append(truck)
                 else:
                     # Force check bypasses next_poll entirely
-                    if flags.force_check_now:
+                    if telegram_bot.force_check_now:
                         due_trucks.append(truck)
                         continue
                     next_poll = truck_states[vid].get("next_poll")
@@ -132,7 +132,7 @@ def main():
                         if next_poll <= now:
                             due_trucks.append(truck)
 
-            if flags.force_check_now:
+            if telegram_bot.force_check_now:
                 import main as _main
                 _main.force_check_now = False
                 log.info(f"/checknow: forcing check on all {len(due_trucks)} trucks")

@@ -11,6 +11,9 @@ import requests
 from config import TELEGRAM_BOT_TOKEN, DISPATCHER_GROUP_ID, ADMIN_CHAT_ID, MIN_SAVINGS_DISPLAY
 
 log = logging.getLogger(__name__)
+
+# Shared flag — set True by /checknow, read by main.py
+force_check_now: bool = False
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 
@@ -504,8 +507,8 @@ def poll_for_uploads() -> None:
 
 def _handle_checknow():
     """/checknow — force immediate check of all trucks"""
-    import flags
-    flags.force_check_now = True
+    global force_check_now
+    force_check_now = True
     _send_to(ADMIN_CHAT_ID, "🔄 *Force check triggered.* Checking all trucks now...")
 
 
@@ -619,7 +622,5 @@ def _handle_removetruck(text: str):
 
 
 # -- Trip message polling -----------------------------------------------------
-
-
 
 

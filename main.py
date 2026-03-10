@@ -6,14 +6,6 @@ Runs two concurrent loops:
   2. Price updater         (daily at 06:00 UTC via simple time check)
 """
 
-"""
-main.py  -  FleetFuel Bot entry point.
-
-Runs two concurrent loops:
-  1. Samsara polling loop  (every 30 seconds tick, trucks polled per their schedule)
-  2. Price updater         (daily at 06:00 UTC via simple time check)
-"""
-
 import logging
 import time
 import signal
@@ -25,8 +17,7 @@ from config import STATE_SAVE_INTERVAL_SECONDS
 from database import init_db, load_all_truck_states, save_all_truck_states, reset_truck_states, auto_register_truck
 from samsara_client import get_combined_vehicle_data
 from state_machine import process_truck
-from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads
-from price_updater import run_price_update
+from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads, poll_for_trips
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -69,15 +60,6 @@ def _should_update_prices(now: datetime) -> bool:
     return hours_since >= 23 and now.hour == 6
 
 
-def _run_price_update():
-    global _last_price_update
-    log.info("Starting daily price update...")
-    try:
-        pilot_count, loves_count = run_price_update()
-        _last_price_update = _utcnow()
-    except Exception as e:
-        log.error(f"Price update failed: {e}", exc_info=True)
-
 
 # -- Main loop ----------------------------------------------------------------
 def main():
@@ -86,13 +68,12 @@ def main():
     log.info("FleetFuel Bot starting up...")
     log.info("Initializing database...")
     init_db()
+    from trip_parser import init_trip_schema
+    init_trip_schema()
 
     if os.getenv("RESET_DB", "0") == "1":
         log.info("RESET_DB=1 — clearing truck states...")
         reset_truck_states()
-
-    # Run price update on startup
-    _run_price_update()
 
     # Load persisted truck states
     truck_states = load_all_truck_states()
@@ -118,25 +99,10 @@ def main():
             if (now - last_upload_check).total_seconds() >= 30:
                 try:
                     poll_for_uploads()
+                    poll_for_trips()
                 except Exception as e:
                     log.error(f"Upload poll error: {e}")
                 last_upload_check = now
-
-            # -- Daily price update -------------------------------------------
-            if _should_update_prices(now):
-                _run_price_update()
-
-            # -- Find trucks due for polling -----------------------------------
-            due_trucks = []
-            for vid, state in truck_states.items():
-                next_poll = state.get("next_poll")
-                if next_poll is None:
-                    due_trucks.append(vid)
-                elif isinstance(next_poll, datetime):
-                    if next_poll.tzinfo is None:
-                        next_poll = next_poll.replace(tzinfo=timezone.utc)
-                    if next_poll <= now:
-                        due_trucks.append(vid)
 
             # -- Fetch from Samsara -------------------------------------------
             try:
@@ -146,32 +112,36 @@ def main():
                 time.sleep(60)
                 continue
 
+            # -- Find trucks due for polling -----------------------------------
+            due_trucks = []
+            for truck in all_trucks:
+                vid = truck["vehicle_id"]
+                if vid not in truck_states:
+                    # Brand new truck — register and process immediately
+                    auto_register_truck(vid, truck["vehicle_name"])
+                    log.info(f"New truck: {truck['vehicle_name']} — registered, processing now.")
+                    due_trucks.append(truck)
+                else:
+                    next_poll = truck_states[vid].get("next_poll")
+                    if next_poll is None:
+                        due_trucks.append(truck)
+                    else:
+                        if next_poll.tzinfo is None:
+                            next_poll = next_poll.replace(tzinfo=timezone.utc)
+                        if next_poll <= now:
+                            due_trucks.append(truck)
+
             log.info(f"Poll #{poll_cycle}: {len(all_trucks)} trucks  "
                      f"{len(due_trucks)} due for check")
 
             # -- Process due trucks -------------------------------------------
-            for vid in due_trucks:
-                current_data = next(
-                    (t for t in all_trucks if t["vehicle_id"] == vid), None
-                )
-                if current_data is None:
-                    if vid in truck_states:
-                        truck_states[vid]["next_poll"] = now + timedelta(minutes=30)
-                    continue
+            for truck in due_trucks:
+                vid = truck["vehicle_id"]
                 try:
                     process_truck(vid, truck_states.get(vid, {}),
-                                  current_data, truck_states)
+                                  truck, truck_states)
                 except Exception as e:
-                    log.error(f"Error processing {vid}: {e}", exc_info=True)
-
-            # -- Discover new trucks ------------------------------------------
-            for truck in all_trucks:
-                vid = truck["vehicle_id"]
-                if vid not in truck_states:
-                    newly_added = auto_register_truck(vid, truck["vehicle_name"])
-                    if newly_added:
-                        log.info(f"New truck from Samsara: {truck['vehicle_name']} ({vid}) — auto-registered. Add group ID in DB when ready.")
-                    process_truck(vid, {}, truck, truck_states)
+                    log.error(f"Error processing {truck['vehicle_name']}: {e}", exc_info=True)
 
             # -- Periodic DB save ---------------------------------------------
             if (now - last_db_save).total_seconds() >= STATE_SAVE_INTERVAL_SECONDS:

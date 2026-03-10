@@ -312,12 +312,19 @@ def process_truck(vid, prev_state, current_data, truck_states):
 
         # Re-alert if truck moved 50+ miles since last alert (new best stop likely)
         last_alert_lat = state.get("last_alert_lat")
-        last_alert_lng = state.get("last_alert_lng")
-        moved_since_alert = 0.0
-        if last_alert_lat and last_alert_lng:
-            from truck_stop_finder import haversine_miles
-            moved_since_alert = haversine_miles(last_alert_lat, last_alert_lng, lat, lng)
-        location_changed = moved_since_alert >= 30
+        # Re-alert based on time since last alert
+        last_alert_time = state.get("last_alert_time")
+        minutes_since_alert = 0
+        if last_alert_time:
+            last_alert_time = _tz(last_alert_time)
+            minutes_since_alert = (_utcnow() - last_alert_time).total_seconds() / 60
+
+        # Re-alert every 30 min normally, every 10 min when critical/emergency
+        if current_urgency in ("CRITICAL", "EMERGENCY"):
+            time_threshold = 10
+        else:
+            time_threshold = 30
+        time_elapsed = minutes_since_alert >= time_threshold
 
         # Re-alert if fuel dropped 5%+ since last alert
         last_alert_fuel = state.get("last_alert_fuel")
@@ -329,7 +336,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         should_alert = (
             not state.get("alert_sent")
             or tier_escalated
-            or location_changed
+            or time_elapsed
             or fuel_dropped
         )
 
@@ -341,10 +348,11 @@ def process_truck(vid, prev_state, current_data, truck_states):
             elif fuel_dropped:
                 reason = f"fuel dropped {last_alert_fuel:.0f}%→{fuel:.0f}%"
             else:
-                reason = f"moved {moved_since_alert:.0f}mi"
+                reason = f"{minutes_since_alert:.0f}min since last alert"
             log.info(f"  {vname}: firing alert — {reason}")
             _fire_alert(vid, state, current_data, tank_gal, mpg)
             state["last_alert_urgency"] = current_urgency
+            state["last_alert_time"]    = _utcnow()
             state["last_alert_lat"]     = lat
             state["last_alert_lng"]     = lng
             state["last_alert_fuel"]    = fuel

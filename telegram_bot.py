@@ -38,11 +38,20 @@ def _post(method: str, payload: dict, retries: int = 4) -> dict | None:
     return None
 
 
+def _esc(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _send_to(chat_id: str, text: str) -> int | None:
-    """Send message to a specific chat_id. Returns message_id or None."""
+    """Send message to a specific chat_id. Returns message_id or None.
+    Falls back to plain text if MarkdownV2 fails."""
     if not chat_id:
         log.warning("No chat_id — message not sent.")
         return None
+    # Try with Markdown first, fall back to plain text on parse error
     result = _post("sendMessage", {
         "chat_id":                  chat_id,
         "text":                     text,
@@ -51,6 +60,16 @@ def _send_to(chat_id: str, text: str) -> int | None:
     })
     if result and result.get("ok"):
         return result["result"]["message_id"]
+    # Fallback: strip markdown, send plain
+    import re
+    plain = re.sub(r"[*_`\[\]]", "", text)
+    result2 = _post("sendMessage", {
+        "chat_id":                  chat_id,
+        "text":                     plain,
+        "disable_web_page_preview": True,
+    })
+    if result2 and result2.get("ok"):
+        return result2["result"]["message_id"]
     return None
 
 
@@ -207,8 +226,8 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
     else:
         lines += [
             "",
-            "❌ No diesel stops found within range.",
-            "📞 Dispatcher notified.",
+            "No diesel stops found within range.",
+            "Dispatcher notified.",
         ]
         _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND")
 
@@ -642,4 +661,4 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
-# -- Trip message polling -----------------------------------------------------
+# -- Trip message polling -----------------

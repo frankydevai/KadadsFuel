@@ -559,6 +559,27 @@ def _handle_checknow():
     log.info(f"Admin added truck: {vehicle_name} group={group_id}")
 
 
+def _handle_addtruck(text: str):
+    """/addtruck <vehicle_name> [group_id]"""
+    from database import auto_register_truck, upsert_truck_group
+    parts = text.split()
+    if len(parts) < 2:
+        _send_to(ADMIN_CHAT_ID, "Usage: /addtruck <vehicle_name> [telegram_group_id]")
+        return
+    vehicle_name = parts[1]
+    group_id     = parts[2] if len(parts) >= 3 else None
+    try:
+        auto_register_truck(vehicle_name, vehicle_name)
+        if group_id:
+            upsert_truck_group(vehicle_name, group_id)
+        msg = f"✅ Truck *{vehicle_name}* added"
+        if group_id:
+            msg += f" → group `{group_id}`"
+        _send_to(ADMIN_CHAT_ID, msg)
+    except Exception as e:
+        _send_to(ADMIN_CHAT_ID, f"❌ Failed to add truck: `{e}`")
+
+
 def _handle_setgroup(text: str):
     """/setgroup Unit 4821 -1009876543210"""
     from database import upsert_truck_group
@@ -622,5 +643,3 @@ def _handle_removetruck(text: str):
 
 
 # -- Trip message polling -----------------------------------------------------
-
-

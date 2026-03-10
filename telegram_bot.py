@@ -192,11 +192,9 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
     compass   = _compass(heading)
 
     lines = [
-        f"{emoji} *Low Fuel Alert*",
-        "",
-        f"🚛 Truck:          *{vehicle_name}*",
-        f"⛽ Current fuel:  *{fuel_pct:.0f}%*",
-        f"📍 [{truck_lat:.4f}, {truck_lng:.4f}]({truck_url})  ·  {speed_mph:.0f} mph {compass}",
+        f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
+        f"⛽ Fuel: *{fuel_pct:.0f}%*   🧭 {speed_mph:.0f} mph {compass}",
+        f"📍 [View on Map]({truck_url})",
     ]
 
     if best_stop:
@@ -215,11 +213,10 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
 
         lines += [
             "",
-            "*Recommended Fuel Stop*",
-            f"*{name}*",
-            f"Address: {full_address}",
-            f"{dist:.1f} mi away",
-            f"Diesel #2: *${price:.3f}/gal*" if price else "Diesel #2: Price N/A",
+            f"⛽ *{name}*",
+            f"📌 {full_address}",
+            f"🛣 {dist:.1f} mi away",
+            f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
         ]
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
@@ -324,7 +321,7 @@ def send_at_stop_alert(vehicle_name: str, fuel_pct: float,
         lines += _stop_lines(current_stop, "🅿️ *Truck is already stopped at:*")
         lines.append("✅ This is the best available price nearby.")
 
-    _send_to_truck(vehicle_name, "\n".join(lines))
+    return _send_to_truck(vehicle_name, "\n".join(lines))
 
 
 def send_refueled_alert(vehicle_name: str, stop_name: str,
@@ -422,9 +419,10 @@ def poll_for_uploads() -> None:
 
     try:
         result = _post("getUpdates", {
-            "offset":  _last_update_id + 1,
-            "timeout": 0,
-            "limit":   20,
+            "offset":          _last_update_id + 1,
+            "timeout":         0,
+            "limit":           20,
+            "allowed_updates": ["message", "my_chat_member"],
         })
 
         if not result or not result.get("ok"):
@@ -434,6 +432,47 @@ def poll_for_uploads() -> None:
 
         for update in updates:
             _last_update_id = update["update_id"]
+
+            # -- Detect when bot is added to a new group ----------------------
+            chat_member = update.get("my_chat_member", {})
+            if chat_member:
+                new_status = chat_member.get("new_chat_member", {}).get("status", "")
+                if new_status in ("member", "administrator"):
+                    chat    = chat_member.get("chat", {})
+                    g_id    = str(chat.get("id", ""))
+                    g_title = chat.get("title", "") or ""
+
+                    # Extract truck number from first word of group title
+                    # e.g. "2710 Delima Michel" → "2710"
+                    first_word = g_title.strip().split()[0] if g_title.strip() else ""
+                    matched = None
+                    if first_word:
+                        from database import get_all_registered_trucks, upsert_truck_group
+                        trucks = get_all_registered_trucks()
+                        for truck in trucks:
+                            if truck["vehicle_name"] == first_word:
+                                matched = first_word
+                                break
+
+                    if matched:
+                        upsert_truck_group(matched, g_id)
+                        _send_to(ADMIN_CHAT_ID,
+                            f"✅ *Auto-assigned group*\n"
+                            f"Truck: *{matched}*\n"
+                            f"Group: *{g_title}*\n"
+                            f"ID: `{g_id}`"
+                        )
+                        log.info(f"Auto-assigned group {g_id} ({g_title}) to truck {matched}")
+                    else:
+                        # No match — send group info for manual assignment
+                        _send_to(ADMIN_CHAT_ID,
+                            f"➕ *Bot added to group — no truck matched*\n"
+                            f"Group: *{g_title}*\n"
+                            f"ID: `{g_id}`\n\n"
+                            f"Assign manually:\n`/setgroup TRUCKNAME {g_id}`"
+                        )
+                        log.info(f"Bot added to group: {g_title} ({g_id}) — no truck matched")
+                continue
 
             message = update.get("message", {})
             chat_id = str(message.get("chat", {}).get("id", ""))
@@ -531,53 +570,6 @@ def _handle_checknow():
     _send_to(ADMIN_CHAT_ID, "🔄 *Force check triggered.* Checking all trucks now...")
 
 
-
-    """
-    /addtruck Unit 4821 -1009876543210
-    /addtruck Unit 4821          (no group — uses dispatcher group)
-    """
-    from database import auto_register_truck, upsert_truck_group
-    parts = text.split(maxsplit=2)
-    # parts[0] = /addtruck
-    # parts[1..] = vehicle name, possibly with group id at end
-
-    if len(parts) < 2:
-        _send_to(ADMIN_CHAT_ID, "Usage: `/addtruck Unit 4821 -1009876543210`")
-        return
-
-    # Last part might be a group_id (starts with - and is numeric)
-    rest  = parts[1] if len(parts) == 2 else parts[1] + " " + parts[2]
-    tokens = rest.rsplit(maxsplit=1)
-
-    if len(tokens) == 2 and tokens[1].lstrip("-").isdigit():
-        vehicle_name = tokens[0].strip()
-        group_id     = tokens[1].strip()
-    else:
-        vehicle_name = rest.strip()
-        group_id     = None
-
-    if not vehicle_name:
-        _send_to(ADMIN_CHAT_ID, "❌ No truck name provided.")
-        return
-
-    newly = auto_register_truck("", vehicle_name)
-    if group_id:
-        upsert_truck_group(vehicle_name, group_id)
-
-    if newly:
-        msg = f"✅ Truck added: *{vehicle_name}*"
-    else:
-        msg = f"ℹ️ Truck already exists: *{vehicle_name}*"
-
-    if group_id:
-        msg += f"\nGroup ID set: `{group_id}`"
-    else:
-        msg += "\nNo group ID set — alerts go to dispatcher group."
-
-    _send_to(ADMIN_CHAT_ID, msg)
-    log.info(f"Admin added truck: {vehicle_name} group={group_id}")
-
-
 def _handle_addtruck(text: str):
     """/addtruck <vehicle_name> [group_id]"""
     from database import auto_register_truck, upsert_truck_group
@@ -661,4 +653,4 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
-# -- Trip message polling -----------------
+# -- Trip message polling -----------------------------------------------------

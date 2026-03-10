@@ -80,6 +80,13 @@ def delete_message(chat_id: str, message_id: int) -> bool:
     return bool(result and result.get("ok"))
 
 
+def _send_to_dispatcher(text: str) -> int | None:
+    """Send message to the dispatcher group."""
+    if not DISPATCHER_GROUP_ID:
+        return None
+    return _send_to(DISPATCHER_GROUP_ID, text)
+
+
 
     """Send message to the dispatcher/admin group."""
     if not DISPATCHER_GROUP_ID:
@@ -612,5 +619,7 @@ def _handle_removetruck(text: str):
 
 
 # -- Trip message polling -----------------------------------------------------
+
+
 
 

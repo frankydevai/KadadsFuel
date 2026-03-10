@@ -330,6 +330,7 @@ def send_left_yard_low_fuel(vehicle_name: str, fuel_pct: float,
 def register_commands() -> None:
     """Register bot commands so they appear in the Telegram menu."""
     commands = [
+        {"command": "checknow",    "description": "Force immediate fuel check on all trucks"},
         {"command": "addtruck",    "description": "Add a truck — /addtruck Unit4821 -100123456"},
         {"command": "setgroup",    "description": "Set truck group — /setgroup Unit4821 -100123456"},
         {"command": "listtruck",   "description": "List all trucks and their groups"},
@@ -430,6 +431,8 @@ def poll_for_uploads() -> None:
                         _handle_listtruck()
                     elif text.startswith("/removetruck"):
                         _handle_removetruck(text)
+                    elif text.startswith("/checknow"):
+                        _handle_checknow()
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -492,7 +495,14 @@ def poll_for_uploads() -> None:
 
 # -- Admin command handlers ---------------------------------------------------
 
-def _handle_addtruck(text: str):
+def _handle_checknow():
+    """/checknow — force immediate check of all trucks"""
+    import main as _main
+    _main.force_check_now = True
+    _send_to(ADMIN_CHAT_ID, "🔄 *Force check triggered.* Checking all trucks now...")
+
+
+
     """
     /addtruck Unit 4821 -1009876543210
     /addtruck Unit 4821          (no group — uses dispatcher group)

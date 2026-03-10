@@ -1,91 +1,143 @@
+
 """
-config.py  -  All configuration loaded from environment variables.
+config.py — Environment variable configuration.
 
-Required env vars:
-  SAMSARA_API_TOKEN
-  TELEGRAM_BOT_TOKEN
-  DATABASE_URL          (PostgreSQL connection string from Railway)
-  DISPATCHER_GROUP_ID   (Telegram group ID for admin/dispatcher alerts)
+REQUIRED
+────────
+SAMSARA_API_TOKEN       Samsara fleet API token
+TELEGRAM_BOT_TOKEN      Telegram bot token from @BotFather
+DISPATCHER_GROUP_ID     Telegram group ID that receives all fuel alerts
+ADMIN_CHAT_ID           Your personal Telegram user ID (for admin commands)
+DATABASE_URL            PostgreSQL connection string (auto-set by Railway)
 
-Optional env vars:
-  PILOT_ZIP_URL              URL to download Pilot CSV zip
-  LOVES_ZIP_URL              URL to download Love's XLSX zip
-  FUEL_ALERT_THRESHOLD_PCT   Default: 35
-  POLL_INTERVAL_HEALTHY      Default: 60 (minutes)
-  POLL_INTERVAL_WATCH        Default: 20
-  POLL_INTERVAL_CRITICAL_MOVING  Default: 10
-  POLL_INTERVAL_CRITICAL_PARKED  Default: 60
-  STATE_SAVE_INTERVAL_SECONDS    Default: 300
-  CA_BORDER_REMINDER_MILES       Default: 150
-  CA_BORDER_FUEL_THRESHOLD       Default: 70 (%)
-  DEFAULT_TANK_GAL               Default: 150
-  DEFAULT_MPG                    Default: 6.5
-  MIN_SAVINGS_DISPLAY            Default: 3.0 (dollars)
+OPTIONAL
+────────
+FUEL_ALERT_THRESHOLD_PCT    Fuel % that triggers alert         default: 35
+DEFAULT_TANK_GAL            Default truck tank size (gallons)  default: 150
+DEFAULT_MPG                 Default truck MPG                  default: 6.5
+SAFETY_RESERVE              Fraction of tank kept as reserve   default: 0.10
+VISIT_RADIUS_MILES          Radius to detect truck at stop     default: 0.35
+MIN_SAVINGS_DISPLAY         Min $ savings to show alt stop     default: 3.0
+BEHIND_PENALTY_MILES        Score penalty for stops behind     default: 15
 
-Yards (up to 20):
-  YARD_N=Name:latitude:longitude:radius_miles
-  Example: YARD_1=Main Yard:28.4277:-81.3816:0.5
+POLLING INTERVALS (minutes)
+────────────────────────────
+POLL_INTERVAL_HEALTHY           default: 60
+POLL_INTERVAL_WATCH             default: 20
+POLL_INTERVAL_CRITICAL_MOVING   default: 10
+POLL_INTERVAL_CRITICAL_PARKED   default: 60
+
+CALIFORNIA BORDER REMINDER
+──────────────────────────
+CA_BORDER_REMINDER_MILES    Distance from CA to send reminder  default: 150
+CA_BORDER_FUEL_THRESHOLD    Fuel % threshold to trigger        default: 70
+
+YARDS (up to 20)
+─────────────────
+YARD_1=Main Yard:28.4277:-81.3816:0.5
+YARD_2=Second Yard:29.0000:-82.0000:0.5
+Format: Name:latitude:longitude:radius_miles
 """
 
 import os
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# -- Samsara ------------------------------------------------------------------
-SAMSARA_API_TOKEN = os.getenv("SAMSARA_API_TOKEN", "")
-SAMSARA_BASE_URL  = "https://api.samsara.com"
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-# -- Telegram -----------------------------------------------------------------
-TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-DISPATCHER_GROUP_ID  = os.getenv("DISPATCHER_GROUP_ID", "").strip()
-ADMIN_CHAT_ID        = os.getenv("ADMIN_CHAT_ID", "").strip()   # your personal chat ID — only this user can upload price files
+def _require(key: str) -> str:
+    val = os.getenv(key, "").strip()
+    if not val:
+        print(f"[config] FATAL: Missing required env var: {key}", flush=True)
+        sys.exit(1)
+    return val
 
-# -- PostgreSQL ---------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+def _int(key: str, default: int) -> int:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return int(val.strip())
+    except (ValueError, TypeError):
+        print(f"[config] WARNING: Invalid int for {key}={val!r}, using default {default}", flush=True)
+        return default
 
-# -- Fuel price ZIP URLs ------------------------------------------------------
-PILOT_ZIP_URL = os.getenv("PILOT_ZIP_URL", "")
-LOVES_ZIP_URL = os.getenv("LOVES_ZIP_URL", "")
+def _float(key: str, default: float) -> float:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    try:
+        return float(val.strip())
+    except (ValueError, TypeError):
+        print(f"[config] WARNING: Invalid float for {key}={val!r}, using default {default}", flush=True)
+        return default
 
-# -- Fuel threshold -----------------------------------------------------------
-FUEL_ALERT_THRESHOLD_PCT = float(os.getenv("FUEL_ALERT_THRESHOLD_PCT", 35))
 
-# -- Polling intervals (minutes) ----------------------------------------------
-POLL_INTERVAL_HEALTHY          = int(os.getenv("POLL_INTERVAL_HEALTHY",          60))
-POLL_INTERVAL_WATCH            = int(os.getenv("POLL_INTERVAL_WATCH",            20))
-POLL_INTERVAL_CRITICAL_MOVING  = int(os.getenv("POLL_INTERVAL_CRITICAL_MOVING",  10))
-POLL_INTERVAL_CRITICAL_PARKED  = int(os.getenv("POLL_INTERVAL_CRITICAL_PARKED",  60))
+# ── Required ─────────────────────────────────────────────────────────────────
 
-# -- State persistence --------------------------------------------------------
-STATE_SAVE_INTERVAL_SECONDS = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", 300))
+SAMSARA_API_TOKEN   = _require("SAMSARA_API_TOKEN")
+SAMSARA_BASE_URL    = "https://api.samsara.com"
 
-# -- Stop search --------------------------------------------------------------
-SEARCH_CORRIDOR_MILES  = float(os.getenv("SEARCH_CORRIDOR_MILES",  300))  # max range ahead
-CORRIDOR_WIDTH_MILES   = float(os.getenv("CORRIDOR_WIDTH_MILES",   8))    # miles either side of heading
-BEHIND_PENALTY_MILES   = float(os.getenv("BEHIND_PENALTY_MILES",   15))   # penalty for stops behind truck
-MIN_SAVINGS_DISPLAY    = float(os.getenv("MIN_SAVINGS_DISPLAY",    3.0))  # min $ savings to show line
+TELEGRAM_BOT_TOKEN  = _require("TELEGRAM_BOT_TOKEN")
+DISPATCHER_GROUP_ID = _require("DISPATCHER_GROUP_ID")
+ADMIN_CHAT_ID       = _require("ADMIN_CHAT_ID")
+DATABASE_URL        = _require("DATABASE_URL")
 
-# -- Truck defaults (when per-truck data unknown) -----------------------------
-DEFAULT_TANK_GAL = float(os.getenv("DEFAULT_TANK_GAL", 150))
-DEFAULT_MPG      = float(os.getenv("DEFAULT_MPG",      6.5))
-SAFETY_RESERVE   = float(os.getenv("SAFETY_RESERVE",   0.10))  # 10% never use
 
-# -- California border reminder -----------------------------------------------
-CA_BORDER_REMINDER_MILES   = float(os.getenv("CA_BORDER_REMINDER_MILES",  150))
-CA_BORDER_FUEL_THRESHOLD   = float(os.getenv("CA_BORDER_FUEL_THRESHOLD",  70))
+# ── Fuel alerting ─────────────────────────────────────────────────────────────
 
-# -- Visit detection ----------------------------------------------------------
-VISIT_RADIUS_MILES = float(os.getenv("VISIT_RADIUS_MILES", 0.35))
+FUEL_ALERT_THRESHOLD_PCT = _float("FUEL_ALERT_THRESHOLD_PCT", 35.0)
 
-# -- Yards --------------------------------------------------------------------
+
+# ── Truck defaults ────────────────────────────────────────────────────────────
+
+DEFAULT_TANK_GAL = _float("DEFAULT_TANK_GAL", 150.0)
+DEFAULT_MPG      = _float("DEFAULT_MPG",      6.5)
+SAFETY_RESERVE   = _float("SAFETY_RESERVE",   0.10)
+
+
+# ── Fuel stop search ──────────────────────────────────────────────────────────
+
+BEHIND_PENALTY_MILES  = _float("BEHIND_PENALTY_MILES",  15.0)
+MIN_SAVINGS_DISPLAY   = _float("MIN_SAVINGS_DISPLAY",   3.0)
+VISIT_RADIUS_MILES    = _float("VISIT_RADIUS_MILES",    0.35)
+
+# Legacy — kept for import compatibility
+SEARCH_CORRIDOR_MILES = _float("SEARCH_CORRIDOR_MILES", 50.0)
+CORRIDOR_WIDTH_MILES  = _float("CORRIDOR_WIDTH_MILES",  8.0)
+
+
+# ── Polling intervals (minutes) ───────────────────────────────────────────────
+
+POLL_INTERVAL_HEALTHY         = _int("POLL_INTERVAL_HEALTHY",         60)
+POLL_INTERVAL_WATCH           = _int("POLL_INTERVAL_WATCH",           20)
+POLL_INTERVAL_CRITICAL_MOVING = _int("POLL_INTERVAL_CRITICAL_MOVING", 10)
+POLL_INTERVAL_CRITICAL_PARKED = _int("POLL_INTERVAL_CRITICAL_PARKED", 60)
+
+
+# ── State persistence ─────────────────────────────────────────────────────────
+
+STATE_SAVE_INTERVAL_SECONDS = _int("STATE_SAVE_INTERVAL_SECONDS", 300)
+
+
+# ── California border reminder ────────────────────────────────────────────────
+
+CA_BORDER_REMINDER_MILES = _float("CA_BORDER_REMINDER_MILES", 150.0)
+CA_BORDER_FUEL_THRESHOLD = _float("CA_BORDER_FUEL_THRESHOLD", 70.0)
+
+
+# ── Yards ─────────────────────────────────────────────────────────────────────
+
 YARDS = []
-for _i in range(1, 20):
+for _i in range(1, 21):
     _val = os.getenv(f"YARD_{_i}", "").strip()
     if not _val:
         continue
     _parts = _val.split(":")
     if len(_parts) != 4:
+        print(f"[config] WARNING: YARD_{_i} invalid format — expected Name:lat:lng:radius", flush=True)
         continue
     try:
         YARDS.append({
@@ -95,4 +147,4 @@ for _i in range(1, 20):
             "radius_miles": float(_parts[3]),
         })
     except ValueError:
-        pass
+        print(f"[config] WARNING: YARD_{_i} has invalid coordinates: {_val}", flush=True)

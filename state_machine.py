@@ -153,14 +153,14 @@ def _get_state_code(lat: float, lng: float) -> str | None:
     Rough state detection from lat/lng bounding boxes.
     Good enough for CA border check — not a full geocoder.
     """
-    # Nevada
-    if 35.0 <= lat <= 42.0 and -120.0 <= lng <= -114.0:
+    # Nevada (widened border margin)
+    if 35.0 <= lat <= 42.0 and -120.1 <= lng <= -113.9:
         return "NV"
-    # Arizona
-    if 31.3 <= lat <= 37.0 and -114.8 <= lng <= -109.0:
+    # Arizona (widened border margin)
+    if 31.3 <= lat <= 37.0 and -115.0 <= lng <= -109.0:
         return "AZ"
-    # Oregon
-    if 41.9 <= lat <= 46.3 and -124.6 <= lng <= -116.5:
+    # Oregon (widened border margin)
+    if 41.9 <= lat <= 46.3 and -124.6 <= lng <= -116.3:
         return "OR"
     # California
     if 32.5 <= lat <= 42.0 and -124.5 <= lng <= -114.1:

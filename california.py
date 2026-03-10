@@ -40,9 +40,9 @@ _CA_BORDER_POINTS = [
 # States that border California
 _CA_BORDER_STATES = {"NV", "AZ", "OR"}
 
-# Westward heading range (225° to 315° = SW to NW covers westbound travel)
-_WEST_HEADING_MIN = 225
-_WEST_HEADING_MAX = 315
+# Westward heading range — widened to catch I-40, I-80, I-10 approaches
+_WEST_HEADING_MIN = 200
+_WEST_HEADING_MAX = 340
 
 # California average diesel price premium over surrounding states
 CA_PRICE_PREMIUM = float(1.10)   # $1.10/gal higher on average
@@ -76,9 +76,6 @@ def should_send_ca_reminder(
 
     if state_code not in _CA_BORDER_STATES:
         return False
-
-    if fuel_pct >= CA_BORDER_FUEL_THRESHOLD:
-        return False  # tank is full enough, no need to remind
 
     if not _is_heading_toward_ca(heading):
         return False  # not heading west

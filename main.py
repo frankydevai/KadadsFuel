@@ -17,7 +17,7 @@ from config import STATE_SAVE_INTERVAL_SECONDS
 from database import init_db, load_all_truck_states, save_all_truck_states, reset_truck_states, auto_register_truck
 from samsara_client import get_combined_vehicle_data
 from state_machine import process_truck
-from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads, poll_for_trips
+from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -68,9 +68,6 @@ def main():
     log.info("FleetFuel Bot starting up...")
     log.info("Initializing database...")
     init_db()
-    from trip_parser import init_trip_schema
-    init_trip_schema()
-
     if os.getenv("RESET_DB", "0") == "1":
         log.info("RESET_DB=1 — clearing truck states...")
         reset_truck_states()
@@ -99,7 +96,6 @@ def main():
             if (now - last_upload_check).total_seconds() >= 30:
                 try:
                     poll_for_uploads()
-                    poll_for_trips()
                 except Exception as e:
                     log.error(f"Upload poll error: {e}")
                 last_upload_check = now

@@ -359,7 +359,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
     if was_parked and prev_lat and prev_lng:
         from truck_stop_finder import haversine_miles
         moved_miles = haversine_miles(prev_lat, prev_lng, lat, lng)
-        if moved_miles > 0.5:
+        if moved_miles > 1.0:  # increased from 0.5 to reduce GPS drift resets
             log.info(f"  {vname}: re-parked at new location ({moved_miles:.1f}mi) — reset sleep state")
             state["parked_since"]         = None
             state["overnight_alert_sent"] = False
@@ -443,6 +443,13 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
     if current_stop:
         log.info(f"  {vname}: already at {current_stop['store_name']} — checking nearby prices")
         cheaper = find_cheaper_nearby(lat, lng, current_stop, fuel, tank_gal, mpg)
+
+        # Delete previous alert before sending new one
+        if state.get("prev_truck_msg_id") and state.get("prev_truck_group"):
+            delete_message(state["prev_truck_group"], state["prev_truck_msg_id"])
+        if state.get("prev_dispatcher_msg_id"):
+            delete_message(DISPATCHER_GROUP_ID, state["prev_dispatcher_msg_id"])
+
         result = send_at_stop_alert(
             vehicle_name=vname,
             fuel_pct=fuel,

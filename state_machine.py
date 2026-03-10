@@ -1,5 +1,3 @@
-
-
 """
 state_machine.py  -  Core truck state logic.
 
@@ -440,7 +438,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
         log.info(f"  {vname}: deleted previous dispatcher alert {prev_dispatcher_msg_id}")
 
     # Check if truck is already parked at a fuel stop
-    current_stop = find_current_stop(lat, lng) if speed <= 5 else None
+    current_stop = find_current_stop(lat, lng) if speed <= 10 else None
 
     if current_stop:
         log.info(f"  {vname}: already at {current_stop['store_name']} — checking nearby prices")

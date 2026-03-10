@@ -1,10 +1,3 @@
-"""
-price_updater.py  -  Parse and load fuel prices from uploaded files.
-
-Prices are uploaded manually via Telegram by admin.
-Supported: Fuel_Prices.csv, all_locations.csv, LovesSearchResults.xlsx, or .zip
-"""
-
 import io
 import os
 import hashlib
@@ -54,6 +47,8 @@ LOVES_COLUMNS = {
 
 
 # -- Helpers ------------------------------------------------------------------
+
+_PILOT_LOCATIONS_KEY = "pilot_locations_csv"
 
 def _save_pilot_locations(csv_bytes: bytes):
     """Save all_locations.csv bytes to DB as a blob (base64 encoded)."""

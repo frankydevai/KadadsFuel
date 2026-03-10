@@ -26,12 +26,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+import flags
 log = logging.getLogger(__name__)
 
 # -- State --------------------------------------------------------------------
 truck_states     = {}
 _running         = True
-force_check_now  = False   # set True by /checknow command to bypass next_poll
 
 # -- Graceful shutdown --------------------------------------------------------
 def _shutdown(signum, frame):
@@ -120,7 +120,7 @@ def main():
                     due_trucks.append(truck)
                 else:
                     # Force check bypasses next_poll entirely
-                    if force_check_now:
+                    if flags.force_check_now:
                         due_trucks.append(truck)
                         continue
                     next_poll = truck_states[vid].get("next_poll")
@@ -132,7 +132,7 @@ def main():
                         if next_poll <= now:
                             due_trucks.append(truck)
 
-            if force_check_now:
+            if flags.force_check_now:
                 import main as _main
                 _main.force_check_now = False
                 log.info(f"/checknow: forcing check on all {len(due_trucks)} trucks")

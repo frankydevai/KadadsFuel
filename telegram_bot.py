@@ -497,8 +497,8 @@ def poll_for_uploads() -> None:
 
 def _handle_checknow():
     """/checknow — force immediate check of all trucks"""
-    import main as _main
-    _main.force_check_now = True
+    import flags
+    flags.force_check_now = True
     _send_to(ADMIN_CHAT_ID, "🔄 *Force check triggered.* Checking all trucks now...")
 
 
@@ -612,3 +612,5 @@ def _handle_removetruck(text: str):
 
 
 # -- Trip message polling -----------------------------------------------------
+
+

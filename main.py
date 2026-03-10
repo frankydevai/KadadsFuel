@@ -29,8 +29,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # -- State --------------------------------------------------------------------
-truck_states = {}
-_running     = True
+truck_states     = {}
+_running         = True
+force_check_now  = False   # set True by /checknow command to bypass next_poll
 
 # -- Graceful shutdown --------------------------------------------------------
 def _shutdown(signum, frame):
@@ -118,6 +119,10 @@ def main():
                     log.info(f"New truck: {truck['vehicle_name']} — registered, processing now.")
                     due_trucks.append(truck)
                 else:
+                    # Force check bypasses next_poll entirely
+                    if force_check_now:
+                        due_trucks.append(truck)
+                        continue
                     next_poll = truck_states[vid].get("next_poll")
                     if next_poll is None:
                         due_trucks.append(truck)
@@ -126,6 +131,11 @@ def main():
                             next_poll = next_poll.replace(tzinfo=timezone.utc)
                         if next_poll <= now:
                             due_trucks.append(truck)
+
+            if force_check_now:
+                import main as _main
+                _main.force_check_now = False
+                log.info(f"/checknow: forcing check on all {len(due_trucks)} trucks")
 
             log.info(f"Poll #{poll_cycle}: {len(all_trucks)} trucks  "
                      f"{len(due_trucks)} due for check")

@@ -243,25 +243,36 @@ def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
     truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
 
     lines = [
-        f"🌵 *CALIFORNIA BORDER AHEAD — {vehicle_name}*",
-        f"─────────────────────────────",
-        f"🚛 Truck:      *{vehicle_name}*",
-        f"⛽ Fuel:       *{fuel_pct:.0f}%*",
-        f"📍 Location:  [{truck_lat:.4f}, {truck_lng:.4f}]({truck_url})",
-        f"🛣 ~{dist_to_border:.0f} miles to CA border",
-        f"─────────────────────────────",
-        f"⚠️ *California diesel is significantly more expensive.*",
+        f"🌵 *California Border Ahead — Truck {vehicle_name}*",
+        f"🛣 {dist_to_border:.0f} miles to CA border",
+        f"⛽ Fuel: *{fuel_pct:.0f}%*",
+        f"📍 [Truck Location]({truck_url})",
+        "",
+        f"💡 *Fill up before crossing — save on every gallon!*",
     ]
 
-    if ca_avg_price and best_stop and best_stop.get("diesel_price"):
-        premium = ca_avg_price - best_stop["diesel_price"]
-        if premium > 0:
-            lines.append(f"   CA avg: ~${ca_avg_price:.3f}/gal  vs here: ${best_stop['diesel_price']:.3f}/gal")
-
     if best_stop:
-        lines.append(f"─────────────────────────────")
-        lines.append(f"🏁 *Fill up before the border:*")
-        lines.append(_format_stop_card(best_stop))
+        name     = best_stop.get("store_name", "Unknown")
+        address  = best_stop.get("address", "")
+        city     = best_stop.get("city", "")
+        state    = best_stop.get("state", "")
+        zip_     = best_stop.get("zip", "")
+        dist     = best_stop.get("distance_miles", 0)
+        price    = best_stop.get("diesel_price")
+        lat      = best_stop.get("latitude")
+        lng      = best_stop.get("longitude")
+        full_address = ", ".join(filter(None, [address, city, state, zip_]))
+        maps_url = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None
+
+        lines += [
+            "",
+            f"⛽ *{name}*",
+            f"📌 {full_address}",
+            f"🛣 {dist:.1f} mi away",
+            f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
+        ]
+        if maps_url:
+            lines.append(f"🗺 [Open in Google Maps]({maps_url})")
 
     return _send_to_truck(vehicle_name, "\n".join(lines))
 
@@ -653,4 +664,4 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
-# -- Trip message polling -----------------------------------------------------
+# -- Trip message polling --------------------------------------------------------------

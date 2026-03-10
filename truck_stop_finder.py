@@ -23,31 +23,6 @@ URGENCY TIERS:
   <10%    EMERGENCY  Absolute nearest stop, price ignored
 """
 
-"""
-truck_stop_finder.py  -  Find the best 2 diesel stops for a truck.
-
-SCORING:
-  Uses true cost formula — not just cheapest price or nearest stop.
-
-  true_cost = (diesel_price × gallons_to_fill)
-            + (detour_miles × 2 × diesel_price / mpg)
-
-  This means a stop that is cheaper but far off-route might actually
-  cost MORE than a slightly pricier stop that is directly on the route.
-
-CORRIDOR:
-  For MOVING trucks, only considers stops within CORRIDOR_WIDTH_MILES
-  either side of the truck's heading direction, up to SEARCH_CORRIDOR_MILES.
-  Stops behind the truck get a distance penalty instead of being excluded,
-  to handle bad heading data from Samsara gracefully.
-
-URGENCY TIERS:
-  35–26%  ADVISORY   Search full corridor, price-optimized
-  25–16%  WARNING    Shorter corridor, still price-optimized
-  15–10%  CRITICAL   Nearest reachable stop, price ignored
-  <10%    EMERGENCY  Absolute nearest stop, price ignored
-"""
-
 import math
 import logging
 from config import (
@@ -64,8 +39,8 @@ from database import get_all_diesel_stops
 log = logging.getLogger(__name__)
 
 EARTH_RADIUS_MILES  = 3958.8
-_PARKED_SPEED_MPH   = 5
-_AT_STOP_RADIUS     = 0.35   # miles — truck is in the lot
+_PARKED_SPEED_MPH   = 10   # trucks showing up to 10mph due to GPS drift while parked
+_AT_STOP_RADIUS     = 0.5   # miles — truck is in the lot (raised from 0.35 for large truck stops)
 _AHEAD_ARC_DEGREES  = 120    # 60° left and right of heading
 
 

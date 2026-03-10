@@ -25,31 +25,6 @@ ALERT LOGIC:
     → One reminder per approach, resets when truck fills up or crosses
 """
 
-"""
-state_machine.py  -  Core truck state logic.
-
-ALERT LOGIC:
-  MOVING + low fuel:
-    → Find best 2 stops (true cost scored) → send alert once per trip leg
-    → Poll every 10 min
-
-  PARKED + low fuel (sleeping):
-    → Send ONE alert so dispatcher knows
-    → Do NOT re-alert while truck stays parked
-    → Poll every 60 min
-
-  TRUCK WAKES UP (was parked, now moving):
-    → Fuel went UP 5%+  → refueled → close alert, send confirmation
-    → Fuel still low    → fresh alert with current heading
-
-  YARD trucks:
-    → Zero alerts, zero checks, always ignored
-
-  CALIFORNIA BORDER:
-    → Checked on every poll for trucks in NV/AZ/OR heading west
-    → One reminder per approach, resets when truck fills up or crosses
-"""
-
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -63,6 +38,7 @@ from config import (
     DEFAULT_TANK_GAL,
     DEFAULT_MPG,
     MIN_SAVINGS_DISPLAY,
+    DISPATCHER_GROUP_ID,
 )
 from yard_geofence import is_in_yard, get_yard_name
 from truck_stop_finder import find_best_stops, calc_savings, is_near_stop, get_urgency, find_current_stop, find_cheaper_nearby
@@ -75,6 +51,7 @@ from california import (
 from telegram_bot import (
     send_low_fuel_alert,
     send_at_stop_alert,
+    delete_message,
     send_ca_border_reminder,
     send_refueled_alert,
     send_left_yard_low_fuel,
@@ -137,6 +114,14 @@ def _new_state(vid, data):
         "sleeping":             False,
         "fuel_when_parked":     None,
         "ca_reminder_sent":     False,
+        "last_alerted_fuel":    None,
+        "last_alert_urgency":   None,
+        "last_alert_fuel":      None,
+        "last_alert_lat":       None,
+        "last_alert_lng":       None,
+        "prev_truck_group":     None,
+        "prev_truck_msg_id":    None,
+        "prev_dispatcher_msg_id": None,
     }
 
 
@@ -151,6 +136,10 @@ def _clear_alert(state):
     state["overnight_alert_sent"] = False
     state["fuel_when_parked"]     = None
     state["sleeping"]             = False
+    state["last_alert_lat"]       = None
+    state["last_alert_lng"]       = None
+    state["last_alert_fuel"]      = None
+    state["last_alert_urgency"]   = None
 
 
 def _get_truck_params(vehicle_name: str) -> tuple[float, float]:
@@ -249,7 +238,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
     # Send CA reminder if conditions met
     if should_send_ca_reminder(state_code or "", lat, lng, heading,
                                 fuel, state.get("ca_reminder_sent", False)):
-        _fire_ca_reminder(state, current_data, tank_gal, mpg, state_code)
+        _fire_ca_reminder(state, current_data, tank_gal, mpg)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 3. FUEL IS FINE
@@ -323,9 +312,44 @@ def process_truck(vid, prev_state, current_data, truck_states):
             urgency_order.get(current_urgency, 0) > urgency_order.get(last_urgency, 0)
         )
 
-        if not state.get("alert_sent") or tier_escalated:
+        # Re-alert if truck moved 50+ miles since last alert (new best stop likely)
+        last_alert_lat = state.get("last_alert_lat")
+        last_alert_lng = state.get("last_alert_lng")
+        moved_since_alert = 0.0
+        if last_alert_lat and last_alert_lng:
+            from truck_stop_finder import haversine_miles
+            moved_since_alert = haversine_miles(last_alert_lat, last_alert_lng, lat, lng)
+        location_changed = moved_since_alert >= 50
+
+        # Re-alert if fuel dropped 5%+ since last alert
+        last_alert_fuel = state.get("last_alert_fuel")
+        fuel_dropped = (
+            last_alert_fuel is not None and
+            fuel <= last_alert_fuel - 5
+        )
+
+        should_alert = (
+            not state.get("alert_sent")
+            or tier_escalated
+            or location_changed
+            or fuel_dropped
+        )
+
+        if should_alert:
+            if not state.get("alert_sent"):
+                reason = "first alert"
+            elif tier_escalated:
+                reason = f"tier {last_urgency}→{current_urgency}"
+            elif fuel_dropped:
+                reason = f"fuel dropped {last_alert_fuel:.0f}%→{fuel:.0f}%"
+            else:
+                reason = f"moved {moved_since_alert:.0f}mi"
+            log.info(f"  {vname}: firing alert — {reason}")
             _fire_alert(vid, state, current_data, tank_gal, mpg)
             state["last_alert_urgency"] = current_urgency
+            state["last_alert_lat"]     = lat
+            state["last_alert_lng"]     = lng
+            state["last_alert_fuel"]    = fuel
         return
 
     # ── 4c. PARKED + LOW FUEL (sleeping) ─────────────────────────────────────
@@ -349,9 +373,17 @@ def process_truck(vid, prev_state, current_data, truck_states):
         state["fuel_when_parked"] = fuel
         log.info(f"  {vname}: parked at {fuel:.1f}% — sleep mode")
 
-    state["state"]     = "CRITICAL_PARKED"
-    state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_PARKED)
-    state["sleeping"]  = True
+    state["state"]    = "CRITICAL_PARKED"
+    state["sleeping"] = True
+
+    # Poll fast at first to confirm truck is really parked, then slow down
+    parked_since   = _tz(state.get("parked_since"))
+    parked_minutes = (_utcnow() - parked_since).total_seconds() / 60 if parked_since else 0
+
+    if parked_minutes < 30:
+        state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_MOVING)  # 10 min
+    else:
+        state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_PARKED)  # 60 min
 
     already_alerted   = state.get("overnight_alert_sent", False)
     last_alerted_fuel = state.get("last_alerted_fuel")
@@ -382,28 +414,30 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
     speed   = data["speed_mph"]
     heading = data["heading"]
 
-    # Priority 1: Use trip-based heading (most accurate — points to next stop)
-    try:
-        from trip_parser import get_trip_heading
-        trip_heading = get_trip_heading(vname, lat, lng)
-        if trip_heading is not None:
-            log.info(f"  {vname}: using trip heading {trip_heading:.0f}° (next stop)")
-            heading = trip_heading
-        else:
-            raise ValueError("no trip")
-    except Exception:
-        # Priority 2: Movement-based heading from GPS delta
-        prev_lat = state.get("lat")
-        prev_lng = state.get("lng")
-        if (prev_lat and prev_lng and speed > 10 and
-                (abs(lat - prev_lat) > 0.001 or abs(lng - prev_lng) > 0.001)):
-            from truck_stop_finder import bearing as calc_bearing
-            real_heading = calc_bearing(prev_lat, prev_lng, lat, lng)
-            log.info(f"  {vname}: using movement heading {heading:.0f}°→{real_heading:.0f}°")
-            heading = real_heading
-        # Priority 3: Samsara GPS heading (least reliable, use as-is)
+    # Use movement-based heading if GPS heading looks unreliable (slow speed)
+    prev_lat = state.get("lat")
+    prev_lng = state.get("lng")
+    if (prev_lat and prev_lng and speed > 10 and
+            (abs(lat - prev_lat) > 0.001 or abs(lng - prev_lng) > 0.001)):
+        from truck_stop_finder import bearing as calc_bearing
+        real_heading = calc_bearing(prev_lat, prev_lng, lat, lng)
+        log.info(f"  {vname}: heading corrected {heading:.0f}°→{real_heading:.0f}° from movement")
+        heading = real_heading
 
     log.info(f"  {vname}: firing alert — fuel={fuel:.1f}% heading={heading:.0f}°")
+
+    # Delete previous alert messages from both groups before sending new ones
+    prev_truck_group      = state.get("prev_truck_group")
+    prev_truck_msg_id     = state.get("prev_truck_msg_id")
+    prev_dispatcher_msg_id = state.get("prev_dispatcher_msg_id")
+
+    if prev_truck_group and prev_truck_msg_id:
+        delete_message(prev_truck_group, prev_truck_msg_id)
+        log.info(f"  {vname}: deleted previous truck group alert {prev_truck_msg_id}")
+
+    if DISPATCHER_GROUP_ID and prev_dispatcher_msg_id:
+        delete_message(DISPATCHER_GROUP_ID, prev_dispatcher_msg_id)
+        log.info(f"  {vname}: deleted previous dispatcher alert {prev_dispatcher_msg_id}")
 
     # Check if truck is already parked at a fuel stop
     current_stop = find_current_stop(lat, lng) if speed <= 5 else None
@@ -411,7 +445,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
     if current_stop:
         log.info(f"  {vname}: already at {current_stop['store_name']} — checking nearby prices")
         cheaper = find_cheaper_nearby(lat, lng, current_stop, fuel, tank_gal, mpg)
-        send_at_stop_alert(
+        result = send_at_stop_alert(
             vehicle_name=vname,
             fuel_pct=fuel,
             truck_lat=lat,
@@ -419,6 +453,10 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
             current_stop=current_stop,
             cheaper_stop=cheaper,
         )
+        if isinstance(result, dict):
+            state["prev_truck_group"]       = result.get("truck_group")
+            state["prev_truck_msg_id"]      = result.get("truck_msg_id")
+            state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
         state["alert_sent"] = True
         return
 
@@ -440,7 +478,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
         state["assigned_stop_lng"]  = float(best["longitude"])
         state["assignment_time"]    = _utcnow()
 
-    send_low_fuel_alert(
+    result = send_low_fuel_alert(
         vehicle_name=vname,
         fuel_pct=fuel,
         truck_lat=lat,
@@ -452,11 +490,18 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
         savings_usd=savings,
     )
 
+    # Track message IDs so we can delete them on next alert
+    if isinstance(result, dict):
+        state["prev_truck_group"]       = result.get("truck_group")
+        state["prev_truck_msg_id"]      = result.get("truck_msg_id")
+        state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
+
     state["alert_sent"] = True
 
 
 def _fire_ca_reminder(state, data, tank_gal, mpg):
     """Send California border reminder."""
+    vid     = state.get("vehicle_id")
     vname   = data["vehicle_name"]
     fuel    = data["fuel_pct"]
     lat     = data["lat"]
@@ -487,32 +532,40 @@ def _fire_ca_reminder(state, data, tank_gal, mpg):
 
     # Log as alert in DB
     create_fuel_alert(
-        data["vehicle_id"], vname, fuel, lat, lng, heading, speed,
+        vid, vname, fuel, lat, lng, heading, speed,
         alert_type="ca_border", best_stop=best
     )
 
 
 def _check_refueled(state, data):
-    """Check if moving truck refueled at assigned stop."""
-    if not state.get("assigned_stop_lat"):
-        return
+    """Check if truck refueled — at assigned stop OR any fuel stop."""
+    fuel  = data["fuel_pct"]
+    lat   = data["lat"]
+    lng   = data["lng"]
+    vname = data["vehicle_name"]
 
-    fuel   = data["fuel_pct"]
-    lat    = data["lat"]
-    lng    = data["lng"]
-    vname  = data["vehicle_name"]
-
-    near = is_near_stop(lat, lng,
-                         state["assigned_stop_lat"],
-                         state["assigned_stop_lng"],
-                         VISIT_RADIUS_MILES)
-
-    # Only mark refueled if fuel actually went up (not just passing by)
     alert_fuel = state.get("fuel_pct", fuel)
-    if near and fuel >= alert_fuel + 5:
-        stop_name = state.get("assigned_stop_name", "fuel stop")
+
+    # Fuel went up 5%+ anywhere — refueled regardless of location
+    if fuel >= alert_fuel + 5:
+        # Try to find which stop they're near
+        current_stop = find_current_stop(lat, lng)
+        stop_name = (
+            current_stop["store_name"] if current_stop
+            else state.get("assigned_stop_name", "a fuel stop")
+        )
         log.info(f"  {vname}: refueled at {stop_name} — {alert_fuel:.0f}%→{fuel:.0f}%")
         if state.get("open_alert_id"):
             resolve_alert(state["open_alert_id"])
         send_refueled_alert(vname, stop_name, fuel)
         _clear_alert(state)
+        return
+
+    # Also check if near assigned stop but fuel hasn't updated yet (GPS lag)
+    if state.get("assigned_stop_lat"):
+        near = is_near_stop(lat, lng,
+                             state["assigned_stop_lat"],
+                             state["assigned_stop_lng"],
+                             VISIT_RADIUS_MILES)
+        if near:
+            log.info(f"  {vname}: at assigned stop {state.get('assigned_stop_name')} — waiting for fuel update")

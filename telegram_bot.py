@@ -51,26 +51,36 @@ def _send_to(chat_id: str, text: str) -> int | None:
     return None
 
 
-def _send_to_truck(vehicle_name: str, text: str) -> int | None:
-    """Send to truck's own group (if set) AND dispatcher group."""
+def _send_to_truck(vehicle_name: str, text: str) -> dict:
+    """Send to truck's own group AND dispatcher. Returns {truck_group, truck_msg_id, dispatcher_msg_id}."""
     from database import get_truck_group
     truck_group = get_truck_group(vehicle_name)
 
-    msg_id = None
-    # Send to truck's own driver group if configured
+    truck_msg_id      = None
+    dispatcher_msg_id = None
+
     if truck_group:
-        msg_id = _send_to(truck_group, text)
+        truck_msg_id = _send_to(truck_group, text)
     else:
         log.info(f"No group set for {vehicle_name} — dispatcher only")
 
-    # Always also send to dispatcher group (skip if same group)
     if DISPATCHER_GROUP_ID and truck_group != str(DISPATCHER_GROUP_ID):
-        _send_to_dispatcher(text)
+        dispatcher_msg_id = _send_to_dispatcher(text)
 
-    return msg_id
+    return {
+        "truck_group":       truck_group,
+        "truck_msg_id":      truck_msg_id,
+        "dispatcher_msg_id": dispatcher_msg_id,
+    }
 
 
-def _send_to_dispatcher(text: str) -> int | None:
+def delete_message(chat_id: str, message_id: int) -> bool:
+    """Delete a message from a chat. Returns True if successful."""
+    result = _post("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    return bool(result and result.get("ok"))
+
+
+
     """Send message to the dispatcher/admin group."""
     if not DISPATCHER_GROUP_ID:
         log.warning("DISPATCHER_GROUP_ID not set.")

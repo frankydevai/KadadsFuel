@@ -537,6 +537,8 @@ def poll_for_uploads() -> None:
                         _handle_removetruck(text)
                     elif text.startswith("/checknow"):
                         _handle_checknow()
+                    elif text.startswith("/dbstats"):
+                        _handle_dbstats()
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -690,6 +692,35 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
+def _handle_dbstats():
+    """/dbstats — show breakdown of stops with prices by brand"""
+    from database import db_cursor
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT source, COUNT(*) AS total, COUNT(diesel_price) AS with_price,
+                   ROUND(AVG(diesel_price)::numeric, 3) AS avg_price,
+                   MIN(diesel_price) AS min_price, MAX(diesel_price) AS max_price,
+                   MAX(price_updated) AS last_updated
+            FROM fuel_stops WHERE has_diesel = TRUE GROUP BY source ORDER BY source
+        """)
+        rows = cur.fetchall()
+    if not rows:
+        _send_to(ADMIN_CHAT_ID, "❌ No fuel stops in database.")
+        return
+    lines = ["📊 *Fuel Stop DB Stats*\n"]
+    for r in rows:
+        source = (r["source"] or "unknown").upper()
+        total = r["total"]; priced = r["with_price"]; missing = total - priced
+        avg = r["avg_price"] or 0; mn = r["min_price"] or 0; mx = r["max_price"] or 0
+        updated = r["last_updated"]
+        updated_s = updated.strftime("%Y-%m-%d %H:%M UTC") if updated else "never"
+        lines.append(f"*{source}*")
+        lines.append(f"  Stops: {total}  Priced: {priced}  Missing: {missing}")
+        lines.append(f"  Price: ${mn:.3f} – ${mx:.3f}  (avg ${avg:.3f})")
+        lines.append(f"  Updated: {updated_s}\n")
+    _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+
+
 def _handle_findstop(text: str, chat_id: str):
     """/findstop <truck_number> — find top 3 cheapest stops within 50 miles"""
     from database import get_all_diesel_stops
@@ -780,5 +811,7 @@ def _handle_findstop(text: str, chat_id: str):
 
 
 
+
+# -- Trip message polling -----------------------------------------------------
 
 # -- Trip message polling -----------------------------------------------------

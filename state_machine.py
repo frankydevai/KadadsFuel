@@ -308,7 +308,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
             (_utcnow() - last_alert_time).total_seconds() / 60
             if last_alert_time else 9999
         )
-        time_threshold  = 10 if current_urgency in ("CRITICAL", "EMERGENCY") else 30
+        time_threshold  = 10  # re-alert every 10 min regardless of urgency
         time_elapsed    = minutes_since >= time_threshold
 
         # Fuel drop since last alert
@@ -318,16 +318,41 @@ def process_truck(vid, prev_state, current_data, truck_states):
             fuel <= last_alert_fuel - _ALERT_FUEL_DROP
         )
 
+        # Check if truck passed its assigned stop without stopping
+        passed_assigned_stop = False
+        assigned_lat = state.get("assigned_stop_lat")
+        assigned_lng = state.get("assigned_stop_lng")
+        if state.get("alert_sent") and assigned_lat and assigned_lng:
+            dist_to_stop = haversine_miles(lat, lng, assigned_lat, assigned_lng)
+            assignment_time = _tz(state.get("assignment_time"))
+            # If >10 miles past assigned stop AND at least 15 min since assignment
+            minutes_since_assign = (
+                (_utcnow() - assignment_time).total_seconds() / 60
+                if assignment_time else 0
+            )
+            if dist_to_stop > 10 and minutes_since_assign > 15:
+                passed_assigned_stop = True
+                log.info(f"  {vname}: passed assigned stop ({dist_to_stop:.1f} mi away) — finding next stop")
+                # Clear assignment so next alert picks a fresh stop
+                state["assigned_stop_id"]   = None
+                state["assigned_stop_name"] = None
+                state["assigned_stop_lat"]  = None
+                state["assigned_stop_lng"]  = None
+                state["assignment_time"]    = None
+
         should_alert = (
             not state.get("alert_sent")
             or tier_escalated
             or time_elapsed
             or fuel_dropped
+            or passed_assigned_stop
         )
 
         if should_alert:
             if state.get("alert_sent"):
-                if tier_escalated:
+                if passed_assigned_stop:
+                    reason = "passed assigned stop"
+                elif tier_escalated:
                     reason = f"tier {last_urgency}→{current_urgency}"
                 elif fuel_dropped:
                     reason = f"fuel dropped {last_alert_fuel:.0f}%→{fuel:.0f}%"

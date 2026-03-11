@@ -326,10 +326,9 @@ def find_best_stops(
         tc        = true_cost(stop, truck_lat, truck_lng,
                               truck_heading or 0, fuel_pct, tank_gal, mpg)
 
-        # Parked: nearest. Moving+price matters: true cost. Critical: distance.
-        if parked:
-            score = dist
-        elif price_matters:
+        # Parked: use true cost (price matters even when parked — truck has to drive there)
+        # Critical/Emergency: nearest reachable regardless
+        if price_matters:
             score = tc
         else:
             score = dist

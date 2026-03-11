@@ -95,13 +95,18 @@ def get_urgency(fuel_pct: float) -> str:
     return "ADVISORY"
 
 
-def get_search_radius(urgency: str) -> float:
-    return {
-        "ADVISORY":  50.0,    # 35-26% — 50mi ahead, price-optimize
-        "WARNING":   80.0,    # 25-16% — 80mi
-        "CRITICAL":  120.0,   # 15-10% — 120mi nearest reachable
-        "EMERGENCY": 150.0,   # <10%   — 150mi absolute nearest
+def get_search_radius(urgency: str, fuel_range_miles: float = 0) -> float:
+    """Search up to 80% of actual fuel range, capped by urgency."""
+    max_by_urgency = {
+        "ADVISORY":  250.0,   # 35-26% — search most of range
+        "WARNING":   200.0,   # 25-16%
+        "CRITICAL":  150.0,   # 15-10%
+        "EMERGENCY": 100.0,   # <10% — nearest reachable only
     }[urgency]
+    if fuel_range_miles > 0:
+        # Search 80% of actual range but don't exceed urgency cap
+        return min(fuel_range_miles * 0.80, max_by_urgency)
+    return max_by_urgency
 
 
 def reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
@@ -279,9 +284,9 @@ def find_best_stops(
 
     parked        = speed_mph <= _PARKED_SPEED_MPH
     urgency       = get_urgency(fuel_pct)
-    radius        = get_search_radius(urgency)
-    price_matters = urgency in ("ADVISORY", "WARNING")
     max_range     = reachable_miles(fuel_pct, tank_gal, mpg)
+    radius        = get_search_radius(urgency, max_range)
+    price_matters = urgency in ("ADVISORY", "WARNING")
 
     log.info(f"Stop finder: urgency={urgency} radius={radius:.0f}mi "
              f"range={max_range:.0f}mi parked={parked} stops_in_db={len(all_stops)}")

@@ -504,16 +504,25 @@ def poll_for_uploads() -> None:
             message = update.get("message", {})
             chat_id = str(message.get("chat", {}).get("id", ""))
 
-            # Only process messages from admin
-            if chat_id != ADMIN_CHAT_ID:
-                continue
-
             document = message.get("document")
             text     = message.get("text", "").strip()
 
             # Strip bot username from commands e.g. /listtruck@FuelAlertBot → /listtruck
             if text.startswith("/"):
                 text = text.split("@")[0]
+
+            # /findstop works from ANY group (driver groups)
+            if text.startswith("/findstop"):
+                try:
+                    _handle_findstop(text, chat_id)
+                except Exception as e:
+                    log.error(f"/findstop error: {e}", exc_info=True)
+                    _send_to(chat_id, f"❌ Error finding stop: `{e}`")
+                continue
+
+            # All other commands — admin only
+            if chat_id != ADMIN_CHAT_ID:
+                continue
 
             # Handle commands first
             if text.startswith("/"):
@@ -534,7 +543,8 @@ def poll_for_uploads() -> None:
                             "/addtruck Unit4821 -100123456\n"
                             "/setgroup Unit4821 -100123456\n"
                             "/listtruck\n"
-                            "/removetruck Unit4821"
+                            "/removetruck Unit4821\n"
+                            "/findstop 0792  ← works in any group"
                         )
                 except Exception as e:
                     log.error(f"Command error: {e}", exc_info=True)
@@ -678,6 +688,97 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"✅ Truck deactivated: *{vehicle_name}*")
     else:
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
+
+
+def _handle_findstop(text: str, chat_id: str):
+    """/findstop <truck_number> — find top 3 cheapest stops within 50 miles"""
+    from database import get_all_diesel_stops
+    from samsara_client import get_combined_vehicle_data
+    from truck_stop_finder import haversine_miles
+
+    FINDSTOP_RADIUS  = 50.0   # miles
+    FINDSTOP_TOP_N   = 3
+
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/findstop <truck number>`\nExample: `/findstop 0792`")
+        return
+
+    truck_number = parts[1].strip()
+
+    # Get live location from Samsara
+    try:
+        vehicles = get_combined_vehicle_data()
+    except Exception as e:
+        _send_to(chat_id, f"❌ Could not reach Samsara: `{e}`")
+        return
+
+    # Match truck by name (partial match — "0792" matches "Truck 0792")
+    truck = None
+    for v in vehicles:
+        if truck_number.lower() in v.get("vehicle_name", "").lower():
+            truck = v
+            break
+
+    if not truck:
+        _send_to(chat_id, f"❌ Truck *{truck_number}* not found in Samsara.\nCheck the truck number and try again.")
+        return
+
+    lat   = truck.get("lat")
+    lng   = truck.get("lng")
+    speed = truck.get("speed_mph", 0)
+    fuel  = truck.get("fuel_pct", 0)
+    vname = truck.get("vehicle_name", truck_number)
+
+    if not lat or not lng:
+        _send_to(chat_id, f"❌ No GPS location available for truck *{vname}*.")
+        return
+
+    # Find all stops within 50 miles, sort by price
+    all_stops = get_all_diesel_stops()
+    nearby = []
+    for stop in all_stops:
+        slat = float(stop["latitude"])
+        slng = float(stop["longitude"])
+        dist = haversine_miles(lat, lng, slat, slng)
+        if dist <= FINDSTOP_RADIUS and stop.get("diesel_price"):
+            nearby.append({**stop, "distance_miles": round(dist, 1)})
+
+    if not nearby:
+        _send_to(chat_id,
+            f"⚠️ No fuel stops found within {FINDSTOP_RADIUS:.0f} miles of truck *{vname}*.\n"
+            f"📍 Location: `{lat:.4f}, {lng:.4f}`"
+        )
+        return
+
+    # Sort by price (cheapest first), take top 3
+    nearby.sort(key=lambda s: s["diesel_price"])
+    top = nearby[:FINDSTOP_TOP_N]
+
+    lines = [
+        f"⛽ *Fuel Stops — Truck {vname}*",
+        f"📍 Current location | ⛽ {fuel:.0f}% fuel | 🧭 {speed:.0f} mph",
+        f"🔍 Top {FINDSTOP_TOP_N} cheapest within {FINDSTOP_RADIUS:.0f} miles\n",
+    ]
+
+    for i, stop in enumerate(top, 1):
+        name    = stop["store_name"]
+        address = f"{stop.get('address','')}, {stop.get('city','')}, {stop.get('state','')}"
+        dist    = stop["distance_miles"]
+        price   = stop["diesel_price"]
+        gmaps   = f"https://maps.google.com/?q={stop['latitude']},{stop['longitude']}"
+
+        lines.append(f"*#{i} — {name}*")
+        lines.append(f"📌 {address.strip(', ')}")
+        lines.append(f"🛣 {dist} mi away")
+        lines.append(f"💰 Diesel: ${price:.3f}/gal")
+        lines.append(f"🗺 [Open in Google Maps]({gmaps})")
+        if i < len(top):
+            lines.append("")
+
+    _send_to(chat_id, "\n".join(lines))
+
+
 
 
 # -- Trip message polling -----------------------------------------------------

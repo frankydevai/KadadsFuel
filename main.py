@@ -18,7 +18,7 @@ from database import init_db, load_all_truck_states, save_all_truck_states, rese
 from samsara_client import get_combined_vehicle_data
 from state_machine import process_truck
 import telegram_bot
-from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads
+from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads, send_weekly_savings_report
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -50,7 +50,8 @@ def _utcnow():
 
 
 # -- Price updater scheduler --------------------------------------------------
-_last_price_update = None   # Track last update time
+_last_price_update  = None   # Track last update time
+_last_weekly_report = None   # Track last weekly report
 
 def _should_update_prices(now: datetime) -> bool:
     """Run price update once daily at 06:00 UTC."""
@@ -60,6 +61,19 @@ def _should_update_prices(now: datetime) -> bool:
     hours_since = (now - _last_price_update).total_seconds() / 3600
     return hours_since >= 23 and now.hour == 6
 
+
+
+def _should_send_weekly_report(now: datetime) -> bool:
+    """Send weekly report every Monday at 08:00 UTC."""
+    global _last_weekly_report
+    if now.weekday() != 0:          # 0 = Monday
+        return False
+    if now.hour != 8:
+        return False
+    if _last_weekly_report is None:
+        return True
+    hours_since = (now - _last_weekly_report).total_seconds() / 3600
+    return hours_since >= 23        # Prevent double-fire same Monday
 
 
 # -- Main loop ----------------------------------------------------------------
@@ -100,6 +114,15 @@ def main():
                 except Exception as e:
                     log.error(f"Upload poll error: {e}")
                 last_upload_check = now
+
+            # -- Weekly savings report (Monday 08:00 UTC) --------------
+            if _should_send_weekly_report(now):
+                global _last_weekly_report
+                try:
+                    send_weekly_savings_report()
+                    _last_weekly_report = now
+                except Exception as e:
+                    log.error(f"Weekly report error: {e}")
 
             # -- Fetch from Samsara -------------------------------------------
             try:

@@ -23,6 +23,31 @@ URGENCY TIERS:
   <10%    EMERGENCY  Absolute nearest stop, price ignored
 """
 
+"""
+truck_stop_finder.py  -  Find the best 2 diesel stops for a truck.
+
+SCORING:
+  Uses true cost formula — not just cheapest price or nearest stop.
+
+  true_cost = (diesel_price × gallons_to_fill)
+            + (detour_miles × 2 × diesel_price / mpg)
+
+  This means a stop that is cheaper but far off-route might actually
+  cost MORE than a slightly pricier stop that is directly on the route.
+
+CORRIDOR:
+  For MOVING trucks, only considers stops within CORRIDOR_WIDTH_MILES
+  either side of the truck's heading direction, up to SEARCH_CORRIDOR_MILES.
+  Stops behind the truck get a distance penalty instead of being excluded,
+  to handle bad heading data from Samsara gracefully.
+
+URGENCY TIERS:
+  35–26%  ADVISORY   Search full corridor, price-optimized
+  25–16%  WARNING    Shorter corridor, still price-optimized
+  15–10%  CRITICAL   Nearest reachable stop, price ignored
+  <10%    EMERGENCY  Absolute nearest stop, price ignored
+"""
+
 import math
 import logging
 from config import (
@@ -158,16 +183,20 @@ def true_cost(stop: dict, truck_lat: float, truck_lng: float,
 def find_current_stop(truck_lat: float, truck_lng: float) -> dict | None:
     """
     Check if truck is currently parked at a known fuel stop.
-    Returns the stop dict if found, None otherwise.
+    Returns the CLOSEST stop within radius, or None.
     """
     all_stops = get_all_diesel_stops()
+    best      = None
+    best_dist = _AT_STOP_RADIUS + 1  # start outside radius
+
     for stop in all_stops:
         dist = haversine_miles(truck_lat, truck_lng,
                                float(stop["latitude"]), float(stop["longitude"]))
-        if dist <= _AT_STOP_RADIUS:
+        if dist <= _AT_STOP_RADIUS and dist < best_dist:
+            best_dist = dist
             slat = float(stop["latitude"])
             slng = float(stop["longitude"])
-            return {
+            best = {
                 **stop,
                 "distance_miles":  round(dist, 2),
                 "detour_miles":    0.0,
@@ -177,7 +206,7 @@ def find_current_stop(truck_lat: float, truck_lng: float) -> dict | None:
                 "_ahead":          True,
                 "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
             }
-    return None
+    return best
 
 
 _NEARBY_SEARCH_MILES = 20   # radius to compare prices when already at a stop
@@ -379,13 +408,16 @@ def find_best_stops(
 
     # Sort by score (true cost for price-matters, distance for critical/emergency)
     candidates.sort(key=lambda s: s["_score"])
-
     best = candidates[0]
+
+    # Find nearest stop (by distance) as alt for savings comparison
+    nearest = min(candidates, key=lambda s: s["distance_miles"])
+    alt = nearest if nearest["store_name"] != best["store_name"] else None
 
     log.info(f"Best: {best['store_name']} {best['distance_miles']:.1f}mi "
              f"${best.get('diesel_price','?')}/gal  true_cost=${best['true_cost']:.2f}")
 
-    return best, None
+    return best, alt
 
 
 def calc_savings(best: dict, alt: dict) -> float | None:

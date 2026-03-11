@@ -295,6 +295,40 @@ def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
 
 
 
+def send_at_stop_alert(vehicle_name: str, fuel_pct: float,
+                       truck_lat: float, truck_lng: float,
+                       current_stop: dict) -> dict:
+    """Alert when truck is already parked at a fuel stop — show stop info only, no redirect."""
+    emoji     = _urgency_emoji(fuel_pct)
+    truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
+    name      = current_stop.get("store_name", "Fuel Stop")
+    address   = ", ".join(filter(None, [
+        current_stop.get("address",""),
+        current_stop.get("city",""),
+        current_stop.get("state",""),
+    ]))
+    price     = current_stop.get("diesel_price")
+    slat      = current_stop.get("latitude")
+    slng      = current_stop.get("longitude")
+    maps_url  = f"https://maps.google.com/?q={slat},{slng}" if slat and slng else None
+
+    lines = [
+        f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
+        f"⛽ Fuel: *{fuel_pct:.0f}%*",
+        f"📍 [View on Map]({truck_url})",
+        "",
+        f"🅿️ *Already stopped at:*",
+        f"⛽ *{name}*",
+        f"📌 {address}",
+        f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
+    ]
+    if maps_url:
+        lines.append(f"🗺 [Open in Google Maps]({maps_url})")
+
+    return _send_to_truck(vehicle_name, "\n".join(lines))
+
+
+
 def send_refueled_alert(vehicle_name: str, stop_name: str,
                          fuel_pct: float) -> None:
     text = (
@@ -754,6 +788,9 @@ def _handle_findstop(text: str, chat_id: str):
     _send_to(chat_id, "\n".join(lines))
 
 
+
+
+# -- Trip message polling -----------------------------------------------------
 
 
 # -- Trip message polling -----------------------------------------------------

@@ -218,6 +218,22 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
             f"🛣 {dist:.1f} mi away",
             f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
         ]
+
+        # Savings vs nearest stop
+        if alt_stop and price and alt_stop.get("diesel_price"):
+            nearest_price   = alt_stop.get("diesel_price")
+            nearest_name    = alt_stop.get("store_name", "nearest stop")
+            nearest_dist    = alt_stop.get("distance_miles", 0)
+            price_diff      = nearest_price - price
+            if price_diff > 0.01:
+                from config import DEFAULT_TANK_GAL, SAFETY_RESERVE
+                gallons_needed  = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100) * (1 - SAFETY_RESERVE))
+                total_savings   = round(price_diff * gallons_needed, 2)
+                lines.append(
+                    f"💵 Saves *${price_diff:.2f}/gal × {gallons_needed} gal = ${total_savings:.0f}* "
+                    f"vs {nearest_name} ({nearest_dist:.1f} mi, ${nearest_price:.3f}/gal)"
+                )
+
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
     else:
@@ -664,4 +680,4 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
-# -- Trip message polling --------------------------------------------------------------
+# -- Trip message polling -----------------------------------------------------

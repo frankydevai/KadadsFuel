@@ -3,11 +3,11 @@ database.py  -  PostgreSQL connection + schema + all queries.
 
 Tables:
   trucks          - maps Samsara vehicle_name → telegram_group_id
-                    manually inserted by admin
   fuel_stops      - all Pilot + Love's locations with diesel prices
   truck_states    - current state of each truck (persisted across restarts)
   fuel_alerts     - one row per low-fuel alert event
   ca_reminders    - tracks California border reminders sent (cooldown)
+  bot_config      - key/value store for config (pilot locations cache etc.)
 """
 
 import logging
@@ -47,23 +47,12 @@ def get_connection(retries: int = 3, delay: float = 2.0):
 
 @contextmanager
 def db_cursor():
-    """Yields a dict cursor; commits on success, rolls back on error. Retries on connection loss."""
+    """Yields a dict cursor; commits on success, rolls back on error."""
     conn = get_connection()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         yield cur
         conn.commit()
-    except psycopg2.OperationalError as e:
-        log.warning(f"DB connection lost mid-query, retrying once: {e}")
-        conn.close()
-        conn = get_connection()
-        try:
-            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            yield cur
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
     except Exception:
         conn.rollback()
         raise
@@ -75,7 +64,6 @@ def db_cursor():
 
 SCHEMA_SQL = """
 -- trucks: manually inserted to map Samsara name → Telegram group
--- Admin inserts: INSERT INTO trucks (vehicle_name, telegram_group_id) VALUES ('Unit 4821', '-1001234567890');
 CREATE TABLE IF NOT EXISTS trucks (
     id                  SERIAL PRIMARY KEY,
     vehicle_name        TEXT    NOT NULL UNIQUE,
@@ -92,7 +80,7 @@ CREATE TABLE IF NOT EXISTS trucks (
 -- fuel_stops: seeded from Pilot CSV + Love's XLSX
 CREATE TABLE IF NOT EXISTS fuel_stops (
     id              SERIAL PRIMARY KEY,
-    source          TEXT    NOT NULL,           -- 'pilot' or 'loves'
+    source          TEXT    NOT NULL,
     store_id        TEXT    NOT NULL,
     store_name      TEXT    NOT NULL,
     brand           TEXT    NOT NULL,
@@ -103,7 +91,7 @@ CREATE TABLE IF NOT EXISTS fuel_stops (
     latitude        REAL    NOT NULL,
     longitude       REAL    NOT NULL,
     phone           TEXT,
-    diesel_price    REAL,                       -- NULL if not in price file yet
+    diesel_price    REAL,
     price_updated   TIMESTAMPTZ,
     has_diesel      BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -162,8 +150,8 @@ CREATE TABLE IF NOT EXISTS fuel_alerts (
     alt_stop_name   TEXT,
     alt_stop_price  REAL,
     savings_usd     REAL,
-    alert_type      TEXT    NOT NULL DEFAULT 'low_fuel',  -- 'low_fuel' | 'ca_border' | 'no_stop'
-    status          TEXT    NOT NULL DEFAULT 'open',      -- 'open' | 'resolved'
+    alert_type      TEXT    NOT NULL DEFAULT 'low_fuel',
+    status          TEXT    NOT NULL DEFAULT 'open',
     alerted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     resolved_at     TIMESTAMPTZ
 );
@@ -179,38 +167,35 @@ CREATE TABLE IF NOT EXISTS ca_reminders (
 );
 
 CREATE TABLE IF NOT EXISTS bot_config (
-    key    TEXT PRIMARY KEY,
-    value  TEXT NOT NULL,
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
 
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist. Runs migrations for existing DBs."""
     log.info("Initializing PostgreSQL schema...")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(SCHEMA_SQL)
-    # Fix existing DBs where telegram_group_id was NOT NULL
+    # Migrations for existing DBs
     cur.execute("ALTER TABLE trucks ALTER COLUMN telegram_group_id DROP NOT NULL")
-    # Add message ID columns if they don't exist yet (migration)
     for col, coltype in [
         ("prev_truck_group",       "TEXT"),
         ("prev_truck_msg_id",      "BIGINT"),
         ("prev_dispatcher_msg_id", "BIGINT"),
     ]:
-        cur.execute(f"""
-            ALTER TABLE truck_states
-            ADD COLUMN IF NOT EXISTS {col} {coltype}
-        """)
+        cur.execute(f"ALTER TABLE truck_states ADD COLUMN IF NOT EXISTS {col} {coltype}")
     conn.commit()
     conn.close()
     log.info("✅ Database schema ready.")
 
 
+# -- Config -------------------------------------------------------------------
+
 def set_config_value(key: str, value: str):
-    """Store a key/value in bot_config table (upsert)."""
     sql = """
         INSERT INTO bot_config (key, value, updated_at)
         VALUES (%s, %s, NOW())
@@ -221,7 +206,6 @@ def set_config_value(key: str, value: str):
 
 
 def get_config_value(key: str) -> str | None:
-    """Retrieve a value from bot_config table. Returns None if not found."""
     with db_cursor() as cur:
         cur.execute("SELECT value FROM bot_config WHERE key=%s", (key,))
         row = cur.fetchone()
@@ -250,7 +234,6 @@ def _dt(val):
 # -- trucks -------------------------------------------------------------------
 
 def get_truck_group(vehicle_name: str) -> str | None:
-    """Return telegram_group_id for a vehicle name, or None if not registered."""
     with db_cursor() as cur:
         cur.execute(
             "SELECT telegram_group_id FROM trucks WHERE vehicle_name = %s AND is_active = TRUE",
@@ -261,7 +244,6 @@ def get_truck_group(vehicle_name: str) -> str | None:
 
 
 def get_truck_config(vehicle_name: str) -> dict | None:
-    """Return full truck config row or None."""
     with db_cursor() as cur:
         cur.execute(
             "SELECT * FROM trucks WHERE vehicle_name = %s AND is_active = TRUE",
@@ -277,11 +259,7 @@ def get_all_registered_trucks() -> list:
 
 
 def auto_register_truck(vehicle_id: str, vehicle_name: str) -> bool:
-    """
-    Auto-register a truck seen from Samsara if not already in DB.
-    telegram_group_id left NULL — admin fills it in manually later.
-    Returns True if newly registered, False if already existed.
-    """
+    """Auto-register a truck seen from Samsara if not already in DB. Returns True if newly registered."""
     with db_cursor() as cur:
         cur.execute("SELECT id FROM trucks WHERE vehicle_name = %s", (vehicle_name,))
         if cur.fetchone():
@@ -295,7 +273,6 @@ def auto_register_truck(vehicle_id: str, vehicle_name: str) -> bool:
 
 
 def upsert_truck_group(vehicle_name: str, group_id: str) -> bool:
-    """Set or update telegram_group_id for a truck. Returns True if truck found."""
     with db_cursor() as cur:
         cur.execute(
             "UPDATE trucks SET telegram_group_id = %s WHERE vehicle_name = %s",
@@ -305,7 +282,6 @@ def upsert_truck_group(vehicle_name: str, group_id: str) -> bool:
 
 
 def deactivate_truck(vehicle_name: str) -> bool:
-    """Soft-delete a truck by setting is_active=FALSE. Returns True if found."""
     with db_cursor() as cur:
         cur.execute(
             "UPDATE trucks SET is_active = FALSE WHERE vehicle_name = %s",
@@ -316,13 +292,12 @@ def deactivate_truck(vehicle_name: str) -> bool:
 
 # -- fuel_stops ---------------------------------------------------------------
 
-def upsert_fuel_stop(row: dict) -> int:
-    """Insert or update a single fuel stop. Returns stop id."""
-    return bulk_upsert_fuel_stops([row])
+def upsert_fuel_stop(row: dict):
+    bulk_upsert_fuel_stops([row])
 
 
 def bulk_upsert_fuel_stops(records: list[dict]) -> int:
-    """Bulk insert/update fuel stops in a single transaction. Returns count. Retries on connection loss."""
+    """Bulk insert/update fuel stops. Returns count inserted/updated."""
     if not records:
         return 0
     sql = """
@@ -346,17 +321,9 @@ def bulk_upsert_fuel_stops(records: list[dict]) -> int:
             price_updated = EXCLUDED.price_updated,
             has_diesel    = EXCLUDED.has_diesel
     """
-    for attempt in range(1, 4):
-        try:
-            with db_cursor() as cur:
-                cur.executemany(sql, records)
-            return len(records)
-        except psycopg2.OperationalError as e:
-            log.warning(f"bulk_upsert attempt {attempt}/3 failed: {e}")
-            if attempt < 3:
-                time.sleep(2 * attempt)
-            else:
-                raise
+    with db_cursor() as cur:
+        cur.executemany(sql, records)
+    return len(records)
 
 
 def get_all_diesel_stops() -> list:
@@ -386,7 +353,7 @@ def get_price_last_updated() -> datetime | None:
 # -- truck_states -------------------------------------------------------------
 
 def load_all_truck_states() -> dict:
-    """Load all truck states. Returns {vehicle_id: state_dict}."""
+    """Load all truck states from DB. Returns {vehicle_id: state_dict}."""
     with db_cursor() as cur:
         cur.execute("SELECT * FROM truck_states")
         rows = cur.fetchall()
@@ -396,38 +363,38 @@ def load_all_truck_states() -> dict:
         r = dict(row)
         vid = r["vehicle_id"]
         states[vid] = {
-            "vehicle_id":           vid,
-            "vehicle_name":         r["vehicle_name"],
-            "state":                r["state"],
-            "fuel_pct":             r["fuel_pct"],
-            "lat":                  r["latitude"],
-            "lng":                  r["longitude"],
-            "speed_mph":            r["speed_mph"],
-            "heading":              r["heading"],
-            "next_poll":            _dt(r["next_poll"]),
-            "parked_since":         _dt(r["parked_since"]),
-            "alert_sent":           bool(r["alert_sent"]),
-            "overnight_alert_sent": bool(r["overnight_alert_sent"]),
-            "open_alert_id":        r["open_alert_id"],
-            "assigned_stop_id":     r["assigned_stop_id"],
-            "assigned_stop_name":   r["assigned_stop_name"],
-            "assigned_stop_lat":    r["assigned_stop_lat"],
-            "assigned_stop_lng":    r["assigned_stop_lng"],
-            "assignment_time":      _dt(r["assignment_time"]),
-            "in_yard":              bool(r["in_yard"]),
-            "yard_name":            r["yard_name"],
-            "sleeping":             bool(r["sleeping"]),
-            "fuel_when_parked":     r["fuel_when_parked"],
-            "ca_reminder_sent":     bool(r["ca_reminder_sent"]),
-            "prev_truck_group":     r.get("prev_truck_group"),
-            "prev_truck_msg_id":    r.get("prev_truck_msg_id"),
+            "vehicle_id":             vid,
+            "vehicle_name":           r["vehicle_name"],
+            "state":                  r["state"],
+            "fuel_pct":               r["fuel_pct"],
+            "lat":                    r["latitude"],
+            "lng":                    r["longitude"],
+            "speed_mph":              r["speed_mph"],
+            "heading":                r["heading"],
+            "next_poll":              _dt(r["next_poll"]),
+            "parked_since":           _dt(r["parked_since"]),
+            "alert_sent":             bool(r["alert_sent"]),
+            "overnight_alert_sent":   bool(r["overnight_alert_sent"]),
+            "open_alert_id":          r["open_alert_id"],
+            "assigned_stop_id":       r["assigned_stop_id"],
+            "assigned_stop_name":     r["assigned_stop_name"],
+            "assigned_stop_lat":      r["assigned_stop_lat"],
+            "assigned_stop_lng":      r["assigned_stop_lng"],
+            "assignment_time":        _dt(r["assignment_time"]),
+            "in_yard":                bool(r["in_yard"]),
+            "yard_name":              r["yard_name"],
+            "sleeping":               bool(r["sleeping"]),
+            "fuel_when_parked":       r["fuel_when_parked"],
+            "ca_reminder_sent":       bool(r["ca_reminder_sent"]),
+            "prev_truck_group":       r.get("prev_truck_group"),
+            "prev_truck_msg_id":      r.get("prev_truck_msg_id"),
             "prev_dispatcher_msg_id": r.get("prev_dispatcher_msg_id"),
         }
     return states
 
 
 def save_truck_state(state: dict):
-    """Upsert a single truck state."""
+    """Upsert a single truck state to DB."""
     sql = """
         INSERT INTO truck_states (
             vehicle_id, vehicle_name, state, fuel_pct,
@@ -478,31 +445,31 @@ def save_truck_state(state: dict):
     """
     with db_cursor() as cur:
         cur.execute(sql, {
-            "vehicle_id":           state["vehicle_id"],
-            "vehicle_name":         state.get("vehicle_name"),
-            "state":                state.get("state", "UNKNOWN"),
-            "fuel_pct":             state.get("fuel_pct"),
-            "lat":                  state.get("lat"),
-            "lng":                  state.get("lng"),
-            "speed_mph":            state.get("speed_mph"),
-            "heading":              state.get("heading"),
-            "next_poll":            state.get("next_poll"),
-            "parked_since":         state.get("parked_since"),
-            "alert_sent":           bool(state.get("alert_sent", False)),
-            "overnight_alert_sent": bool(state.get("overnight_alert_sent", False)),
-            "open_alert_id":        state.get("open_alert_id"),
-            "assigned_stop_id":     state.get("assigned_stop_id"),
-            "assigned_stop_name":   state.get("assigned_stop_name"),
-            "assigned_stop_lat":    state.get("assigned_stop_lat"),
-            "assigned_stop_lng":    state.get("assigned_stop_lng"),
-            "assignment_time":      state.get("assignment_time"),
-            "in_yard":              bool(state.get("in_yard", False)),
-            "yard_name":            state.get("yard_name"),
-            "sleeping":             bool(state.get("sleeping", False)),
-            "fuel_when_parked":     state.get("fuel_when_parked"),
-            "ca_reminder_sent":     bool(state.get("ca_reminder_sent", False)),
-            "prev_truck_group":     state.get("prev_truck_group"),
-            "prev_truck_msg_id":    state.get("prev_truck_msg_id"),
+            "vehicle_id":             state["vehicle_id"],
+            "vehicle_name":           state.get("vehicle_name"),
+            "state":                  state.get("state", "UNKNOWN"),
+            "fuel_pct":               state.get("fuel_pct"),
+            "lat":                    state.get("lat"),
+            "lng":                    state.get("lng"),
+            "speed_mph":              state.get("speed_mph"),
+            "heading":                state.get("heading"),
+            "next_poll":              state.get("next_poll"),
+            "parked_since":           state.get("parked_since"),
+            "alert_sent":             bool(state.get("alert_sent", False)),
+            "overnight_alert_sent":   bool(state.get("overnight_alert_sent", False)),
+            "open_alert_id":          state.get("open_alert_id"),
+            "assigned_stop_id":       state.get("assigned_stop_id"),
+            "assigned_stop_name":     state.get("assigned_stop_name"),
+            "assigned_stop_lat":      state.get("assigned_stop_lat"),
+            "assigned_stop_lng":      state.get("assigned_stop_lng"),
+            "assignment_time":        state.get("assignment_time"),
+            "in_yard":                bool(state.get("in_yard", False)),
+            "yard_name":              state.get("yard_name"),
+            "sleeping":               bool(state.get("sleeping", False)),
+            "fuel_when_parked":       state.get("fuel_when_parked"),
+            "ca_reminder_sent":       bool(state.get("ca_reminder_sent", False)),
+            "prev_truck_group":       state.get("prev_truck_group"),
+            "prev_truck_msg_id":      state.get("prev_truck_msg_id"),
             "prev_dispatcher_msg_id": state.get("prev_dispatcher_msg_id"),
         })
 
@@ -521,19 +488,19 @@ def reset_truck_states():
 # -- fuel_alerts --------------------------------------------------------------
 
 def create_fuel_alert(vehicle_id, vehicle_name, fuel_pct, lat, lng,
-                       heading, speed_mph, alert_type="low_fuel",
-                       best_stop=None, alt_stop=None, savings_usd=None) -> int:
+                      heading, speed_mph, alert_type="low_fuel",
+                      best_stop=None, alt_stop=None, savings_usd=None) -> int:
     sql = """
         INSERT INTO fuel_alerts (
             vehicle_id, vehicle_name, fuel_pct, latitude, longitude,
             heading, speed_mph, alert_type,
             best_stop_id, best_stop_name, best_stop_price,
-            alt_stop_id, alt_stop_name, alt_stop_price, savings_usd
+            alt_stop_id,  alt_stop_name,  alt_stop_price, savings_usd
         ) VALUES (
             %(vehicle_id)s, %(vehicle_name)s, %(fuel_pct)s, %(lat)s, %(lng)s,
             %(heading)s, %(speed_mph)s, %(alert_type)s,
             %(best_stop_id)s, %(best_stop_name)s, %(best_stop_price)s,
-            %(alt_stop_id)s, %(alt_stop_name)s, %(alt_stop_price)s, %(savings_usd)s
+            %(alt_stop_id)s,  %(alt_stop_name)s,  %(alt_stop_price)s, %(savings_usd)s
         ) RETURNING id
     """
     with db_cursor() as cur:
@@ -546,12 +513,12 @@ def create_fuel_alert(vehicle_id, vehicle_name, fuel_pct, lat, lng,
             "heading":         heading,
             "speed_mph":       speed_mph,
             "alert_type":      alert_type,
-            "best_stop_id":    best_stop["id"] if best_stop else None,
-            "best_stop_name":  best_stop["store_name"] if best_stop else None,
+            "best_stop_id":    best_stop["id"]          if best_stop else None,
+            "best_stop_name":  best_stop["store_name"]  if best_stop else None,
             "best_stop_price": best_stop["diesel_price"] if best_stop else None,
-            "alt_stop_id":     alt_stop["id"] if alt_stop else None,
-            "alt_stop_name":   alt_stop["store_name"] if alt_stop else None,
-            "alt_stop_price":  alt_stop["diesel_price"] if alt_stop else None,
+            "alt_stop_id":     alt_stop["id"]           if alt_stop else None,
+            "alt_stop_name":   alt_stop["store_name"]   if alt_stop else None,
+            "alt_stop_price":  alt_stop["diesel_price"]  if alt_stop else None,
             "savings_usd":     savings_usd,
         })
         return cur.fetchone()["id"]
@@ -565,7 +532,8 @@ def resolve_alert(alert_id: int):
         )
 
 
-# Aliases used by ai_admin.py
+# -- Aliases ------------------------------------------------------------------
+
 def get_bot_config(key: str) -> str | None:
     return get_config_value(key)
 

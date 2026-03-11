@@ -10,31 +10,8 @@ Tables:
   ca_reminders    - tracks California border reminders sent (cooldown)
 """
 
-"""
-database.py  -  PostgreSQL connection + schema + all queries.
-
-Tables:
-  trucks          - maps Samsara vehicle_name → telegram_group_id
-                    manually inserted by admin
-  fuel_stops      - all Pilot + Love's locations with diesel prices
-  truck_states    - current state of each truck (persisted across restarts)
-  fuel_alerts     - one row per low-fuel alert event
-  ca_reminders    - tracks California border reminders sent (cooldown)
-"""
-
-"""
-database.py  -  PostgreSQL connection + schema + all queries.
-
-Tables:
-  trucks          - maps Samsara vehicle_name → telegram_group_id
-                    manually inserted by admin
-  fuel_stops      - all Pilot + Love's locations with diesel prices
-  truck_states    - current state of each truck (persisted across restarts)
-  fuel_alerts     - one row per low-fuel alert event
-  ca_reminders    - tracks California border reminders sent (cooldown)
-"""
-
 import logging
+import time
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
@@ -46,19 +23,47 @@ log = logging.getLogger(__name__)
 
 # -- Connection ---------------------------------------------------------------
 
-def get_connection():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+def get_connection(retries: int = 3, delay: float = 2.0):
+    """Connect to PostgreSQL with automatic retry on connection failure."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            conn = psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+            return conn
+        except psycopg2.OperationalError as e:
+            last_err = e
+            log.warning(f"DB connection attempt {attempt}/{retries} failed: {e}")
+            if attempt < retries:
+                time.sleep(delay * attempt)
+    raise last_err
 
 
 @contextmanager
 def db_cursor():
-    """Yields a dict cursor; commits on success, rolls back on error."""
+    """Yields a dict cursor; commits on success, rolls back on error. Retries on connection loss."""
     conn = get_connection()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         yield cur
         conn.commit()
+    except psycopg2.OperationalError as e:
+        log.warning(f"DB connection lost mid-query, retrying once: {e}")
+        conn.close()
+        conn = get_connection()
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     except Exception:
         conn.rollback()
         raise
@@ -134,6 +139,9 @@ CREATE TABLE IF NOT EXISTS truck_states (
     sleeping                BOOLEAN     NOT NULL DEFAULT FALSE,
     fuel_when_parked        REAL,
     ca_reminder_sent        BOOLEAN     NOT NULL DEFAULT FALSE,
+    prev_truck_group        TEXT,
+    prev_truck_msg_id       BIGINT,
+    prev_dispatcher_msg_id  BIGINT,
     last_updated            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -186,6 +194,16 @@ def init_db():
     cur.execute(SCHEMA_SQL)
     # Fix existing DBs where telegram_group_id was NOT NULL
     cur.execute("ALTER TABLE trucks ALTER COLUMN telegram_group_id DROP NOT NULL")
+    # Add message ID columns if they don't exist yet (migration)
+    for col, coltype in [
+        ("prev_truck_group",       "TEXT"),
+        ("prev_truck_msg_id",      "BIGINT"),
+        ("prev_dispatcher_msg_id", "BIGINT"),
+    ]:
+        cur.execute(f"""
+            ALTER TABLE truck_states
+            ADD COLUMN IF NOT EXISTS {col} {coltype}
+        """)
     conn.commit()
     conn.close()
     log.info("✅ Database schema ready.")
@@ -304,7 +322,7 @@ def upsert_fuel_stop(row: dict) -> int:
 
 
 def bulk_upsert_fuel_stops(records: list[dict]) -> int:
-    """Bulk insert/update fuel stops in a single transaction. Returns count."""
+    """Bulk insert/update fuel stops in a single transaction. Returns count. Retries on connection loss."""
     if not records:
         return 0
     sql = """
@@ -328,9 +346,17 @@ def bulk_upsert_fuel_stops(records: list[dict]) -> int:
             price_updated = EXCLUDED.price_updated,
             has_diesel    = EXCLUDED.has_diesel
     """
-    with db_cursor() as cur:
-        cur.executemany(sql, records)
-    return len(records)
+    for attempt in range(1, 4):
+        try:
+            with db_cursor() as cur:
+                cur.executemany(sql, records)
+            return len(records)
+        except psycopg2.OperationalError as e:
+            log.warning(f"bulk_upsert attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                time.sleep(2 * attempt)
+            else:
+                raise
 
 
 def get_all_diesel_stops() -> list:
@@ -393,6 +419,9 @@ def load_all_truck_states() -> dict:
             "sleeping":             bool(r["sleeping"]),
             "fuel_when_parked":     r["fuel_when_parked"],
             "ca_reminder_sent":     bool(r["ca_reminder_sent"]),
+            "prev_truck_group":     r.get("prev_truck_group"),
+            "prev_truck_msg_id":    r.get("prev_truck_msg_id"),
+            "prev_dispatcher_msg_id": r.get("prev_dispatcher_msg_id"),
         }
     return states
 
@@ -407,7 +436,8 @@ def save_truck_state(state: dict):
             open_alert_id, assigned_stop_id, assigned_stop_name,
             assigned_stop_lat, assigned_stop_lng, assignment_time,
             in_yard, yard_name, sleeping, fuel_when_parked,
-            ca_reminder_sent, last_updated
+            ca_reminder_sent, prev_truck_group, prev_truck_msg_id,
+            prev_dispatcher_msg_id, last_updated
         ) VALUES (
             %(vehicle_id)s, %(vehicle_name)s, %(state)s, %(fuel_pct)s,
             %(lat)s, %(lng)s, %(speed_mph)s, %(heading)s,
@@ -415,32 +445,36 @@ def save_truck_state(state: dict):
             %(open_alert_id)s, %(assigned_stop_id)s, %(assigned_stop_name)s,
             %(assigned_stop_lat)s, %(assigned_stop_lng)s, %(assignment_time)s,
             %(in_yard)s, %(yard_name)s, %(sleeping)s, %(fuel_when_parked)s,
-            %(ca_reminder_sent)s, NOW()
+            %(ca_reminder_sent)s, %(prev_truck_group)s, %(prev_truck_msg_id)s,
+            %(prev_dispatcher_msg_id)s, NOW()
         )
         ON CONFLICT (vehicle_id) DO UPDATE SET
-            vehicle_name        = EXCLUDED.vehicle_name,
-            state               = EXCLUDED.state,
-            fuel_pct            = EXCLUDED.fuel_pct,
-            latitude            = EXCLUDED.latitude,
-            longitude           = EXCLUDED.longitude,
-            speed_mph           = EXCLUDED.speed_mph,
-            heading             = EXCLUDED.heading,
-            next_poll           = EXCLUDED.next_poll,
-            parked_since        = EXCLUDED.parked_since,
-            alert_sent          = EXCLUDED.alert_sent,
-            overnight_alert_sent = EXCLUDED.overnight_alert_sent,
-            open_alert_id       = EXCLUDED.open_alert_id,
-            assigned_stop_id    = EXCLUDED.assigned_stop_id,
-            assigned_stop_name  = EXCLUDED.assigned_stop_name,
-            assigned_stop_lat   = EXCLUDED.assigned_stop_lat,
-            assigned_stop_lng   = EXCLUDED.assigned_stop_lng,
-            assignment_time     = EXCLUDED.assignment_time,
-            in_yard             = EXCLUDED.in_yard,
-            yard_name           = EXCLUDED.yard_name,
-            sleeping            = EXCLUDED.sleeping,
-            fuel_when_parked    = EXCLUDED.fuel_when_parked,
-            ca_reminder_sent    = EXCLUDED.ca_reminder_sent,
-            last_updated        = NOW()
+            vehicle_name           = EXCLUDED.vehicle_name,
+            state                  = EXCLUDED.state,
+            fuel_pct               = EXCLUDED.fuel_pct,
+            latitude               = EXCLUDED.latitude,
+            longitude              = EXCLUDED.longitude,
+            speed_mph              = EXCLUDED.speed_mph,
+            heading                = EXCLUDED.heading,
+            next_poll              = EXCLUDED.next_poll,
+            parked_since           = EXCLUDED.parked_since,
+            alert_sent             = EXCLUDED.alert_sent,
+            overnight_alert_sent   = EXCLUDED.overnight_alert_sent,
+            open_alert_id          = EXCLUDED.open_alert_id,
+            assigned_stop_id       = EXCLUDED.assigned_stop_id,
+            assigned_stop_name     = EXCLUDED.assigned_stop_name,
+            assigned_stop_lat      = EXCLUDED.assigned_stop_lat,
+            assigned_stop_lng      = EXCLUDED.assigned_stop_lng,
+            assignment_time        = EXCLUDED.assignment_time,
+            in_yard                = EXCLUDED.in_yard,
+            yard_name              = EXCLUDED.yard_name,
+            sleeping               = EXCLUDED.sleeping,
+            fuel_when_parked       = EXCLUDED.fuel_when_parked,
+            ca_reminder_sent       = EXCLUDED.ca_reminder_sent,
+            prev_truck_group       = EXCLUDED.prev_truck_group,
+            prev_truck_msg_id      = EXCLUDED.prev_truck_msg_id,
+            prev_dispatcher_msg_id = EXCLUDED.prev_dispatcher_msg_id,
+            last_updated           = NOW()
     """
     with db_cursor() as cur:
         cur.execute(sql, {
@@ -467,6 +501,9 @@ def save_truck_state(state: dict):
             "sleeping":             bool(state.get("sleeping", False)),
             "fuel_when_parked":     state.get("fuel_when_parked"),
             "ca_reminder_sent":     bool(state.get("ca_reminder_sent", False)),
+            "prev_truck_group":     state.get("prev_truck_group"),
+            "prev_truck_msg_id":    state.get("prev_truck_msg_id"),
+            "prev_dispatcher_msg_id": state.get("prev_dispatcher_msg_id"),
         })
 
 
@@ -526,3 +563,11 @@ def resolve_alert(alert_id: int):
             "UPDATE fuel_alerts SET status='resolved', resolved_at=NOW() WHERE id=%s",
             (alert_id,)
         )
+
+
+# Aliases used by ai_admin.py
+def get_bot_config(key: str) -> str | None:
+    return get_config_value(key)
+
+def set_bot_config(key: str, value: str):
+    set_config_value(key, value)

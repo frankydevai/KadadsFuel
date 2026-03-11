@@ -751,4 +751,9 @@ def _handle_findstop(text: str, chat_id: str):
         if i < len(top):
             lines.append("")
 
-    _send_to(chat_id, "\n".join(li
+    _send_to(chat_id, "\n".join(lines))
+
+
+
+
+# -- Trip message polling -----------------------------------------------------

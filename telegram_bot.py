@@ -518,6 +518,8 @@ def poll_for_uploads() -> None:
                         _handle_checknow()
                     elif text.startswith("/dbstats"):
                         _handle_dbstats()
+                    elif text.startswith("/resetpilot"):
+                        _handle_resetpilot()
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -761,6 +763,18 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
+def _handle_resetpilot():
+    """/resetpilot — delete all Pilot/Flying J stops so re-upload inserts them fresh"""
+    from database import db_cursor
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM fuel_stops WHERE source = 'pilot'")
+        deleted = cur.rowcount
+    _send_to(ADMIN_CHAT_ID,
+        f"🗑 Deleted *{deleted}* Pilot/Flying J stops from DB.\n"
+        f"Now re-upload `Fuel_Prices.csv` to reload with correct addresses."
+    )
+
+
 def _handle_dbstats():
     """/dbstats — show breakdown of stops with prices by brand"""
     from database import db_cursor
@@ -884,4 +898,3 @@ def _handle_findstop(text: str, chat_id: str):
 # -- Trip message polling -----------------------------------------------------
 
 
-# -- Trip message polling -----------------------------------------------------

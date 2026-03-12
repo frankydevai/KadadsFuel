@@ -247,7 +247,13 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
     if fuel_pct <= 15 and best_stop:
         _send_to_dispatcher(f"{emoji} *{vehicle_name}* — critically low at {fuel_pct:.0f}%")
 
-    return _send_to_truck(vehicle_name, "\n".join(lines))
+    result = _send_to_truck(vehicle_name, "\n".join(lines))
+    # result is a dict: {truck_group, truck_msg_id, dispatcher_msg_id}
+    return result if isinstance(result, dict) else {
+        "truck_group":       None,
+        "truck_msg_id":      result,
+        "dispatcher_msg_id": None,
+    }
 
 
 def send_ca_border_reminder(vehicle_name: str, fuel_pct: float,
@@ -518,8 +524,6 @@ def poll_for_uploads() -> None:
                         _handle_checknow()
                     elif text.startswith("/dbstats"):
                         _handle_dbstats()
-                    elif text.startswith("/resetpilot"):
-                        _handle_resetpilot()
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -579,96 +583,6 @@ def poll_for_uploads() -> None:
 
     except Exception as e:
         log.error(f"poll_for_uploads error: {e}", exc_info=True)
-
-
-
-def send_weekly_savings_report() -> None:
-    """Send weekly savings report every Monday to dispatcher group."""
-    from database import db_cursor
-    from datetime import datetime, timezone, timedelta
-
-    now      = datetime.now(timezone.utc)
-    week_ago = now - timedelta(days=7)
-
-    with db_cursor() as cur:
-        cur.execute("""
-            SELECT
-                COUNT(*)                          AS total_alerts,
-                COUNT(DISTINCT vehicle_id)        AS trucks_active,
-                COALESCE(SUM(savings_usd), 0)     AS total_savings,
-                COUNT(*) FILTER (WHERE savings_usd > 0) AS alerts_with_savings
-            FROM fuel_alerts
-            WHERE alerted_at >= %s AND alert_type = 'low_fuel'
-        """, (week_ago,))
-        stats = dict(cur.fetchone())
-
-        cur.execute("""
-            SELECT vehicle_name,
-                   COALESCE(SUM(savings_usd), 0) AS saved,
-                   COUNT(*) AS alerts
-            FROM fuel_alerts
-            WHERE alerted_at >= %s AND alert_type = 'low_fuel'
-            GROUP BY vehicle_name
-            ORDER BY saved DESC
-            LIMIT 5
-        """, (week_ago,))
-        top_trucks = cur.fetchall()
-
-        cur.execute("""
-            SELECT best_stop_name, best_stop_price
-            FROM fuel_alerts
-            WHERE alerted_at >= %s AND best_stop_price IS NOT NULL
-            ORDER BY best_stop_price ASC
-            LIMIT 1
-        """, (week_ago,))
-        cheapest = cur.fetchone()
-
-    total_savings  = float(stats["total_savings"] or 0)
-    total_alerts   = int(stats["total_alerts"] or 0)
-    trucks_active  = int(stats["trucks_active"] or 0)
-    alerts_savings = int(stats["alerts_with_savings"] or 0)
-
-    week_start = (now - timedelta(days=7)).strftime("%b %d")
-    week_end   = now.strftime("%b %d, %Y")
-
-    lines = [
-        f"📊 *FleetFuel AI — Weekly Savings Report*",
-        f"📅 {week_start} – {week_end}",
-        f"─────────────────────────────",
-        f"",
-        f"🚛 Trucks monitored:     *{trucks_active}*",
-        f"⚡ Alerts fired:          *{total_alerts}*",
-        f"💡 Alerts with savings:  *{alerts_savings}*",
-        f"",
-        f"💰 *Total Diesel Savings:  ${total_savings:,.2f}*",
-    ]
-
-    if cheapest:
-        lines += [
-            f"",
-            f"🏆 *Cheapest stop found this week:*",
-            f"   {cheapest['best_stop_name']} — ${cheapest['best_stop_price']:.3f}/gal",
-        ]
-
-    if top_trucks:
-        lines += ["", "🏅 *Top Trucks — Most Saved:*"]
-        medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
-        for i, t in enumerate(top_trucks):
-            saved  = float(t["saved"] or 0)
-            alerts = int(t["alerts"])
-            name   = t["vehicle_name"]
-            lines.append(f"   {medals[i]} Truck {name} — *${saved:.2f}* ({alerts} alerts)")
-
-    if total_savings == 0:
-        lines += ["", "ℹ️ No savings recorded this week — prices may be equal across stops."]
-
-    lines += ["", "─────────────────────────────", "⚙️ _FleetFuel AI — Automated Report_"]
-
-    msg = "\n".join(lines)
-    if DISPATCHER_GROUP_ID:
-        _send_to(DISPATCHER_GROUP_ID, msg)
-    _send_to(ADMIN_CHAT_ID, msg)
-    log.info(f"Weekly savings report sent — ${total_savings:,.2f} total savings this week")
 
 
 # -- Admin command handlers ---------------------------------------------------
@@ -761,18 +675,6 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"✅ Truck deactivated: *{vehicle_name}*")
     else:
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
-
-
-def _handle_resetpilot():
-    """/resetpilot — delete all Pilot/Flying J stops so re-upload inserts them fresh"""
-    from database import db_cursor
-    with db_cursor() as cur:
-        cur.execute("DELETE FROM fuel_stops WHERE source = 'pilot'")
-        deleted = cur.rowcount
-    _send_to(ADMIN_CHAT_ID,
-        f"🗑 Deleted *{deleted}* Pilot/Flying J stops from DB.\n"
-        f"Now re-upload `Fuel_Prices.csv` to reload with correct addresses."
-    )
 
 
 def _handle_dbstats():
@@ -898,3 +800,4 @@ def _handle_findstop(text: str, chat_id: str):
 # -- Trip message polling -----------------------------------------------------
 
 
+# -- Trip message polling -----------------------------------------------------

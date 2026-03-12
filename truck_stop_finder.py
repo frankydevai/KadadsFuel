@@ -74,13 +74,21 @@ def angle_diff(a, b) -> float:
 def perpendicular_distance(truck_lat, truck_lng, truck_heading,
                             stop_lat, stop_lng) -> float:
     """
-    Approximate perpendicular (cross-track) distance from the truck's
-    route line to the stop, in miles. Used as detour estimate.
+    Actual detour cost = extra miles driven to reach the stop vs staying on route.
+    For a stop ahead: detour = dist_to_stop - along_track (only the off-route portion).
+    For a stop behind: detour = full distance (truck must backtrack).
     """
     dist = haversine_miles(truck_lat, truck_lng, stop_lat, stop_lng)
     bear = bearing(truck_lat, truck_lng, stop_lat, stop_lng)
-    angle = math.radians(angle_diff(truck_heading, bear))
-    return abs(dist * math.sin(angle))
+    angle_rad = math.radians(angle_diff(truck_heading, bear))
+    along_track = dist * math.cos(angle_rad)   # how far stop is along route
+    cross_track = dist * math.sin(angle_rad)   # how far off route
+    if along_track > 0:
+        # Stop is ahead — detour is just the off-route jog (there and back handled in true_cost)
+        return abs(cross_track)
+    else:
+        # Stop is behind — full distance is the detour
+        return dist
 
 
 # -- Urgency tiers ------------------------------------------------------------
@@ -102,10 +110,10 @@ def get_search_radius(urgency: str, fuel_range_miles: float = 0, fuel_pct: float
         return min(fuel_range_miles * 0.80, 100.0) if fuel_range_miles > 0 else 100.0
 
     max_by_urgency = {
-        "ADVISORY":  250.0,   # 35-26% — search most of range
-        "WARNING":   200.0,   # 25-16%
-        "CRITICAL":  150.0,   # 15-10%
-        "EMERGENCY": 100.0,   # <10% — nearest reachable only
+        "ADVISORY":  100.0,   # 35-26% — cap at 100mi, don't send driver too far
+        "WARNING":    80.0,   # 25-16%
+        "CRITICAL":   60.0,   # 15-10%
+        "EMERGENCY":  50.0,   # <10% — nearest reachable only
     }[urgency]
     if fuel_range_miles > 0:
         return min(fuel_range_miles * 0.80, max_by_urgency)
@@ -395,10 +403,22 @@ def find_best_stops(
 
     # Sort by score (true cost for price-matters, distance for critical/emergency)
     candidates.sort(key=lambda s: s["_score"])
-    best = candidates[0]
 
-    # Find nearest stop (by distance) as alt for savings comparison
+    # Safety check: never recommend a stop more than 2x the nearest stop's distance.
+    # e.g. if Pilot is 25mi away, don't send driver 137mi to save $0.31/gal
     nearest = min(candidates, key=lambda s: s["distance_miles"])
+    nearest_dist = nearest["distance_miles"]
+    max_recommend_dist = max(nearest_dist * 2.0, 60.0)  # at least 60mi window
+
+    # Filter out stops beyond the max recommend distance, keep at least 1
+    filtered = [c for c in candidates if c["distance_miles"] <= max_recommend_dist]
+    if not filtered:
+        filtered = candidates  # fallback: keep all if filter removes everything
+
+    # Re-sort filtered by score
+    filtered.sort(key=lambda s: s["_score"])
+    best = filtered[0]
+
     alt = nearest if nearest["store_name"] != best["store_name"] else None
 
     log.info(f"Best: {best['store_name']} {best['distance_miles']:.1f}mi "

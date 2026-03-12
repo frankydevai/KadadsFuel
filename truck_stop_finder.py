@@ -99,7 +99,7 @@ def get_search_radius(urgency: str, fuel_range_miles: float = 0, fuel_pct: float
     """Search up to 80% of actual fuel range, capped by urgency.
     Below 30% fuel: hard cap at 80 miles — don't risk sending driver too far."""
     if fuel_pct < 30:
-        return min(fuel_range_miles * 0.80, 80.0) if fuel_range_miles > 0 else 80.0
+        return min(fuel_range_miles * 0.80, 100.0) if fuel_range_miles > 0 else 100.0
 
     max_by_urgency = {
         "ADVISORY":  250.0,   # 35-26% — search most of range
@@ -113,9 +113,13 @@ def get_search_radius(urgency: str, fuel_range_miles: float = 0, fuel_pct: float
 
 
 def reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
-    """How far the truck can actually drive on current fuel (minus 10% reserve)."""
+    """How far the truck can actually drive on current fuel (minus 10% reserve).
+    At CRITICAL/EMERGENCY, guarantee at least 50 miles so we always find nearby stops."""
     usable = usable_gallons(fuel_pct, tank_gal)
-    return usable * mpg
+    calculated = usable * mpg
+    if fuel_pct <= 15:
+        return max(calculated, 50.0)  # CRITICAL/EMERGENCY — must find something
+    return max(calculated, 30.0)
 
 
 # -- Usable range -------------------------------------------------------------
@@ -312,7 +316,8 @@ def find_best_stops(
         # Must be within search radius AND physically reachable
         if dist > radius:
             continue
-        if dist > max_range:
+        # CRITICAL/EMERGENCY: skip max_range filter — truck must find nearest stop
+        if urgency not in ("CRITICAL", "EMERGENCY") and dist > max_range:
             continue
 
         ahead = True
@@ -336,7 +341,7 @@ def find_best_stops(
         else:
             score = dist
 
-        if not ahead:
+        if not ahead and urgency not in ("EMERGENCY", "CRITICAL"):
             score += BEHIND_PENALTY_MILES * (stop.get("diesel_price") or 4.0)
 
         candidates.append({
@@ -370,7 +375,7 @@ def find_best_stops(
                 fill_cost = (stop["diesel_price"] or 0) * fill_gal
                 tc        = true_cost(stop, truck_lat, truck_lng, truck_heading or 0, fuel_pct, tank_gal, mpg)
                 score     = dist if not ahead else (tc if price_matters else dist)
-                if not ahead:
+                if not ahead and urgency not in ("EMERGENCY", "CRITICAL"):
                     score += BEHIND_PENALTY_MILES * (stop.get("diesel_price") or 4.0)
                 candidates.append({
                     **stop,

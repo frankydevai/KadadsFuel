@@ -219,19 +219,30 @@ def send_low_fuel_alert(vehicle_name: str, fuel_pct: float,
             f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
         ]
 
-        # Savings vs nearest stop
+        # Savings vs alt stop
         if alt_stop and price and alt_stop.get("diesel_price"):
+            from config import DEFAULT_TANK_GAL, SAFETY_RESERVE
             nearest_price   = alt_stop.get("diesel_price")
             nearest_name    = alt_stop.get("store_name", "nearest stop")
             nearest_dist    = alt_stop.get("distance_miles", 0)
             price_diff      = nearest_price - price
+            gallons_needed  = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100) * (1 - SAFETY_RESERVE))
             if price_diff > 0.01:
-                from config import DEFAULT_TANK_GAL, SAFETY_RESERVE
-                gallons_needed  = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100) * (1 - SAFETY_RESERVE))
-                total_savings   = round(price_diff * gallons_needed, 2)
+                total_savings = round(price_diff * gallons_needed, 2)
                 lines.append(
                     f"💵 Saves *${price_diff:.2f}/gal × {gallons_needed} gal = ${total_savings:.0f}* "
                     f"vs {nearest_name} ({nearest_dist:.1f} mi, ${nearest_price:.3f}/gal)"
+                )
+            elif price_diff < -0.01:
+                # best is more expensive per gallon but cheaper true cost (closer)
+                extra_per_gal = abs(price_diff)
+                lines.append(
+                    f"📍 Nearest cheaper: {nearest_name} ({nearest_dist:.1f} mi, ${nearest_price:.3f}/gal) "
+                    f"— but ${extra_per_gal:.2f}/gal cheaper price doesn't offset extra {nearest_dist - dist:.1f} mi detour"
+                )
+            else:
+                lines.append(
+                    f"📍 Nearest stop: {nearest_name} ({nearest_dist:.1f} mi, ${nearest_price:.3f}/gal)"
                 )
 
         if maps_url:
@@ -890,6 +901,3 @@ def send_weekly_savings_report() -> None:
         _send_to(DISPATCHER_GROUP_ID, msg)
     _send_to(ADMIN_CHAT_ID, msg)
     log.info(f"Weekly savings report sent — ${total_savings:,.2f} total savings")
-
-
-# -- Trip message polling -----------------------------------------------------

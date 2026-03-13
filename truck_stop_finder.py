@@ -104,16 +104,12 @@ def get_urgency(fuel_pct: float) -> str:
 
 
 def get_search_radius(urgency: str, fuel_range_miles: float = 0, fuel_pct: float = 100) -> float:
-    """Search up to 80% of actual fuel range, capped by urgency.
-    Below 30% fuel: hard cap at 80 miles — don't risk sending driver too far."""
-    if fuel_pct < 30:
-        return min(fuel_range_miles * 0.80, 100.0) if fuel_range_miles > 0 else 100.0
-
+    """Search up to 80% of actual fuel range, capped by urgency."""
     max_by_urgency = {
-        "ADVISORY":  100.0,   # 35-26% — cap at 100mi, don't send driver too far
-        "WARNING":    80.0,   # 25-16%
-        "CRITICAL":   60.0,   # 15-10%
-        "EMERGENCY":  50.0,   # <10% — nearest reachable only
+        "ADVISORY":  250.0,   # 35-26% — wide search, truck has plenty of range
+        "WARNING":   150.0,   # 25-16%
+        "CRITICAL":  100.0,   # 15-10%
+        "EMERGENCY":  60.0,   # <10% — nearest only
     }[urgency]
     if fuel_range_miles > 0:
         return min(fuel_range_miles * 0.80, max_by_urgency)
@@ -284,6 +280,7 @@ def find_best_stops(
     fuel_pct: float,
     tank_gal: float = DEFAULT_TANK_GAL,
     mpg: float = DEFAULT_MPG,
+    truck_state: str = "",
 ) -> tuple[dict | None, dict | None]:
     """
     Find the best 2 diesel stops for a truck.
@@ -313,11 +310,21 @@ def find_best_stops(
             log.info(f"Truck already at {current['store_name']} ({current['distance_miles']*5280:.0f} ft)")
             return current, None
 
+    # -- If truck is in CA: force 150mi search and skip CA stops entirely ------
+    truck_in_ca = (truck_state or "").upper() == "CA"
+    if truck_in_ca:
+        radius = min(radius, 150.0)
+        log.info(f"Truck in CA — capping radius to 150mi, skipping CA stops")
+
     # -- Score all stops in range --------------------------------------------
     candidates = []
     for stop in all_stops:
         slat = float(stop["latitude"])
         slng = float(stop["longitude"])
+
+        # If truck is in CA, never recommend a CA stop — diesel too expensive
+        if truck_in_ca and (stop.get("state") or "").upper() == "CA":
+            continue
 
         dist = haversine_miles(truck_lat, truck_lng, slat, slng)
 

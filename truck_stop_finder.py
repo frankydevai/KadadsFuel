@@ -297,7 +297,9 @@ def find_best_stops(
     parked        = speed_mph <= _PARKED_SPEED_MPH
     urgency       = get_urgency(fuel_pct)
     max_range     = reachable_miles(fuel_pct, tank_gal, mpg)
-    radius        = get_search_radius(urgency, max_range, fuel_pct)
+    # Always search 100 miles in heading direction for best price comparison
+    # Urgency radius only used as safety fallback for EMERGENCY
+    radius        = 60.0 if urgency == "EMERGENCY" else 100.0
     price_matters = urgency in ("ADVISORY", "WARNING")
 
     log.info(f"Stop finder: urgency={urgency} radius={radius:.0f}mi "
@@ -426,7 +428,10 @@ def find_best_stops(
     filtered.sort(key=lambda s: s["_score"])
     best = filtered[0]
 
-    alt = nearest if nearest["store_name"] != best["store_name"] else None
+    # Alt = most expensive stop within range (for maximum savings comparison)
+    # This shows driver how much they save vs the worst option nearby
+    other = [c for c in filtered if c["store_name"] != best["store_name"]]
+    alt = max(other, key=lambda s: s["diesel_price"] or 0) if other else None
 
     log.info(f"Best: {best['store_name']} {best['distance_miles']:.1f}mi "
              f"${best.get('diesel_price','?')}/gal  true_cost=${best['true_cost']:.2f}")

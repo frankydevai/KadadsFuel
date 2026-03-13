@@ -213,7 +213,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         state.update({"in_yard": False, "yard_name": None})
         if fuel <= FUEL_ALERT_THRESHOLD_PCT:
             send_left_yard_low_fuel(vname, fuel, yard_name)
-            _fire_alert(vid, state, current_data, tank_gal, mpg)
+            _fire_alert(vid, state, current_data, tank_gal, mpg, state_code="")
             return
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -228,7 +228,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
 
     if should_send_ca_reminder(state_code or "", lat, lng, heading,
                                 fuel, state.get("ca_reminder_sent", False)):
-        _fire_ca_reminder(state, current_data, tank_gal, mpg)
+        _fire_ca_reminder(state, current_data, tank_gal, mpg, state_code=state_code or "")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 3. FUEL IS FINE
@@ -283,7 +283,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         _clear_alert(state)
         state["state"]     = "CRITICAL_MOVING"
         state["next_poll"] = _next_poll(POLL_INTERVAL_CRITICAL_MOVING)
-        _fire_alert(vid, state, current_data, tank_gal, mpg)
+        _fire_alert(vid, state, current_data, tank_gal, mpg, state_code=state_code or "")
         return
 
     # ── 4c. MOVING + LOW FUEL ─────────────────────────────────────────────────
@@ -360,7 +360,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 else:
                     reason = f"{minutes_since:.0f}min since last alert"
                 log.info(f"  {vname}: re-alert — {reason}")
-            _fire_alert(vid, state, current_data, tank_gal, mpg)
+            _fire_alert(vid, state, current_data, tank_gal, mpg, state_code=state_code or "")
             state["last_alert_urgency"] = current_urgency
             state["last_alert_time"]    = _utcnow()
             state["last_alert_lat"]     = lat
@@ -425,7 +425,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 if fuel_dropped else f"moved {moved_since_alert:.1f}mi"
             )
             log.info(f"  {vname}: parked re-alert — {reason}")
-        _fire_alert(vid, state, current_data, tank_gal, mpg)
+        _fire_alert(vid, state, current_data, tank_gal, mpg, state_code=state_code or "")
         state["overnight_alert_sent"] = True
         state["last_alerted_fuel"]    = fuel
         state["last_alert_lat"]       = lat
@@ -436,7 +436,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
 
 # -- Alert firing -------------------------------------------------------------
 
-def _fire_alert(vid, state, data, tank_gal, mpg):
+def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
     """Find best stops and send Telegram alert. Deletes previous alert first."""
     vname   = data["vehicle_name"]
     fuel    = data["fuel_pct"]
@@ -528,7 +528,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg):
     state["alert_sent"] = True
 
 
-def _fire_ca_reminder(state, data, tank_gal, mpg):
+def _fire_ca_reminder(state, data, tank_gal, mpg, state_code=""):
     """Send California border reminder."""
     vid     = state.get("vehicle_id")
     vname   = data["vehicle_name"]

@@ -85,68 +85,123 @@ def _coord(val) -> float | None:
 
 # -- Parsers ------------------------------------------------------------------
 
+# US states only — skip Canadian provinces
+_US_STATES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+    "VA","WA","WV","WI","WY","DC",
+}
+
 def _parse_pilot(csv_bytes: bytes, locations_bytes: bytes | None = None) -> list[dict]:
     """
-    Parse Pilot fuel prices.
+    Parse Pilot/Flying J fuel prices by merging:
+      Fuel_Prices.csv   — store#, city, state, diesel price
+      all_locations.csv — store#, name, address, city, state, zip, lat, lng
 
-    Fuel_Prices.csv  — store#, city, state, diesel price (no coordinates)
-    all_locations.csv — store#, name, address, lat, lng, phone, zip
-
-    If locations_bytes provided: merge on store number to get coordinates.
-    If not provided: fall back to prices-only (no lat/lng — stops skipped).
+    Merges on store number. City/address come from locations file (authoritative).
+    Skips Canadian stops. Only keeps Pilot Travel Center + Flying J Travel Center.
     """
-    prices_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str)
-    log.info(f"Pilot prices columns: {list(prices_df.columns)}")
-    c = PILOT_COLUMNS
-
-    if locations_bytes is not None:
-        locs_df = pd.read_csv(io.BytesIO(locations_bytes), dtype=str)
-        log.info(f"Pilot locations columns: {list(locs_df.columns)}")
-
-        # Filter: only Pilot Travel Center and Flying J Travel Center
-        before = len(locs_df)
-        locs_df = locs_df[locs_df[c["store_name"]].str.strip().isin([
-            "Pilot Travel Center",
-            "Flying J Travel Center",
-        ])].reset_index(drop=True)
-        log.info(f"Pilot locations: {before} total → {len(locs_df)} kept (Pilot + Flying J only)")
-
-        df = pd.merge(
-            prices_df,
-            locs_df,
-            left_on=c["store_id"],
-            right_on=c["loc_store_id"],
-            how="inner",
-        )
-        log.info(f"Pilot: {len(prices_df)} prices + {len(locs_df)} locations → {len(df)} merged")
-    else:
-        log.warning("Pilot: no locations file — cannot determine coordinates, skipping all stops.")
+    if locations_bytes is None:
+        log.warning("Pilot: no locations file — skipping all Pilot stops.")
         return []
+
+    # Load both files
+    prices_df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str).fillna("")
+    locs_df   = pd.read_csv(io.BytesIO(locations_bytes), dtype=str).fillna("")
+
+    # Normalize column names — strip whitespace
+    prices_df.columns = [c.strip() for c in prices_df.columns]
+    locs_df.columns   = [c.strip() for c in locs_df.columns]
+
+    log.info(f"Pilot prices: {len(prices_df)} rows, cols={list(prices_df.columns)}")
+    log.info(f"Pilot locations: {len(locs_df)} rows, cols={list(locs_df.columns)}")
+
+    # Filter locations: Pilot + Flying J only
+    locs_df = locs_df[locs_df["Name"].str.strip().isin([
+        "Pilot Travel Center", "Flying J Travel Center"
+    ])].copy()
+    log.info(f"Pilot locations after brand filter: {len(locs_df)}")
+
+    # Filter locations: US only
+    locs_df = locs_df[locs_df["State"].str.strip().str.upper().isin(_US_STATES)].copy()
+    log.info(f"Pilot locations after US filter: {len(locs_df)}")
+
+    # Normalize store number columns for merge
+    prices_df["_store_num"] = prices_df["Pilot Travel Center"].str.strip()
+    locs_df["_store_num"]   = locs_df["Store #"].str.strip()
+
+    # Merge — locations are authoritative for address/city/state/zip
+    df = pd.merge(prices_df, locs_df, on="_store_num", how="inner", suffixes=("_price", "_loc"))
+    log.info(f"Pilot merged: {len(df)} stops")
 
     now = datetime.now(timezone.utc)
     records = []
+    skipped_no_coords = 0
+    skipped_canada    = 0
+
     for _, row in df.iterrows():
-        lat = _coord(row.get(c["latitude"]))
-        lng = _coord(row.get(c["longitude"]))
+        lat = _coord(row.get("Latitude"))
+        lng = _coord(row.get("Longitude"))
         if lat is None or lng is None:
+            skipped_no_coords += 1
             continue
+
+        # Use location file values (authoritative) — never price file city
+        city    = str(row.get("City_loc") or row.get("City_price") or row.get("City") or "").strip()
+        state   = str(row.get("State") or row.get("State/Province") or "").strip().upper()
+        # Convert full state names to abbreviations if needed
+        _STATE_MAP = {
+            "TEXAS":"TX","CALIFORNIA":"CA","FLORIDA":"FL","OHIO":"OH","TENNESSEE":"TN",
+            "GEORGIA":"GA","ILLINOIS":"IL","PENNSYLVANIA":"PA","NEW YORK":"NY","MICHIGAN":"MI",
+            "NORTH CAROLINA":"NC","VIRGINIA":"VA","WASHINGTON":"WA","ARIZONA":"AZ","COLORADO":"CO",
+            "INDIANA":"IN","KENTUCKY":"KY","OREGON":"OR","OKLAHOMA":"OK","NEVADA":"NV",
+            "MISSOURI":"MO","ALABAMA":"AL","ARKANSAS":"AR","LOUISIANA":"LA","MINNESOTA":"MN",
+            "MISSISSIPPI":"MS","IOWA":"IA","KANSAS":"KS","UTAH":"UT","NEBRASKA":"NE",
+            "NEW MEXICO":"NM","SOUTH CAROLINA":"SC","WEST VIRGINIA":"WV","MONTANA":"MT",
+            "IDAHO":"ID","NORTH DAKOTA":"ND","SOUTH DAKOTA":"SD","WYOMING":"WY",
+            "WISCONSIN":"WI","NEW JERSEY":"NJ","MARYLAND":"MD","CONNECTICUT":"CT",
+            "MASSACHUSETTS":"MA","NEW HAMPSHIRE":"NH","VERMONT":"VT","MAINE":"ME",
+            "RHODE ISLAND":"RI","DELAWARE":"DE","ALASKA":"AK","HAWAII":"HI","DC":"DC",
+        }
+        if len(state) > 2:
+            state = _STATE_MAP.get(state, state)
+        address = str(row.get("Address") or "").strip()
+        zip_    = str(row.get("Zip Code") or "").strip()
+        name    = str(row.get("Name") or "Pilot Travel Center").strip()
+        store_id = str(row.get("_store_num") or "").strip()
+
+        # Skip Canadian stops
+        if state not in _US_STATES:
+            skipped_canada += 1
+            continue
+
+        diesel = _price(row.get("Diesel"))
+
         records.append({
             "source":        "pilot",
-            "store_id":      str(row.get(c["store_id"], "")).strip(),
-            "store_name":    str(row.get(c["store_name"], "")).strip() or "Pilot Travel Center",
-            "brand":         str(row.get(c["store_name"], "Pilot Flying J")).strip(),
-            "address":       str(row.get(c["address"], "")).strip(),
-            "city":          str(row.get(c["loc_city"], "")).strip(),
-            "state":         str(row.get(c["loc_state"], "")).strip().upper(),
-            "zip":           str(row.get(c["zip"], "")).strip(),
+            "store_id":      store_id,
+            "store_name":    name,
+            "brand":         name,
+            "address":       address,
+            "city":          city,
+            "state":         state,
+            "zip":           zip_,
             "latitude":      lat,
             "longitude":     lng,
-            "phone":         str(row.get(c["phone"], "")).strip(),
-            "diesel_price":  _price(row.get(c["diesel"])),
+            "phone":         str(row.get("Phone Number") or "").strip(),
+            "diesel_price":  diesel,
             "price_updated": now,
-            "has_diesel":    True,
+            "has_diesel":    diesel is not None,
         })
-    log.info(f"Pilot: parsed {len(records)} stops with coordinates")
+
+    log.info(
+        f"Pilot: {len(records)} stops saved "
+        f"({skipped_no_coords} no coords, {skipped_canada} Canada skipped)"
+    )
+    # Sample log to verify city is populated
+    for r in records[:3]:
+        log.info(f"  Sample: {r['store_name']} | {r['address']}, {r['city']}, {r['state']} {r['zip']} | ${r['diesel_price']}")
     return records
 
 

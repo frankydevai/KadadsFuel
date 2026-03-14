@@ -370,6 +370,7 @@ def register_commands() -> None:
     """Register bot commands so they appear in the Telegram menu."""
     commands = [
         {"command": "checknow",    "description": "Force immediate fuel check on all trucks"},
+        {"command": "resetpilot",  "description": "Wipe Pilot DB rows — then re-upload price files"},
         {"command": "addtruck",    "description": "Add a truck — /addtruck Unit4821 -100123456"},
         {"command": "setgroup",    "description": "Set truck group — /setgroup Unit4821 -100123456"},
         {"command": "listtruck",   "description": "List all trucks and their groups"},
@@ -525,6 +526,8 @@ def poll_for_uploads() -> None:
                         _handle_checknow()
                     elif text.startswith("/dbstats"):
                         _handle_dbstats()
+                    elif text.startswith("/resetpilot"):
+                        _handle_resetpilot()
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -678,6 +681,17 @@ def _handle_removetruck(text: str):
         _send_to(ADMIN_CHAT_ID, f"❌ Truck not found: *{vehicle_name}*")
 
 
+def _handle_resetpilot():
+    """/resetpilot — wipe all Pilot/Flying J stops so re-upload inserts them fresh with correct addresses"""
+    from database import db_cursor
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM fuel_stops WHERE source = 'pilot'")
+        deleted = cur.rowcount
+    _send_to(ADMIN_CHAT_ID,
+        f"🗑 Deleted *{deleted}* Pilot/Flying J stops from DB.\n"
+        f"Now re-upload all_locations.csv then Fuel_Prices.csv to reload with correct addresses."
+    )
+
 def _handle_dbstats():
     """/dbstats — show breakdown of stops with prices by brand"""
     from database import db_cursor
@@ -802,7 +816,6 @@ def _handle_findstop(text: str, chat_id: str):
 
 
 # -- Trip message polling -----------------------------------------------------
-
 
 def send_weekly_savings_report() -> None:
     """Send weekly savings report every Monday 08:00 UTC to dispatcher group and admin."""

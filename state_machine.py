@@ -38,7 +38,7 @@ from config import (
     DISPATCHER_GROUP_ID,
 )
 from yard_geofence import is_in_yard, get_yard_name
-from truck_stop_finder import find_best_stops, calc_savings, get_urgency, find_current_stop, haversine_miles
+from truck_stop_finder import find_best_stops, find_best_stops_on_route, calc_savings, get_urgency, find_current_stop, haversine_miles
 from california import (
     should_send_ca_reminder,
     should_reset_ca_reminder,
@@ -489,7 +489,15 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
         return
 
     # Find best stops and calculate savings
-    best, alt = find_best_stops(lat, lng, heading, speed, fuel, tank_gal, mpg, truck_state=state_code or "")
+    # Use route-based search if QuickManage route is available
+    route = state.get("qm_route")
+    if route:
+        best, alt = find_best_stops_on_route(lat, lng, route, fuel, speed, tank_gal, mpg)
+        if not best:
+            log.info(f"  {vname}: route search found nothing — falling back to heading search")
+            best, alt = find_best_stops(lat, lng, heading, speed, fuel, tank_gal, mpg, truck_state=state_code or "")
+    else:
+        best, alt = find_best_stops(lat, lng, heading, speed, fuel, tank_gal, mpg, truck_state=state_code or "")
     savings   = calc_savings(best, alt) if best and alt else None
 
     # Log to DB

@@ -80,6 +80,10 @@ def _float(key: str, default: float) -> float:
 SAMSARA_API_TOKEN   = _require("SAMSARA_API_TOKEN")
 SAMSARA_BASE_URL    = "https://api.samsara.com"
 
+# QuickManage TMS — route-based fuel stop optimization
+QUICKMANAGE_API_KEY  = os.getenv("QUICKMANAGE_API_KEY", "")
+QUICKMANAGE_API_URL  = "https://api.quickmanage.com"
+
 TELEGRAM_BOT_TOKEN  = _require("TELEGRAM_BOT_TOKEN")
 DISPATCHER_GROUP_ID = _require("DISPATCHER_GROUP_ID")
 ADMIN_CHAT_ID       = _require("ADMIN_CHAT_ID")

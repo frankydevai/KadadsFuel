@@ -439,6 +439,124 @@ def find_best_stops(
     return best, alt
 
 
+
+def find_best_stops_on_route(
+    truck_lat: float,
+    truck_lng: float,
+    route: dict,
+    fuel_pct: float,
+    speed_mph: float,
+    tank_gal: float = DEFAULT_TANK_GAL,
+    mpg: float = DEFAULT_MPG,
+) -> tuple[dict | None, dict | None]:
+    """
+    Find best fuel stop along the actual route from QuickManage.
+
+    Instead of searching in heading direction, searches along the
+    corridor between truck's current position and destination.
+
+    Route dict must have:
+      route["destination"]["lat"], route["destination"]["lng"]
+      route["stops"] — list of stop dicts with lat/lng
+    """
+    dest = route.get("destination") or {}
+    dest_lat = dest.get("lat")
+    dest_lng = dest.get("lng")
+
+    if not dest_lat or not dest_lng:
+        log.warning("Route has no destination coords — falling back to heading search")
+        return None, None
+
+    all_stops = get_all_diesel_stops()
+    if not all_stops:
+        return None, None
+
+    urgency    = get_urgency(fuel_pct)
+    max_range  = reachable_miles(fuel_pct, tank_gal, mpg)
+    truck_in_ca = False  # will be set by caller if needed
+
+    # Corridor: search stops within CORRIDOR_WIDTH miles of the
+    # straight line between truck position and destination
+    CORRIDOR_WIDTH = 30.0  # miles either side of route line
+
+    # Heading from truck to destination
+    route_heading = bearing(truck_lat, truck_lng, dest_lat, dest_lng)
+    total_dist    = haversine_miles(truck_lat, truck_lng, dest_lat, dest_lng)
+
+    log.info(
+        f"Route search: heading={route_heading:.0f}° "
+        f"dest={dest.get('city')},{dest.get('state')} "
+        f"dist={total_dist:.0f}mi urgency={urgency}"
+    )
+
+    candidates = []
+    for stop in all_stops:
+        slat = float(stop["latitude"])
+        slng = float(stop["longitude"])
+
+        # Skip CA stops if truck is in CA
+        if truck_in_ca and (stop.get("state") or "").upper() == "CA":
+            continue
+
+        dist = haversine_miles(truck_lat, truck_lng, slat, slng)
+
+        # Must be reachable
+        if urgency not in ("CRITICAL", "EMERGENCY") and dist > max_range:
+            continue
+
+        # Must be between truck and destination (not behind or past)
+        stop_bear  = bearing(truck_lat, truck_lng, slat, slng)
+        adiff      = angle_diff(route_heading, stop_bear)
+        if adiff > 90:
+            continue  # stop is behind or too far off route direction
+
+        # Must be within corridor width of route line
+        cross_track = abs(dist * math.sin(math.radians(adiff)))
+        if cross_track > CORRIDOR_WIDTH:
+            continue
+
+        # Must not be past the destination
+        along_track = dist * math.cos(math.radians(adiff))
+        if along_track > total_dist * 1.1:  # 10% buffer
+            continue
+
+        price    = stop.get("diesel_price") or 0
+        fill_gal = gallons_to_fill(fuel_pct, tank_gal)
+        tc       = true_cost(stop, truck_lat, truck_lng, route_heading, fuel_pct, tank_gal, mpg)
+
+        candidates.append({
+            **stop,
+            "distance_miles": round(dist, 2),
+            "detour_miles":   round(cross_track, 2),
+            "fill_cost":      round(price * fill_gal, 2),
+            "true_cost":      tc,
+            "_score":         tc if urgency in ("ADVISORY", "WARNING") else dist,
+            "_ahead":         True,
+            "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",
+        })
+
+    if not candidates:
+        log.warning(f"No stops found in route corridor — falling back to heading search")
+        return None, None
+
+    candidates.sort(key=lambda s: s["_score"])
+
+    # Safety cap: don't recommend stop more than 2x nearest distance
+    nearest      = min(candidates, key=lambda s: s["distance_miles"])
+    max_rec_dist = max(nearest["distance_miles"] * 2.0, 60.0)
+    filtered     = [c for c in candidates if c["distance_miles"] <= max_rec_dist] or candidates
+    filtered.sort(key=lambda s: s["_score"])
+
+    best  = filtered[0]
+    other = [c for c in filtered if c["store_name"] != best["store_name"]]
+    alt   = max(other, key=lambda s: s["diesel_price"] or 0) if other else None
+
+    log.info(
+        f"Route best: {best['store_name']} {best['distance_miles']:.1f}mi "
+        f"${best.get('diesel_price','?')}/gal corridor={cross_track:.1f}mi off-route"
+    )
+    return best, alt
+
 def calc_savings(best: dict, alt: dict) -> float | None:
     return None
 

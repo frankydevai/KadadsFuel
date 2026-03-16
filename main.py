@@ -16,9 +16,10 @@ from datetime import datetime, timedelta, timezone
 from config import STATE_SAVE_INTERVAL_SECONDS
 from database import init_db, load_all_truck_states, save_all_truck_states, reset_truck_states, auto_register_truck
 from samsara_client import get_combined_vehicle_data
+from config import QUICKMANAGE_API_KEY
 from state_machine import process_truck
 import telegram_bot
-from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads, send_weekly_savings_report
+from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -50,8 +51,7 @@ def _utcnow():
 
 
 # -- Price updater scheduler --------------------------------------------------
-_last_price_update  = None   # Track last update time
-_last_weekly_report = None   # Track last weekly report
+_last_price_update = None   # Track last update time
 
 def _should_update_prices(now: datetime) -> bool:
     """Run price update once daily at 06:00 UTC."""
@@ -61,19 +61,6 @@ def _should_update_prices(now: datetime) -> bool:
     hours_since = (now - _last_price_update).total_seconds() / 3600
     return hours_since >= 23 and now.hour == 6
 
-
-
-def _should_send_weekly_report(now: datetime) -> bool:
-    """Send weekly report every Monday at 08:00 UTC."""
-    global _last_weekly_report
-    if now.weekday() != 0:          # 0 = Monday
-        return False
-    if now.hour != 8:
-        return False
-    if _last_weekly_report is None:
-        return True
-    hours_since = (now - _last_weekly_report).total_seconds() / 3600
-    return hours_since >= 23        # Prevent double-fire same Monday
 
 
 # -- Main loop ----------------------------------------------------------------
@@ -115,15 +102,6 @@ def main():
                     log.error(f"Upload poll error: {e}")
                 last_upload_check = now
 
-            # -- Weekly savings report (Monday 08:00 UTC) --------------
-            if _should_send_weekly_report(now):
-                global _last_weekly_report
-                try:
-                    send_weekly_savings_report()
-                    _last_weekly_report = now
-                except Exception as e:
-                    log.error(f"Weekly report error: {e}")
-
             # -- Fetch from Samsara -------------------------------------------
             try:
                 all_trucks = get_combined_vehicle_data()
@@ -131,6 +109,17 @@ def main():
                 log.error(f"Samsara fetch failed: {e}")
                 time.sleep(60)
                 continue
+
+            # -- Fetch QuickManage routes (if API key configured) -------------
+            qm_routes = {}
+            if QUICKMANAGE_API_KEY:
+                try:
+                    from quickmanage_client import get_all_truck_routes
+                    qm_routes = get_all_truck_routes()
+                    if qm_routes:
+                        log.info(f"QuickManage: routes loaded for {len(qm_routes)} trucks")
+                except Exception as e:
+                    log.warning(f"QuickManage fetch failed: {e}")
 
             # -- Find trucks due for polling -----------------------------------
             due_trucks = []
@@ -166,6 +155,12 @@ def main():
             # -- Process due trucks -------------------------------------------
             for truck in due_trucks:
                 vid = truck["vehicle_id"]
+                # Attach QuickManage route to truck state if available
+                truck_num = truck.get("vehicle_name", "")
+                if truck_num in qm_routes:
+                    truck_states.setdefault(vid, {})["qm_route"] = qm_routes[truck_num]
+                elif truck_states.get(vid, {}).get("qm_route"):
+                    pass  # keep existing route
                 try:
                     process_truck(vid, truck_states.get(vid, {}),
                                   truck, truck_states)

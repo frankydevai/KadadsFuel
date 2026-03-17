@@ -497,14 +497,9 @@ def poll_for_uploads() -> None:
             username  = from_user.get("username", "").lower()
             first_name = from_user.get("first_name", "").lower()
 
-            # ── QM Notifier message — parse load and save route ──────────
-            is_qm_notifier = (
-                "qm" in username or "qm" in first_name or
-                "notifier" in username or "notifier" in first_name or
-                "quickmanage" in username or
-                "NEW TRIP" in text and "HAS BEEN ASSIGNED" in text
-            )
-            if is_qm_notifier and "NEW TRIP" in text and "HAS BEEN ASSIGNED" in text:
+            # ── QM Notifier message — detect purely by message content ──
+            is_qm_trip_msg = "NEW TRIP" in text and "HAS BEEN ASSIGNED" in text
+            if is_qm_trip_msg:
                 try:
                     from route_reader import parse_qm_notifier_message
                     from database import save_truck_route, get_truck_by_group
@@ -529,7 +524,9 @@ def poll_for_uploads() -> None:
                 text = text.split("@")[0]
 
             # /findstop works from ANY group (driver groups)
-            if text.startswith("/route"):
+            if text.startswith("/loadroute"):
+                _handle_loadroute(text, chat_id)
+            elif text.startswith("/route"):
                 _handle_route(text, chat_id)
             elif text.startswith("/findstop"):
                 try:

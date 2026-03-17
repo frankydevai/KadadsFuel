@@ -883,6 +883,7 @@ def _handle_findstop(text: str, chat_id: str):
     lines = [
         f"⛽ *Fuel Stops — Truck {vname}*",
         f"📍 Current location | ⛽ {fuel:.0f}% fuel | 🧭 {speed:.0f} mph",
+        f"🌐 GPS: `{lat:.5f}, {lng:.5f}`",
         f"🔍 Top {FINDSTOP_TOP_N} cheapest within {FINDSTOP_RADIUS:.0f} miles\n",
     ]
 
@@ -903,20 +904,6 @@ def _handle_findstop(text: str, chat_id: str):
 
     _send_to(chat_id, "\n".join(lines))
 
-
-
-
-# -- Trip message polling -----------------------------------------------------
-
-
-# -- Trip message polling -----------------------------------------------------
-
-
-
-# -- Trip message polling -----------------------------------------------------
-
-
-# -- Trip message polling -----------------------------------------------------
 
 
 

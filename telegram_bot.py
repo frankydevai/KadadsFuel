@@ -756,8 +756,7 @@ def _handle_dbstats():
 
 
 def _handle_route(text: str, chat_id: str) -> None:
-    """/route <truck_number> — show active QuickManage load instantly (no geocoding)"""
-    from config import QUICKMANAGE_API_KEY
+    """/route <truck_number> — show last parsed QM Notifier route from DB"""
     parts = text.strip().split()
     if len(parts) < 2:
         _send_to(chat_id, "Usage: `/route 0792`")
@@ -765,85 +764,54 @@ def _handle_route(text: str, chat_id: str) -> None:
 
     truck_num = parts[1].strip()
 
-    if not QUICKMANAGE_API_KEY:
-        _send_to(chat_id, "❌ QuickManage API key not configured in Railway.")
-        return
-
     try:
-        import requests as _req
-        import json as _json
-        headers = {
-            "Authorization": f"Bearer {QUICKMANAGE_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        # Search trips — no geocoding, just raw API data
-        payload = {"query": "", "filters": [], "page": 0, "page_size": 50}
-        resp = _req.post(
-            "https://api.quickmanage.com/x/trips/search",
-            json=payload, headers=headers, timeout=8
-        )
-        resp.raise_for_status()
-        trips = resp.json().get("data", {}).get("items", [])
+        from database import get_truck_route
+        route = get_truck_route(truck_num)
     except Exception as e:
-        _send_to(chat_id, f"❌ QuickManage API error: {e}")
+        _send_to(chat_id, f"❌ DB error: `{e}`")
         return
 
-    # Find trip assigned to this truck
-    found_trip = None
-    for trip in trips:
-        if trip.get("status", "").lower() not in ("dispatched", "in_transit"):
-            continue
-        for stop in (trip.get("stops") or []):
-            truck = stop.get("assigned_truck") or {}
-            if str(truck.get("number", "")).strip() == truck_num:
-                found_trip = trip
-                break
-        if found_trip:
-            break
-
-    if not found_trip:
+    if not route:
         _send_to(chat_id,
             f"🚛 Truck *{truck_num}*\n"
-            f"❌ No active load found.\n"
-            f"_(Only dispatched/in_transit loads shown)_"
+            f"❌ No route found.\n"
+            f"Route is saved automatically when QM Notifier posts a trip in the driver group."
         )
         return
 
-    status = found_trip.get("status", "").lower()
+    status = route.get("status", "").lower()
     status_label = {
         "dispatched": "🟡 Dispatched → heading to pickup",
         "in_transit": "🟢 In Transit → heading to delivery",
-    }.get(status, status)
+    }.get(status, f"📌 {status}")
+
+    origin = route.get("origin", {})
+    dest   = route.get("destination", {})
 
     lines = [
         f"🗺 *Truck {truck_num} — Active Load*",
-        f"📋 Ref: `{found_trip.get('ref_number','')}` | Trip #{found_trip.get('trip_num','')}",
-        f"📌 {status_label}",
+        f"📋 Trip #: `{route.get('trip_num','')}` | Ref: `{route.get('ref_number','')}`",
+        f"{status_label}",
         "",
     ]
 
-    stops = found_trip.get("stops") or []
-    # Find next stop based on status
-    next_stop_idx = 0 if status == "dispatched" else 1
-
-    for i, stop in enumerate(stops):
-        addr   = stop.get("address") or {}
-        city   = addr.get("city", "")
-        state  = addr.get("state", "")
-        zip_   = addr.get("zip_code", "")
-        icon   = "📦" if stop.get("pickup") else "🏁"
-        stype  = "Pickup" if stop.get("pickup") else "Delivery"
-        is_next = (i == next_stop_idx)
-        arrow  = "  ← *NEXT*" if is_next else ""
-
-        lines.append(f"{icon} *Stop {i+1} — {stype}*{arrow}")
-        lines.append(f"   {stop.get('company_name','')}")
-        lines.append(f"   📍 {city}, {state} {zip_}".strip())
-        appt = stop.get("appointment_date","")
-        if appt:
-            lines.append(f"   🕐 {appt[:16].replace('T',' ')}")
+    for s in route.get("stops", []):
+        icon  = "📦" if s["pickup"] else "🏁"
+        stype = "Pickup" if s["pickup"] else "Delivery"
+        loc   = f"{s['city']}, {s['state']} {s['zip']}".strip()
+        is_next = (
+            s["city"] == dest.get("city") and
+            s["state"] == dest.get("state")
+        )
+        arrow = "  ← *NEXT*" if is_next else ""
+        lines.append(f"{icon} *Stop {s['stop_num']} — {stype}*{arrow}")
+        lines.append(f"   {s['company']}")
+        lines.append(f"   📍 {loc}")
+        if s.get("appt"):
+            lines.append(f"   🕐 {s['appt'][:16].replace('T',' ')}")
         lines.append("")
 
+    lines.append(f"🏁 *Destination: {dest.get('city')}, {dest.get('state')}*")
     _send_to(chat_id, "\n".join(lines))
 
 
@@ -935,6 +903,13 @@ def _handle_findstop(text: str, chat_id: str):
 
     _send_to(chat_id, "\n".join(lines))
 
+
+
+
+# -- Trip message polling -----------------------------------------------------
+
+
+# -- Trip message polling -----------------------------------------------------
 
 
 

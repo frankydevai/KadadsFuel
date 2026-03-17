@@ -162,6 +162,10 @@ def main():
                 try:
                     process_truck(vid, truck_states.get(vid, {}),
                                   truck, truck_states)
+                    # Save immediately if an alert was fired — preserves msg_ids for deletion
+                    if truck_states.get(vid, {}).get("alert_sent"):
+                        from database import save_truck_state
+                        save_truck_state(truck_states[vid])
                 except Exception as e:
                     log.error(f"Error processing {truck['vehicle_name']}: {e}", exc_info=True)
 
@@ -177,6 +181,9 @@ def main():
 
     log.info("FleetFuel Bot stopped cleanly.")
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

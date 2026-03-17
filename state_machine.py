@@ -309,7 +309,8 @@ def process_truck(vid, prev_state, current_data, truck_states):
             if last_alert_time else 9999
         )
         # 30% - 20%: every 30 min | 20% - 10%: every 10 min
-        time_threshold  = 10 if fuel <= 20 else 30
+        # 35-15%: alert every 20 min | below 15%: alert every 10 min
+        time_threshold  = 10 if fuel <= 15 else 20
         time_elapsed    = minutes_since >= time_threshold
 
         # Fuel drop since last alert

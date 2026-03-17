@@ -19,14 +19,33 @@ def _get(endpoint: str, params: dict = None) -> dict:
 
 
 def get_vehicle_locations() -> list[dict]:
+    """Fetch current vehicle locations from Samsara."""
     url  = "https://api.samsara.com/fleet/vehicles/locations"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    return resp.json().get("data", [])
+    data = resp.json().get("data", [])
+    # Log any trucks with stale locations (>2 hours old)
+    import logging
+    log = logging.getLogger(__name__)
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    for v in data:
+        loc = v.get("location", {})
+        ts  = loc.get("time", "")
+        if ts:
+            try:
+                t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                age_min = (now - t).total_seconds() / 60
+                if age_min > 120:
+                    log.warning(f"Truck {v.get('name')} GPS stale: {age_min:.0f} min old ({loc.get('reverseGeo',{}).get('formattedLocation','')})")
+            except Exception:
+                pass
+    return data
 
 
 def get_vehicle_stats() -> list[dict]:
-    url    = "https://api.samsara.com/fleet/vehicles/stats/feed"
+    """Fetch current fuel levels — use /history endpoint with short window for latest reading."""
+    url    = "https://api.samsara.com/fleet/vehicles/stats"
     params = {"types": "fuelPercents"}
     resp   = requests.get(url, headers=HEADERS, params=params, timeout=15)
     resp.raise_for_status()
@@ -55,12 +74,17 @@ def get_combined_vehicle_data() -> list[dict]:
     # Index fuel stats by vehicle id
     stats_map = {}
     for s in stats_raw:
-        vid         = s.get("id")
+        vid = s.get("id")
+        if not vid:
+            continue
+        # /stats endpoint returns fuelPercents as list with single current reading
         fuel_events = s.get("fuelPercents", [])
-        if vid and fuel_events:
-            latest         = max(fuel_events, key=lambda x: x.get("time", ""))
-            stats_map[vid] = float(latest.get("value", 100))
-        elif vid:
+        if fuel_events:
+            # Get most recent reading
+            latest = max(fuel_events, key=lambda x: x.get("time", ""))
+            val = latest.get("value")
+            stats_map[vid] = float(val) if val is not None else 100.0
+        else:
             stats_map[vid] = 100.0
 
     results = []

@@ -16,7 +16,6 @@ from datetime import datetime, timedelta, timezone
 from config import STATE_SAVE_INTERVAL_SECONDS
 from database import init_db, load_all_truck_states, save_all_truck_states, reset_truck_states, auto_register_truck
 from samsara_client import get_combined_vehicle_data
-from config import QUICKMANAGE_API_KEY
 from state_machine import process_truck
 import telegram_bot
 from telegram_bot import send_startup_message, send_price_update_notification, poll_for_uploads
@@ -110,16 +109,15 @@ def main():
                 time.sleep(60)
                 continue
 
-            # -- Fetch QuickManage routes (if API key configured) -------------
-            qm_routes = {}
-            if QUICKMANAGE_API_KEY:
-                try:
-                    from quickmanage_client import get_all_truck_routes
-                    qm_routes = get_all_truck_routes()
-                    if qm_routes:
-                        log.info(f"QuickManage: routes loaded for {len(qm_routes)} trucks")
-                except Exception as e:
-                    log.warning(f"QuickManage fetch failed: {e}")
+            # -- Load routes from DB (saved by QM Notifier message parser) --
+            try:
+                from database import get_all_truck_routes_from_db
+                qm_routes = get_all_truck_routes_from_db()
+                if qm_routes:
+                    log.info(f"Routes loaded from DB for {len(qm_routes)} trucks")
+            except Exception as e:
+                log.warning(f"Route DB load failed: {e}")
+                qm_routes = {}
 
             # -- Find trucks due for polling -----------------------------------
             due_trucks = []

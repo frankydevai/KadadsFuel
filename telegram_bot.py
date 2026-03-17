@@ -491,8 +491,38 @@ def poll_for_uploads() -> None:
             message = update.get("message", {})
             chat_id = str(message.get("chat", {}).get("id", ""))
 
-            document = message.get("document")
-            text     = message.get("text", "").strip()
+            document  = message.get("document")
+            text      = message.get("text", "").strip()
+            from_user = message.get("from", {})
+            username  = from_user.get("username", "").lower()
+            first_name = from_user.get("first_name", "").lower()
+
+            # ── QM Notifier message — parse load and save route ──────────
+            is_qm_notifier = (
+                "qm" in username or "qm" in first_name or
+                "notifier" in username or "notifier" in first_name or
+                "quickmanage" in username or
+                "NEW TRIP" in text and "HAS BEEN ASSIGNED" in text
+            )
+            if is_qm_notifier and "NEW TRIP" in text and "HAS BEEN ASSIGNED" in text:
+                try:
+                    from route_reader import parse_qm_notifier_message
+                    from database import save_truck_route, get_truck_by_group
+                    route = parse_qm_notifier_message(text, chat_id)
+                    if route:
+                        # Find which truck this group belongs to
+                        truck = get_truck_by_group(chat_id)
+                        if truck:
+                            save_truck_route(truck["vehicle_name"], chat_id, route)
+                            log.info(
+                                f"Route saved for truck {truck['vehicle_name']}: "
+                                f"trip {route['trip_num']} "
+                                f"{route['origin']['city']} → {route['destination']['city']}"
+                            )
+                        else:
+                            log.warning(f"QM message in group {chat_id} — no truck matched")
+                except Exception as e:
+                    log.error(f"QM Notifier parse error: {e}", exc_info=True)
 
             # Strip bot username from commands e.g. /listtruck@FuelAlertBot → /listtruck
             if text.startswith("/"):
@@ -530,6 +560,8 @@ def poll_for_uploads() -> None:
                         _handle_dbstats()
                     elif text.startswith("/resetpilot"):
                         _handle_resetpilot()
+                    elif text.startswith("/testroute"):
+                        _handle_testroute(text)
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -721,6 +753,98 @@ def _handle_dbstats():
         lines.append(f"  Price: ${mn:.3f} – ${mx:.3f}  (avg ${avg:.3f})")
         lines.append(f"  Updated: {updated_s}\n")
     _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+
+
+def _handle_route(text: str, chat_id: str) -> None:
+    """/route <truck_number> — show active QuickManage load instantly (no geocoding)"""
+    from config import QUICKMANAGE_API_KEY
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/route 0792`")
+        return
+
+    truck_num = parts[1].strip()
+
+    if not QUICKMANAGE_API_KEY:
+        _send_to(chat_id, "❌ QuickManage API key not configured in Railway.")
+        return
+
+    try:
+        import requests as _req
+        import json as _json
+        headers = {
+            "Authorization": f"Bearer {QUICKMANAGE_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        # Search trips — no geocoding, just raw API data
+        payload = {"query": "", "filters": [], "page": 0, "page_size": 50}
+        resp = _req.post(
+            "https://api.quickmanage.com/x/trips/search",
+            json=payload, headers=headers, timeout=8
+        )
+        resp.raise_for_status()
+        trips = resp.json().get("data", {}).get("items", [])
+    except Exception as e:
+        _send_to(chat_id, f"❌ QuickManage API error: {e}")
+        return
+
+    # Find trip assigned to this truck
+    found_trip = None
+    for trip in trips:
+        if trip.get("status", "").lower() not in ("dispatched", "in_transit"):
+            continue
+        for stop in (trip.get("stops") or []):
+            truck = stop.get("assigned_truck") or {}
+            if str(truck.get("number", "")).strip() == truck_num:
+                found_trip = trip
+                break
+        if found_trip:
+            break
+
+    if not found_trip:
+        _send_to(chat_id,
+            f"🚛 Truck *{truck_num}*\n"
+            f"❌ No active load found.\n"
+            f"_(Only dispatched/in_transit loads shown)_"
+        )
+        return
+
+    status = found_trip.get("status", "").lower()
+    status_label = {
+        "dispatched": "🟡 Dispatched → heading to pickup",
+        "in_transit": "🟢 In Transit → heading to delivery",
+    }.get(status, status)
+
+    lines = [
+        f"🗺 *Truck {truck_num} — Active Load*",
+        f"📋 Ref: `{found_trip.get('ref_number','')}` | Trip #{found_trip.get('trip_num','')}",
+        f"📌 {status_label}",
+        "",
+    ]
+
+    stops = found_trip.get("stops") or []
+    # Find next stop based on status
+    next_stop_idx = 0 if status == "dispatched" else 1
+
+    for i, stop in enumerate(stops):
+        addr   = stop.get("address") or {}
+        city   = addr.get("city", "")
+        state  = addr.get("state", "")
+        zip_   = addr.get("zip_code", "")
+        icon   = "📦" if stop.get("pickup") else "🏁"
+        stype  = "Pickup" if stop.get("pickup") else "Delivery"
+        is_next = (i == next_stop_idx)
+        arrow  = "  ← *NEXT*" if is_next else ""
+
+        lines.append(f"{icon} *Stop {i+1} — {stype}*{arrow}")
+        lines.append(f"   {stop.get('company_name','')}")
+        lines.append(f"   📍 {city}, {state} {zip_}".strip())
+        appt = stop.get("appointment_date","")
+        if appt:
+            lines.append(f"   🕐 {appt[:16].replace('T',' ')}")
+        lines.append("")
+
+    _send_to(chat_id, "\n".join(lines))
 
 
 def _handle_findstop(text: str, chat_id: str):

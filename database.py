@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS truck_states (
     prev_truck_group        TEXT,
     prev_truck_msg_id       BIGINT,
     prev_dispatcher_msg_id  BIGINT,
+    prev_ca_truck_msg_id       BIGINT,
+    prev_ca_dispatcher_msg_id  BIGINT,
     last_updated            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -171,6 +173,15 @@ CREATE TABLE IF NOT EXISTS bot_config (
     value      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS truck_routes (
+    truck_number    TEXT PRIMARY KEY,
+    group_chat_id   TEXT,
+    trip_num        TEXT,
+    ref_number      TEXT,
+    route_json      TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 
@@ -186,6 +197,8 @@ def init_db():
         ("prev_truck_group",       "TEXT"),
         ("prev_truck_msg_id",      "BIGINT"),
         ("prev_dispatcher_msg_id", "BIGINT"),
+        ("prev_ca_truck_msg_id",      "BIGINT"),
+        ("prev_ca_dispatcher_msg_id", "BIGINT"),
     ]:
         cur.execute(f"ALTER TABLE truck_states ADD COLUMN IF NOT EXISTS {col} {coltype}")
     conn.commit()
@@ -270,6 +283,16 @@ def auto_register_truck(vehicle_id: str, vehicle_name: str) -> bool:
         )
         log.info(f"Auto-registered new truck: {vehicle_name}")
         return True
+
+
+def get_truck_by_group(group_id: str) -> dict | None:
+    """Get truck record by its Telegram group ID."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM trucks WHERE telegram_group_id = %s AND is_active = TRUE",
+            (str(group_id),)
+        )
+        return cur.fetchone()
 
 
 def upsert_truck_group(vehicle_name: str, group_id: str) -> bool:
@@ -389,6 +412,8 @@ def load_all_truck_states() -> dict:
             "prev_truck_group":       r.get("prev_truck_group"),
             "prev_truck_msg_id":      r.get("prev_truck_msg_id"),
             "prev_dispatcher_msg_id": r.get("prev_dispatcher_msg_id"),
+            "prev_ca_truck_msg_id":      r.get("prev_ca_truck_msg_id"),
+            "prev_ca_dispatcher_msg_id": r.get("prev_ca_dispatcher_msg_id"),
         }
     return states
 
@@ -404,7 +429,7 @@ def save_truck_state(state: dict):
             assigned_stop_lat, assigned_stop_lng, assignment_time,
             in_yard, yard_name, sleeping, fuel_when_parked,
             ca_reminder_sent, prev_truck_group, prev_truck_msg_id,
-            prev_dispatcher_msg_id, last_updated
+            prev_dispatcher_msg_id, prev_ca_truck_msg_id, prev_ca_dispatcher_msg_id, last_updated
         ) VALUES (
             %(vehicle_id)s, %(vehicle_name)s, %(state)s, %(fuel_pct)s,
             %(lat)s, %(lng)s, %(speed_mph)s, %(heading)s,
@@ -413,7 +438,7 @@ def save_truck_state(state: dict):
             %(assigned_stop_lat)s, %(assigned_stop_lng)s, %(assignment_time)s,
             %(in_yard)s, %(yard_name)s, %(sleeping)s, %(fuel_when_parked)s,
             %(ca_reminder_sent)s, %(prev_truck_group)s, %(prev_truck_msg_id)s,
-            %(prev_dispatcher_msg_id)s, NOW()
+            %(prev_dispatcher_msg_id)s, %(prev_ca_truck_msg_id)s, %(prev_ca_dispatcher_msg_id)s, NOW()
         )
         ON CONFLICT (vehicle_id) DO UPDATE SET
             vehicle_name           = EXCLUDED.vehicle_name,
@@ -441,6 +466,8 @@ def save_truck_state(state: dict):
             prev_truck_group       = EXCLUDED.prev_truck_group,
             prev_truck_msg_id      = EXCLUDED.prev_truck_msg_id,
             prev_dispatcher_msg_id = EXCLUDED.prev_dispatcher_msg_id,
+            prev_ca_truck_msg_id      = EXCLUDED.prev_ca_truck_msg_id,
+            prev_ca_dispatcher_msg_id = EXCLUDED.prev_ca_dispatcher_msg_id,
             last_updated           = NOW()
     """
     with db_cursor() as cur:
@@ -471,6 +498,8 @@ def save_truck_state(state: dict):
             "prev_truck_group":       state.get("prev_truck_group"),
             "prev_truck_msg_id":      state.get("prev_truck_msg_id"),
             "prev_dispatcher_msg_id": state.get("prev_dispatcher_msg_id"),
+            "prev_ca_truck_msg_id":      state.get("prev_ca_truck_msg_id"),
+            "prev_ca_dispatcher_msg_id": state.get("prev_ca_dispatcher_msg_id"),
         })
 
 
@@ -539,3 +568,59 @@ def get_bot_config(key: str) -> str | None:
 
 def set_bot_config(key: str, value: str):
     set_config_value(key, value)
+
+def save_truck_route(truck_number: str, group_chat_id: str, route: dict) -> None:
+    """Save parsed QM Notifier route for a truck."""
+    import json
+    with db_cursor() as cur:
+        cur.execute("""
+            INSERT INTO truck_routes (truck_number, group_chat_id, trip_num, ref_number, route_json, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (truck_number) DO UPDATE SET
+                group_chat_id = EXCLUDED.group_chat_id,
+                trip_num      = EXCLUDED.trip_num,
+                ref_number    = EXCLUDED.ref_number,
+                route_json    = EXCLUDED.route_json,
+                updated_at    = NOW()
+        """, (
+            truck_number,
+            group_chat_id,
+            str(route.get("trip_num", "")),
+            str(route.get("ref_number", "")),
+            json.dumps(route),
+        ))
+    log.info(f"Route saved for truck {truck_number}: trip {route.get('trip_num')}")
+
+
+def get_truck_route(truck_number: str) -> dict | None:
+    """Get the last saved route for a truck."""
+    import json
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT route_json FROM truck_routes WHERE truck_number = %s",
+            (truck_number,)
+        )
+        row = cur.fetchone()
+        if row and row["route_json"]:
+            return json.loads(row["route_json"])
+    return None
+
+
+def get_all_truck_routes_from_db() -> dict[str, dict]:
+    """Get all saved routes keyed by truck_number."""
+    import json
+    routes = {}
+    with db_cursor() as cur:
+        cur.execute("SELECT truck_number, route_json FROM truck_routes")
+        for row in cur.fetchall():
+            if row["route_json"]:
+                try:
+                    routes[row["truck_number"]] = json.loads(row["route_json"])
+                except Exception:
+                    pass
+    return routes
+
+
+def get_last_qm_message(chat_id: str) -> dict | None:
+    """Stub — routes stored via save_truck_route."""
+    return None

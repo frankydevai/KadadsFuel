@@ -44,8 +44,8 @@ def get_vehicle_locations() -> list[dict]:
 
 
 def get_vehicle_stats() -> list[dict]:
-    """Fetch current fuel levels — use /history endpoint with short window for latest reading."""
-    url    = "https://api.samsara.com/fleet/vehicles/stats"
+    """Fetch current fuel levels using stats/feed — returns latest value per vehicle."""
+    url    = "https://api.samsara.com/fleet/vehicles/stats/feed"
     params = {"types": "fuelPercents"}
     resp   = requests.get(url, headers=HEADERS, params=params, timeout=15)
     resp.raise_for_status()
@@ -77,13 +77,16 @@ def get_combined_vehicle_data() -> list[dict]:
         vid = s.get("id")
         if not vid:
             continue
-        # /stats endpoint returns fuelPercents as list with single current reading
         fuel_events = s.get("fuelPercents", [])
         if fuel_events:
-            # Get most recent reading
             latest = max(fuel_events, key=lambda x: x.get("time", ""))
             val = latest.get("value")
-            stats_map[vid] = float(val) if val is not None else 100.0
+            # value is 0.0-1.0 in feed (fraction) — convert to percentage
+            if val is not None:
+                fval = float(val)
+                stats_map[vid] = round(fval * 100, 1) if fval <= 1.0 else round(fval, 1)
+            else:
+                stats_map[vid] = 100.0
         else:
             stats_map[vid] = 100.0
 

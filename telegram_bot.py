@@ -317,6 +317,7 @@ def poll_for_uploads():
                     elif text.startswith("/resetpilot"):   _handle_resetpilot()
                     elif text.startswith("/findload"):     _handle_findload(text, chat_id)
                     elif text.startswith("/testroute"):    _handle_testroute(text)
+                    elif text.startswith("/routelist"):     _handle_routelist(chat_id)
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
@@ -478,7 +479,7 @@ def _handle_findload(text: str, chat_id: str) -> None:
             _send_to(chat_id, "❌ Could not get QuickManage token.")
             return
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {"query": "", "filters": [{"field": "trip_num", "operator": "eq", "value": trip_num}], "page": 0, "page_size": 5}
+        payload = {"query": trip_num, "filters": [], "page": 0, "page_size": 10}
         resp = requests.post("https://api.quickmanage.com/x/trips/search", json=payload, headers=headers, timeout=10)
         log.info(f"/findload {trip_num} → {resp.status_code}: {resp.text[:800]}")
         if not resp.ok:
@@ -532,6 +533,30 @@ def _handle_route(text: str, chat_id: str) -> None:
     except Exception as e:
         _send_to(chat_id, f"❌ Error: `{e}`")
         return
+    if not route:
+        # Try searching QM by truck number as query string
+        try:
+            from config import QM_CLIENT_ID, QM_CLIENT_SECRET
+            if QM_CLIENT_ID and QM_CLIENT_SECRET:
+                from quickmanage_client import _get_token, _build_route, _ACTIVE_STATUSES
+                token = _get_token()
+                if token:
+                    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                    resp = requests.post(
+                        "https://api.quickmanage.com/x/trips/search",
+                        json={"query": truck_num, "filters": [], "page": 0, "page_size": 20},
+                        headers=hdrs, timeout=10
+                    )
+                    if resp.ok:
+                        items = resp.json().get("data", {}).get("items", [])
+                        for trip in items:
+                            if trip.get("status","").lower() in _ACTIVE_STATUSES:
+                                route = _build_route(trip, truck_num)
+                                if route:
+                                    break
+        except Exception as e:
+            log.warning(f"/route QM query fallback failed: {e}")
+
     if not route:
         _send_to(chat_id, f"🚛 Truck *{truck_num}*\n❌ No route found.\nRoute is saved when QM Notifier posts a trip in the driver group.")
         return
@@ -657,6 +682,64 @@ def _handle_findstop(text: str, chat_id: str):
         if i < len(nearby):
             lines.append("")
     _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_routelist(chat_id: str) -> None:
+    """/routelist — show all trucks with active QM routes"""
+    try:
+        from config import QM_CLIENT_ID, QM_CLIENT_SECRET
+        routes = {}
+        if QM_CLIENT_ID and QM_CLIENT_SECRET:
+            from quickmanage_client import get_all_truck_routes
+            routes = get_all_truck_routes()
+        if not routes:
+            from database import get_all_truck_routes_from_db
+            routes = get_all_truck_routes_from_db()
+    except Exception as e:
+        _send_to(chat_id, f"❌ Error: `{e}`")
+        return
+
+    if not routes:
+        _send_to(chat_id, "❌ No active routes found.")
+        return
+
+    status_emoji = {"dispatched": "🟡", "in_transit": "🟢", "upcoming": "🔵"}
+
+    lines = [f"🗺 *Active Routes — {len(routes)} trucks*\n"]
+    for truck_num, route in sorted(routes.items()):
+        status = route.get("status", "").lower()
+        emoji  = status_emoji.get(status, "⚪")
+        origin = route.get("origin", {})
+        dest   = route.get("destination", {})
+        trip   = route.get("trip_num", "")
+        o_city = f"{origin.get('city','?')}, {origin.get('state','')}"
+        d_city = f"{dest.get('city','?')}, {dest.get('state','')}"
+        lines.append(f"{emoji} *Truck {truck_num}* — Trip #{trip}")
+        lines.append(f"   {o_city} → {d_city}")
+        lines.append("")
+
+    # Split into chunks if too long
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        chunks = []
+        chunk  = [f"🗺 *Active Routes — {len(routes)} trucks*\n"]
+        for truck_num, route in sorted(routes.items()):
+            status = route.get("status", "").lower()
+            emoji  = status_emoji.get(status, "⚪")
+            origin = route.get("origin", {})
+            dest   = route.get("destination", {})
+            trip   = route.get("trip_num", "")
+            line   = f"{emoji} *{truck_num}* #{trip} | {origin.get('city','?')},{origin.get('state','')} → {dest.get('city','?')},{dest.get('state','')}"
+            chunk.append(line)
+            if len("\n".join(chunk)) > 3800:
+                chunks.append("\n".join(chunk))
+                chunk = []
+        if chunk:
+            chunks.append("\n".join(chunk))
+        for c in chunks:
+            _send_to(chat_id, c)
+    else:
+        _send_to(chat_id, msg)
 
 
 def send_weekly_savings_report() -> None:

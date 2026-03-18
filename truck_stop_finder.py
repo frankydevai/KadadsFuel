@@ -104,16 +104,15 @@ def get_urgency(fuel_pct: float) -> str:
 
 
 def get_search_radius(urgency: str, fuel_range_miles: float = 0, fuel_pct: float = 100) -> float:
-    """Search up to 80% of actual fuel range, capped by urgency."""
-    max_by_urgency = {
-        "ADVISORY":  250.0,   # 35-26% — wide search, truck has plenty of range
-        "WARNING":   150.0,   # 25-16%
-        "CRITICAL":  100.0,   # 15-10%
-        "EMERGENCY":  60.0,   # <10% — nearest only
-    }[urgency]
-    if fuel_range_miles > 0:
-        return min(fuel_range_miles * 0.80, max_by_urgency)
-    return max_by_urgency
+    """
+    Search radius rules:
+      30-35% fuel (ADVISORY): 100 miles — wide search for best price
+      Below 30% (WARNING/CRITICAL/EMERGENCY): 50 miles — nearest cheaper stop
+    """
+    if fuel_pct >= 30:
+        return 100.0   # 30-35% — search 100 miles for best price
+    else:
+        return 50.0    # below 30% — find best within 50 miles
 
 
 def reachable_miles(fuel_pct: float, tank_gal: float, mpg: float) -> float:
@@ -477,7 +476,8 @@ def find_best_stops_on_route(
 
     # Corridor: search stops within CORRIDOR_WIDTH miles of the
     # straight line between truck position and destination
-    CORRIDOR_WIDTH = 30.0  # miles either side of route line
+    # Corridor width based on fuel level
+    CORRIDOR_WIDTH = 50.0 if fuel_pct >= 30 else 25.0
 
     # Heading from truck to destination
     route_heading = bearing(truck_lat, truck_lng, dest_lat, dest_lng)

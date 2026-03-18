@@ -557,6 +557,8 @@ def poll_for_uploads() -> None:
                         _handle_dbstats()
                     elif text.startswith("/resetpilot"):
                         _handle_resetpilot()
+                    elif text.startswith("/findload"):
+                        _handle_findload(text, chat_id)
                     elif text.startswith("/testroute"):
                         _handle_testroute(text)
                     else:
@@ -910,6 +912,12 @@ def _handle_findstop(text: str, chat_id: str):
     _send_to(chat_id, "\n".join(lines))
 
 
+
+
+# -- Trip message polling -----------------------------------------------------
+
+
+# -- Trip message polling -----------------------------------------------------
 
 
 # -- Trip message polling -----------------------------------------------------

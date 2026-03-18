@@ -216,7 +216,11 @@ def get_all_truck_routes() -> dict[str, dict]:
 
     trips  = _search_trips()
     active = [t for t in trips if t.get("status", "").lower() in _ACTIVE_STATUSES]
-    log.info(f"QuickManage: {len(trips)} trips, {len(active)} active")
+    # Log all statuses for debugging
+    from collections import Counter
+    status_counts = Counter(t.get("status","unknown") for t in trips)
+    log.info(f"QuickManage: {len(trips)} trips total — statuses: {dict(status_counts)}")
+    log.info(f"QuickManage: {len(active)} active (dispatched/in_transit)")
 
     routes = {}
     for trip in active:

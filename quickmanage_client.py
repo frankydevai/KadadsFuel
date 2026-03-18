@@ -110,23 +110,47 @@ def _search_trips(page_size: int = 100) -> list[dict]:
     hdrs = _headers()
     if not hdrs:
         return []
+
+    # Try POST search first
     try:
-        resp = requests.post(
-            f"{QM_BASE_URL}/x/trips/search",
-            json={"query": "", "filters": [], "page": 0, "page_size": page_size},
-            headers=hdrs,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json().get("data", {}).get("items", [])
+        payload = {
+            "query": "",
+            "filters": [
+                {
+                    "field":    "status",
+                    "operator": "in",
+                    "value":    ["dispatched", "in_transit"],
+                }
+            ],
+            "page":      0,
+            "page_size": page_size,
+        }
+        resp = requests.post(f"{QM_BASE_URL}/x/trips/search", json=payload, headers=hdrs, timeout=10)
+        log.info(f"QuickManage POST /x/trips/search status: {resp.status_code}")
+        log.info(f"QuickManage response: {resp.text[:800]}")
+        if resp.ok:
+            data  = resp.json()
+            items = data.get("data", {}).get("items", []) or data.get("items", [])
+            if items:
+                return items
     except Exception as e:
-        log.error(f"QuickManage trip search failed: {e}")
-        return []
+        log.error(f"QuickManage POST search failed: {e}")
 
+    # Try GET /x/trips
+    try:
+        resp = requests.get(f"{QM_BASE_URL}/x/trips", headers=hdrs, timeout=10)
+        log.info(f"QuickManage GET /x/trips status: {resp.status_code}")
+        log.info(f"QuickManage GET response: {resp.text[:800]}")
+        if resp.ok:
+            data  = resp.json()
+            items = data.get("data", {}).get("items", []) or data.get("items", []) or data.get("data", [])
+            if isinstance(items, list):
+                return items
+    except Exception as e:
+        log.error(f"QuickManage GET /x/trips failed: {e}")
 
-# ---------------------------------------------------------------------------
-# Route builder
-# ---------------------------------------------------------------------------
+    return []
+
 
 def _build_route(trip: dict, truck_number: str) -> dict | None:
     stops_raw = trip.get("stops") or []

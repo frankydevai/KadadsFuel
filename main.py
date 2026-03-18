@@ -109,15 +109,31 @@ def main():
                 time.sleep(60)
                 continue
 
-            # -- Load routes from DB (saved by QM Notifier message parser) --
+            # -- Fetch routes: QM API first, fall back to DB (QM Notifier) -
+            qm_routes = {}
             try:
-                from database import get_all_truck_routes_from_db
-                qm_routes = get_all_truck_routes_from_db()
-                if qm_routes:
-                    log.info(f"Routes loaded from DB for {len(qm_routes)} trucks")
+                from config import QM_CLIENT_ID, QM_CLIENT_SECRET
+                if QM_CLIENT_ID and QM_CLIENT_SECRET:
+                    from quickmanage_client import get_all_truck_routes
+                    qm_routes = get_all_truck_routes()
+                    if qm_routes:
+                        log.info(f"QuickManage API: routes for {len(qm_routes)} trucks")
+                        # Save to DB so /route command works
+                        from database import save_truck_route
+                        for tn, route in qm_routes.items():
+                            save_truck_route(tn, "", route)
             except Exception as e:
-                log.warning(f"Route DB load failed: {e}")
-                qm_routes = {}
+                log.warning(f"QuickManage API failed: {e}")
+
+            # Fall back to DB routes from QM Notifier messages
+            if not qm_routes:
+                try:
+                    from database import get_all_truck_routes_from_db
+                    qm_routes = get_all_truck_routes_from_db()
+                    if qm_routes:
+                        log.info(f"Routes from DB (QM Notifier): {len(qm_routes)} trucks")
+                except Exception as e:
+                    log.warning(f"DB route load failed: {e}")
 
             # -- Find trucks due for polling -----------------------------------
             due_trucks = []
@@ -181,9 +197,6 @@ def main():
 
     log.info("FleetFuel Bot stopped cleanly.")
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()

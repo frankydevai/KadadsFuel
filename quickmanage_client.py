@@ -1,50 +1,84 @@
 """
-quickmanage_client.py — QuickManage TMS integration
+quickmanage_client.py — QuickManage TMS integration with OAuth2
 
-Fetches active trips from QuickManage API and maps them to truck numbers.
-Used by FleetFuel AI to get the actual route (origin → delivery) for each truck
-so fuel stops are recommended along the real route, not just GPS heading direction.
+Auth flow:
+  POST /auth/token with client_id + client_secret → get Bearer token
+  POST /x/trips/search → get active trips
 
-API endpoints used:
-  POST /x/trips/search — search/list trips with filters
+Trip status logic:
+  dispatched  → truck heading to first pickup
+  in_transit  → truck heading to next undelivered stop
+  upcoming/delivered/canceled → ignored
 """
 
 import logging
 import requests
+import time
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
-from config import QUICKMANAGE_API_KEY, QUICKMANAGE_API_URL
+from config import QM_CLIENT_ID, QM_CLIENT_SECRET
 
 log = logging.getLogger(__name__)
 
-_HEADERS = {
-    "Authorization": f"Bearer {QUICKMANAGE_API_KEY}",
-    "Content-Type":  "application/json",
-}
+QM_BASE_URL     = "https://api.quickmanage.com"
+_ACTIVE_STATUSES = {"dispatched", "in_transit"}
 
-# Trip statuses where truck is actually moving
-# upcoming   = load booked, truck not yet dispatched — skip
-# dispatched = truck heading to first pickup
-# in_transit = truck heading to next stop (pickup or delivery)
-# delivered  = load done — skip
-# canceled   = canceled — skip
-_ACTIVE_STATUSES  = {"dispatched", "in_transit"}
+# Token cache
+_token        = None
+_token_expiry = 0
 
 
 # ---------------------------------------------------------------------------
-# Geocoding — QM stops have address but no lat/lng
+# Auth
+# ---------------------------------------------------------------------------
+
+def _get_token() -> str | None:
+    global _token, _token_expiry
+
+    if not QM_CLIENT_ID or not QM_CLIENT_SECRET:
+        log.warning("QuickManage: QM_CLIENT_ID or QM_CLIENT_SECRET not set")
+        return None
+
+    # Reuse token if still valid (refresh 60s before expiry)
+    if _token and time.time() < _token_expiry - 60:
+        return _token
+
+    try:
+        resp = requests.post(
+            f"{QM_BASE_URL}/auth/token",
+            json={"client_id": QM_CLIENT_ID, "client_secret": QM_CLIENT_SECRET},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data  = resp.json()
+        _token        = data.get("access_token") or data.get("token")
+        expires_in    = data.get("expires_in", 3600)
+        _token_expiry = time.time() + expires_in
+        log.info(f"QuickManage: token obtained (expires in {expires_in}s)")
+        return _token
+    except Exception as e:
+        log.error(f"QuickManage auth failed: {e}")
+        return None
+
+
+def _headers() -> dict:
+    token = _get_token()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    } if token else {}
+
+
+# ---------------------------------------------------------------------------
+# Geocoding
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=512)
-def _geocode(city: str, state: str, zip_code: str) -> tuple[float, float] | None:
-    """
-    Convert city/state/zip to lat/lng using OpenStreetMap Nominatim (free, no key).
-    Results are cached in memory for the process lifetime.
-    """
-    query = f"{zip_code}, {city}, {state}, US"
+def _geocode(address: str) -> tuple[float, float] | None:
     try:
         resp = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "json", "limit": 1},
+            params={"q": address, "format": "json", "limit": 1, "countrycodes": "us"},
             headers={"User-Agent": "FleetFuelAI/1.0"},
             timeout=5,
         )
@@ -52,150 +86,68 @@ def _geocode(city: str, state: str, zip_code: str) -> tuple[float, float] | None
         if results:
             return float(results[0]["lat"]), float(results[0]["lon"])
     except Exception as e:
-        log.warning(f"Geocode failed for {query}: {e}")
+        log.warning(f"Geocode failed for '{address}': {e}")
     return None
 
 
 def _stop_coords(stop: dict) -> tuple[float, float] | None:
-    """Extract lat/lng from a stop — geocodes from address if not present."""
-    # QM API doesn't return lat/lng in stop data — geocode from address
-    addr = stop.get("address") or {}
+    addr     = stop.get("address") or {}
+    line1    = addr.get("address_line_1", "").strip()
     city     = addr.get("city", "").strip()
     state    = addr.get("state", "").strip()
     zip_code = addr.get("zip_code", "").strip()
-    if city and state:
-        return _geocode(city, state, zip_code)
-    return None
+    if not city or not state:
+        return None
+    query = f"{line1}, {city}, {state} {zip_code}".strip(", ")
+    return _geocode(query)
 
 
 # ---------------------------------------------------------------------------
 # API calls
 # ---------------------------------------------------------------------------
 
-def _search_trips(filters: list[dict], page_size: int = 50) -> list[dict]:
-    """Call /x/trips/search and return list of trip items."""
-    payload = {
-        "query":     "",
-        "filters":   filters,
-        "page":      0,
-        "page_size": page_size,
-    }
+def _search_trips(page_size: int = 100) -> list[dict]:
+    hdrs = _headers()
+    if not hdrs:
+        return []
     try:
         resp = requests.post(
-            f"{QUICKMANAGE_API_URL}/x/trips/search",
-            json=payload,
-            headers=_HEADERS,
+            f"{QM_BASE_URL}/x/trips/search",
+            json={"query": "", "filters": [], "page": 0, "page_size": page_size},
+            headers=hdrs,
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("data", {}).get("items", [])
+        return resp.json().get("data", {}).get("items", [])
     except Exception as e:
-        log.error(f"QuickManage API error: {e}")
+        log.error(f"QuickManage trip search failed: {e}")
         return []
 
 
 # ---------------------------------------------------------------------------
-# Public interface
+# Route builder
 # ---------------------------------------------------------------------------
 
-def get_active_trips() -> list[dict]:
-    """
-    Fetch all active trips (upcoming + in_progress).
-    Returns list of raw trip dicts from QM API.
-    """
-    trips = _search_trips(filters=[])
-    active = [t for t in trips if t.get("status", "").lower() in _ACTIVE_STATUSES]
-    log.info(f"QuickManage: {len(trips)} total trips, {len(active)} active")
-    return active
-
-
-def get_route_for_truck(truck_number: str) -> dict | None:
-    """
-    Find the active trip for a given truck number and extract its route.
-
-    Returns a route dict:
-    {
-        "trip_id":       str,
-        "trip_num":      int,
-        "ref_number":    str,
-        "truck_number":  str,
-        "status":        str,
-        "stops": [
-            {
-                "pickup":       bool,
-                "company_name": str,
-                "city":         str,
-                "state":        str,
-                "zip":          str,
-                "lat":          float | None,
-                "lng":          float | None,
-                "appt":         str,   # ISO datetime
-            },
-            ...
-        ],
-        "origin":      {"lat": float, "lng": float, "city": str, "state": str},
-        "destination": {"lat": float, "lng": float, "city": str, "state": str},
-    }
-    Returns None if no active trip found for this truck.
-    """
-    trips = get_active_trips()
-
-    for trip in trips:
-        stops = trip.get("stops") or []
-        for stop in stops:
-            truck = stop.get("assigned_truck") or {}
-            if str(truck.get("number", "")).strip() == str(truck_number).strip():
-                return _build_route(trip, truck_number)
-
-    log.info(f"QuickManage: no active trip found for truck {truck_number}")
-    return None
-
-
-def get_all_truck_routes() -> dict[str, dict]:
-    """
-    Returns a mapping of truck_number → route for all active trips.
-    Used during each poll cycle to update route info for all trucks.
-    """
-    trips  = get_active_trips()
-    routes = {}
-
-    for trip in trips:
-        stops = trip.get("stops") or []
-        # Find truck number from first stop with a real truck assigned
-        truck_number = None
-        for stop in stops:
-            truck = stop.get("assigned_truck") or {}
-            num = str(truck.get("number", "")).strip()
-            if num and num != "0" and truck.get("id") != "00000000-0000-0000-0000-000000000000":
-                truck_number = num
-                break
-        if truck_number:
-            route = _build_route(trip, truck_number)
-            if route:
-                routes[truck_number] = route
-
-    log.info(f"QuickManage: built routes for {len(routes)} trucks")
-    return routes
-
-
 def _build_route(trip: dict, truck_number: str) -> dict | None:
-    """Build a clean route dict from a raw QM trip."""
     stops_raw = trip.get("stops") or []
     if len(stops_raw) < 2:
         return None
 
-    stops = []
+    status = trip.get("status", "").lower()
+    stops  = []
+
     for s in stops_raw:
         addr  = s.get("address") or {}
         city  = addr.get("city", "").strip()
         state = addr.get("state", "").strip()
         zip_  = addr.get("zip_code", "").strip()
+        line1 = addr.get("address_line_1", "").strip()
         coords = _stop_coords(s)
 
         stops.append({
             "pickup":       bool(s.get("pickup")),
             "company_name": s.get("company_name", ""),
+            "address":      line1,
             "city":         city,
             "state":        state,
             "zip":          zip_,
@@ -204,37 +156,28 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
             "appt":         s.get("appointment_date", ""),
         })
 
-    status = trip.get("status", "").lower()
-
-    # Origin = first pickup stop with coords
+    # Origin = first pickup with coords
     origin = next((s for s in stops if s["pickup"] and s["lat"]), None)
 
-    # Destination depends on status:
-    # dispatched  → truck heading to first pickup address
-    # in_transit  → truck heading to next undelivered stop
-    #               (could be a 2nd pickup or any delivery)
-    #               We take the first stop that is NOT the first pickup
+    # Destination depends on status
     if status == "dispatched":
-        # Heading to first pickup
         dest = next((s for s in stops if s["pickup"] and s["lat"]), None)
     else:
-        # in_transit — find next stop after first pickup
-        # First pickup is the origin — next stop is the current destination
-        pickup_passed = False
+        # in_transit — next stop after first pickup
+        passed_first = False
         dest = None
         for s in stops:
-            if s["pickup"] and not pickup_passed:
-                pickup_passed = True
-                continue  # skip first pickup — already done
+            if s["pickup"] and not passed_first:
+                passed_first = True
+                continue
             if s["lat"]:
                 dest = s
                 break
-        # Fallback — last stop with coords
         if not dest:
             dest = next((s for s in reversed(stops) if s["lat"]), None)
 
     if not origin or not dest:
-        log.warning(f"Trip {trip.get('trip_num')} — could not resolve origin/destination coords")
+        log.warning(f"Trip {trip.get('trip_num')}: no coords for origin/dest")
         return None
 
     return {
@@ -242,7 +185,7 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
         "trip_num":     trip.get("trip_num"),
         "ref_number":   trip.get("ref_number", ""),
         "truck_number": truck_number,
-        "status":       trip.get("status", ""),
+        "status":       status,
         "stops":        stops,
         "origin": {
             "lat":   origin["lat"],
@@ -257,3 +200,51 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
             "state": dest["state"],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+def get_all_truck_routes() -> dict[str, dict]:
+    """
+    Fetch all active trips and return truck_number → route mapping.
+    Called every poll cycle from main.py.
+    """
+    if not QM_CLIENT_ID or not QM_CLIENT_SECRET:
+        return {}
+
+    trips  = _search_trips()
+    active = [t for t in trips if t.get("status", "").lower() in _ACTIVE_STATUSES]
+    log.info(f"QuickManage: {len(trips)} trips, {len(active)} active")
+
+    routes = {}
+    for trip in active:
+        stops = trip.get("stops") or []
+        # Find truck number — check all stops
+        truck_number = None
+        for stop in stops:
+            truck = stop.get("assigned_truck") or {}
+            num   = str(truck.get("number", "")).strip()
+            if num and truck.get("id") != "00000000-0000-0000-0000-000000000000":
+                truck_number = num
+                break
+        if not truck_number:
+            continue
+
+        route = _build_route(trip, truck_number)
+        if route:
+            routes[truck_number] = route
+            log.info(
+                f"  Truck {truck_number}: trip {route['trip_num']} "
+                f"{route['origin']['city']} → {route['destination']['city']} "
+                f"[{route['status']}]"
+            )
+
+    return routes
+
+
+def get_route_for_truck(truck_number: str) -> dict | None:
+    """Get active route for a specific truck."""
+    routes = get_all_truck_routes()
+    return routes.get(truck_number)

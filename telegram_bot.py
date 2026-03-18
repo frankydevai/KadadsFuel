@@ -762,10 +762,18 @@ def _handle_route(text: str, chat_id: str) -> None:
     truck_num = parts[1].strip()
 
     try:
-        from database import get_truck_route
-        route = get_truck_route(truck_num)
+        # Try QM API first for live data
+        from config import QM_CLIENT_ID, QM_CLIENT_SECRET
+        route = None
+        if QM_CLIENT_ID and QM_CLIENT_SECRET:
+            from quickmanage_client import get_route_for_truck
+            route = get_route_for_truck(truck_num)
+        # Fall back to DB (QM Notifier parsed message)
+        if not route:
+            from database import get_truck_route
+            route = get_truck_route(truck_num)
     except Exception as e:
-        _send_to(chat_id, f"❌ DB error: `{e}`")
+        _send_to(chat_id, f"❌ Error: `{e}`")
         return
 
     if not route:

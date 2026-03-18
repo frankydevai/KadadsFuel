@@ -15,7 +15,6 @@ import logging
 import requests
 import time
 from datetime import datetime, timezone, timedelta
-from functools import lru_cache
 from config import QM_CLIENT_ID, QM_CLIENT_SECRET
 
 log = logging.getLogger(__name__)
@@ -89,20 +88,53 @@ def _headers() -> dict:
 # Geocoding
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=512)
+# In-memory geocode cache (persists for process lifetime)
+_geocode_cache: dict = {}
+
 def _geocode(address: str) -> tuple[float, float] | None:
+    """Geocode using US Census API (free, fast, no rate limit) with fallback to Nominatim."""
+    if not address:
+        return None
+
+    key = address.strip().lower()
+    if key in _geocode_cache:
+        return _geocode_cache[key]
+
+    # Try US Census Geocoder first — fast, free, no rate limit
+    try:
+        resp = requests.get(
+            "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+            params={"address": address, "benchmark": "Public_AR_Current", "format": "json"},
+            timeout=5,
+        )
+        if resp.ok:
+            matches = resp.json().get("result", {}).get("addressMatches", [])
+            if matches:
+                coords = matches[0]["coordinates"]
+                result = (float(coords["y"]), float(coords["x"]))
+                _geocode_cache[key] = result
+                return result
+    except Exception:
+        pass
+
+    # Fallback: Nominatim with rate limit
+    time.sleep(1.1)
     try:
         resp = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params={"q": address, "format": "json", "limit": 1, "countrycodes": "us"},
             headers={"User-Agent": "FleetFuelAI/1.0"},
-            timeout=5,
+            timeout=8,
         )
-        results = resp.json()
-        if results:
-            return float(results[0]["lat"]), float(results[0]["lon"])
+        if resp.ok and resp.text.strip():
+            results = resp.json()
+            if results:
+                result = float(results[0]["lat"]), float(results[0]["lon"])
+                _geocode_cache[key] = result
+                return result
     except Exception as e:
         log.warning(f"Geocode failed for '{address}': {e}")
+
     return None
 
 
@@ -304,7 +336,7 @@ def get_route_for_truck(truck_number: str) -> dict | None:
     # Search trips filtered by truck number
     payloads = [
         {"query": str(truck_number), "filters": [], "page": 0, "page_size": 20},
-        {"query": str(truck_number), "filters": [], "page": 0, "page_size": 10},
+        {"query": "", "filters": [{"field": "truck_number", "operator": "eq", "value": str(truck_number)}], "page": 0, "page_size": 10},
         {"query": "", "filters": [{"field": "status", "operator": "in", "value": ["in_transit","dispatched","upcoming"]}], "page": 0, "page_size": 100},
     ]
 

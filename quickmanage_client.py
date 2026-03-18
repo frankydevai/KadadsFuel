@@ -296,6 +296,39 @@ def get_all_truck_routes() -> dict[str, dict]:
 
 
 def get_route_for_truck(truck_number: str) -> dict | None:
-    """Get active route for a specific truck."""
+    """Get active route for a specific truck — searches QM by truck number directly."""
+    hdrs = _headers()
+    if not hdrs:
+        return None
+
+    # Search trips filtered by truck number
+    payloads = [
+        {"query": str(truck_number), "filters": [], "page": 0, "page_size": 20},
+        {"query": str(truck_number), "filters": [], "page": 0, "page_size": 10},
+        {"query": "", "filters": [{"field": "status", "operator": "in", "value": ["in_transit","dispatched","upcoming"]}], "page": 0, "page_size": 100},
+    ]
+
+    for payload in payloads:
+        try:
+            resp = requests.post(f"{QM_BASE_URL}/x/trips/search", json=payload, headers=hdrs, timeout=10)
+            if not resp.ok:
+                continue
+            items = resp.json().get("data", {}).get("items", [])
+            # Find trip assigned to this truck
+            for trip in items:
+                if trip.get("status","").lower() not in _ACTIVE_STATUSES:
+                    continue
+                stops = trip.get("stops") or []
+                for stop in stops:
+                    truck = stop.get("assigned_truck") or {}
+                    if str(truck.get("number","")).strip() == str(truck_number).strip():
+                        route = _build_route(trip, str(truck_number))
+                        if route:
+                            log.info(f"Found route for truck {truck_number}: trip {route['trip_num']}")
+                            return route
+        except Exception as e:
+            log.error(f"get_route_for_truck search failed: {e}")
+
+    # Fall back to full route list
     routes = get_all_truck_routes()
-    return routes.get(truck_number)
+    return routes.get(str(truck_number))

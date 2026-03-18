@@ -44,15 +44,31 @@ def _get_token() -> str | None:
         return _token
 
     try:
+        # Try with JSON body first
         resp = requests.post(
             f"{QM_BASE_URL}/auth/token",
             json={"client_id": QM_CLIENT_ID, "client_secret": QM_CLIENT_SECRET},
+            headers={"Content-Type": "application/json"},
             timeout=10,
         )
-        resp.raise_for_status()
-        data  = resp.json()
-        _token        = data.get("access_token") or data.get("token")
-        expires_in    = data.get("expires_in", 3600)
+        log.info(f"QM auth response: {resp.status_code} — {resp.text[:300]}")
+
+        if not resp.ok:
+            # Try with form data
+            resp = requests.post(
+                f"{QM_BASE_URL}/auth/token",
+                data={"client_id": QM_CLIENT_ID, "client_secret": QM_CLIENT_SECRET},
+                timeout=10,
+            )
+            log.info(f"QM auth form response: {resp.status_code} — {resp.text[:300]}")
+
+        if not resp.ok:
+            log.error(f"QM auth failed: {resp.status_code} {resp.text[:200]}")
+            return None
+
+        data       = resp.json()
+        _token     = data.get("access_token") or data.get("token") or data.get("data", {}).get("access_token")
+        expires_in = data.get("expires_in", 3600)
         _token_expiry = time.time() + expires_in
         log.info(f"QuickManage: token obtained (expires in {expires_in}s)")
         return _token
@@ -111,43 +127,41 @@ def _search_trips(page_size: int = 100) -> list[dict]:
     if not hdrs:
         return []
 
-    # Try POST search first
-    try:
-        payload = {
-            "query": "",
-            "filters": [
-                {
-                    "field":    "status",
-                    "operator": "in",
-                    "value":    ["dispatched", "in_transit"],
-                }
-            ],
-            "page":      0,
-            "page_size": page_size,
-        }
-        resp = requests.post(f"{QM_BASE_URL}/x/trips/search", json=payload, headers=hdrs, timeout=10)
-        log.info(f"QuickManage POST /x/trips/search status: {resp.status_code}")
-        log.info(f"QuickManage response: {resp.text[:800]}")
-        if resp.ok:
-            data  = resp.json()
-            items = data.get("data", {}).get("items", []) or data.get("items", [])
-            if items:
-                return items
-    except Exception as e:
-        log.error(f"QuickManage POST search failed: {e}")
+    endpoints = [
+        ("POST", f"{QM_BASE_URL}/x/trips/search", {"query": "", "filters": [], "page": 0, "page_size": page_size}),
+        ("POST", f"{QM_BASE_URL}/x/trips/search", {"query": "", "filters": [], "page": 0, "page_size": page_size, "status": ["dispatched", "in_transit", "upcoming"]}),
+        ("GET",  f"{QM_BASE_URL}/x/trips", None),
+        ("GET",  f"{QM_BASE_URL}/x/trips?page=0&page_size=50", None),
+        ("GET",  f"{QM_BASE_URL}/trips", None),
+    ]
 
-    # Try GET /x/trips
-    try:
-        resp = requests.get(f"{QM_BASE_URL}/x/trips", headers=hdrs, timeout=10)
-        log.info(f"QuickManage GET /x/trips status: {resp.status_code}")
-        log.info(f"QuickManage GET response: {resp.text[:800]}")
-        if resp.ok:
-            data  = resp.json()
-            items = data.get("data", {}).get("items", []) or data.get("items", []) or data.get("data", [])
-            if isinstance(items, list):
+    for method, url, payload in endpoints:
+        try:
+            if method == "POST":
+                resp = requests.post(url, json=payload, headers=hdrs, timeout=10)
+            else:
+                resp = requests.get(url, headers=hdrs, timeout=10)
+
+            log.info(f"QM {method} {url} → {resp.status_code}: {resp.text[:600]}")
+
+            if not resp.ok:
+                continue
+
+            data = resp.json()
+            # Handle different response structures
+            items = (
+                data.get("data", {}).get("items") or
+                data.get("data", {}).get("trips") or
+                data.get("items") or
+                data.get("trips") or
+                (data.get("data") if isinstance(data.get("data"), list) else None) or
+                []
+            )
+            if items:
+                log.info(f"QM: found {len(items)} trips via {method} {url}")
                 return items
-    except Exception as e:
-        log.error(f"QuickManage GET /x/trips failed: {e}")
+        except Exception as e:
+            log.error(f"QM {method} {url} failed: {e}")
 
     return []
 

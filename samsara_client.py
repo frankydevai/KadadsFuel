@@ -29,6 +29,7 @@ def get_vehicle_locations() -> list[dict]:
     log = logging.getLogger(__name__)
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
+    fresh = []
     for v in data:
         loc = v.get("location", {})
         ts  = loc.get("time", "")
@@ -38,9 +39,12 @@ def get_vehicle_locations() -> list[dict]:
                 age_min = (now - t).total_seconds() / 60
                 if age_min > 120:
                     log.warning(f"Truck {v.get('name')} GPS stale: {age_min:.0f} min old ({loc.get('reverseGeo',{}).get('formattedLocation','')})")
+                    continue  # skip stale trucks — don't alert on bad data
             except Exception:
                 pass
-    return data
+        fresh.append(v)
+    log.info(f"Samsara: {len(data)} trucks total, {len(fresh)} with fresh GPS")
+    return fresh
 
 
 def get_vehicle_stats() -> list[dict]:

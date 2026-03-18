@@ -127,12 +127,21 @@ def _search_trips(page_size: int = 100) -> list[dict]:
     if not hdrs:
         return []
 
+    # Try filtering by active statuses directly
     endpoints = [
+        # Filter by in_transit status
+        ("POST", f"{QM_BASE_URL}/x/trips/search", {
+            "query": "", "page": 0, "page_size": page_size,
+            "filters": [{"field": "status", "operator": "in", "value": ["in_transit", "dispatched", "upcoming"]}]
+        }),
+        # Filter by in_transit only
+        ("POST", f"{QM_BASE_URL}/x/trips/search", {
+            "query": "", "page": 0, "page_size": page_size,
+            "filters": [{"field": "status", "operator": "eq", "value": "in_transit"}]
+        }),
+        # No filter — get all and filter client side
         ("POST", f"{QM_BASE_URL}/x/trips/search", {"query": "", "filters": [], "page": 0, "page_size": page_size}),
-        ("POST", f"{QM_BASE_URL}/x/trips/search", {"query": "", "filters": [], "page": 0, "page_size": page_size, "status": ["dispatched", "in_transit", "upcoming"]}),
         ("GET",  f"{QM_BASE_URL}/x/trips", None),
-        ("GET",  f"{QM_BASE_URL}/x/trips?page=0&page_size=50", None),
-        ("GET",  f"{QM_BASE_URL}/trips", None),
     ]
 
     for method, url, payload in endpoints:

@@ -84,14 +84,25 @@ def main():
 
     log.info("Polling loop started.")
 
-    last_db_save    = _utcnow()
+    last_db_save      = _utcnow()
     last_upload_check = _utcnow()
-    poll_cycle      = 0
+    last_weekly_report = _utcnow()
+    poll_cycle        = 0
 
     while _running:
         try:
             poll_cycle += 1
             now = _utcnow()
+
+            # -- Weekly savings report (every Monday 08:00 UTC) --------------
+            if (now - last_weekly_report).total_seconds() >= 3600:  # check every hour
+                if now.weekday() == 0 and now.hour == 8:  # Monday 08:00 UTC
+                    try:
+                        from telegram_bot import send_weekly_savings_report
+                        send_weekly_savings_report()
+                        last_weekly_report = now
+                    except Exception as e:
+                        log.error(f"Weekly report error: {e}")
 
             # -- Check for admin file uploads (every 30 seconds) --------------
             if (now - last_upload_check).total_seconds() >= 30:

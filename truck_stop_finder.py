@@ -474,25 +474,38 @@ def find_best_stops_on_route(
     max_range  = reachable_miles(fuel_pct, tank_gal, mpg)
     truck_in_ca = False  # will be set by caller if needed
 
-    # Corridor: search stops within CORRIDOR_WIDTH miles of the
-    # straight line between truck position and destination
-    # Corridor width based on fuel level
-    CORRIDOR_WIDTH = 50.0 if fuel_pct >= 30 else 25.0
+    # Search radius based on fuel level
+    search_radius = 100.0 if fuel_pct >= 30 else 50.0
 
-    # Heading from truck to destination
-    route_heading = bearing(truck_lat, truck_lng, dest_lat, dest_lng)
-    total_dist    = haversine_miles(truck_lat, truck_lng, dest_lat, dest_lng)
+    # Build route segments: truck → each upcoming stop → destination
+    # This follows the actual highway path instead of a straight line
+    route_stops = route.get("stops", [])
+    upcoming_waypoints = []
+    for s in route_stops:
+        if s.get("lat") and s.get("lng"):
+            wp_dist = haversine_miles(truck_lat, truck_lng, s["lat"], s["lng"])
+            if wp_dist > 1.0:  # skip stops already passed (within 1 mile)
+                upcoming_waypoints.append((s["lat"], s["lng"]))
+
+    if not upcoming_waypoints:
+        upcoming_waypoints = [(dest_lat, dest_lng)]
 
     log.info(
-        f"Route search: heading={route_heading:.0f}° "
+        f"Route search: {len(upcoming_waypoints)} waypoints ahead, "
         f"dest={dest.get('city')},{dest.get('state')} "
-        f"dist={total_dist:.0f}mi urgency={urgency}"
+        f"radius={search_radius:.0f}mi urgency={urgency}"
     )
 
     candidates = []
+    seen_ids = set()
+
     for stop in all_stops:
         slat = float(stop["latitude"])
         slng = float(stop["longitude"])
+        stop_id = stop.get("id") or f"{slat},{slng}"
+
+        if stop_id in seen_ids:
+            continue
 
         # Skip CA stops if truck is in CA
         if truck_in_ca and (stop.get("state") or "").upper() == "CA":
@@ -500,34 +513,50 @@ def find_best_stops_on_route(
 
         dist = haversine_miles(truck_lat, truck_lng, slat, slng)
 
-        # Must be reachable
+        # Must be within search radius
+        if dist > search_radius:
+            continue
+
+        # Must be reachable on fuel
         if urgency not in ("CRITICAL", "EMERGENCY") and dist > max_range:
             continue
 
-        # Must be between truck and destination (not behind or past)
-        stop_bear  = bearing(truck_lat, truck_lng, slat, slng)
-        adiff      = angle_diff(route_heading, stop_bear)
-        if adiff > 90:
-            continue  # stop is behind or too far off route direction
+        # Check if stop is near ANY segment of the route
+        # (truck → waypoint1, waypoint1 → waypoint2, etc.)
+        on_route = False
+        min_cross = float("inf")
+        prev_lat, prev_lng = truck_lat, truck_lng
 
-        # Must be within corridor width of route line
-        cross_track = abs(dist * math.sin(math.radians(adiff)))
-        if cross_track > CORRIDOR_WIDTH:
+        for wp_lat, wp_lng in upcoming_waypoints:
+            seg_heading  = bearing(prev_lat, prev_lng, wp_lat, wp_lng)
+            seg_dist     = haversine_miles(prev_lat, prev_lng, wp_lat, wp_lng)
+            stop_bearing = bearing(prev_lat, prev_lng, slat, slng)
+            adiff        = angle_diff(seg_heading, stop_bearing)
+            dist_from_seg_start = haversine_miles(prev_lat, prev_lng, slat, slng)
+            along = dist_from_seg_start * math.cos(math.radians(adiff))
+            cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
+
+            # Stop is on this segment if: within 120° of direction AND within corridor AND before end
+            if adiff <= 120 and cross <= 75.0 and along <= seg_dist * 1.2:
+                on_route = True
+                min_cross = min(min_cross, cross)
+                break
+
+            prev_lat, prev_lng = wp_lat, wp_lng
+
+        if not on_route:
             continue
 
-        # Must not be past the destination
-        along_track = dist * math.cos(math.radians(adiff))
-        if along_track > total_dist * 1.1:  # 10% buffer
-            continue
-
+        seen_ids.add(stop_id)
         price    = stop.get("diesel_price") or 0
         fill_gal = gallons_to_fill(fuel_pct, tank_gal)
-        tc       = true_cost(stop, truck_lat, truck_lng, route_heading, fuel_pct, tank_gal, mpg)
+        seg_heading_to_dest = bearing(truck_lat, truck_lng, dest_lat, dest_lng)
+        tc       = true_cost(stop, truck_lat, truck_lng, seg_heading_to_dest, fuel_pct, tank_gal, mpg)
 
         candidates.append({
             **stop,
             "distance_miles": round(dist, 2),
-            "detour_miles":   round(cross_track, 2),
+            "detour_miles":   round(min_cross, 2),
             "fill_cost":      round(price * fill_gal, 2),
             "true_cost":      tc,
             "_score":         tc if urgency in ("ADVISORY", "WARNING") else dist,
@@ -536,7 +565,7 @@ def find_best_stops_on_route(
         })
 
     if not candidates:
-        log.warning(f"No stops found in route corridor — falling back to heading search")
+        log.warning(f"No stops found on route — falling back to heading search")
         return None, None
 
     candidates.sort(key=lambda s: s["_score"])
@@ -560,6 +589,11 @@ def find_best_stops_on_route(
 def calc_savings(best: dict, alt: dict) -> float | None:
     return None
 
+
+def is_near_stop(truck_lat, truck_lng, stop_lat, stop_lng,
+                 radius_miles=None) -> bool:
+    r = radius_miles or _AT_STOP_RADIUS
+    return haversine_miles(truck_lat, truck_lng, stop_lat, stop_lng) <= r
 
 def is_near_stop(truck_lat, truck_lng, stop_lat, stop_lng,
                  radius_miles=None) -> bool:

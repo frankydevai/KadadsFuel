@@ -261,9 +261,67 @@ def process_truck(vid, prev_state, current_data, truck_states):
     if fuel >= prev_fuel + _REFUEL_PCT:
         stop_name = state.get("assigned_stop_name") or "a fuel stop"
         log.info(f"  {vname}: refueled — {prev_fuel:.0f}%→{fuel:.0f}% at {stop_name}")
+
+        # ── Check if truck visited the recommended stop ──────────────────────
+        rec_lat  = state.get("assigned_stop_lat")
+        rec_lng  = state.get("assigned_stop_lng")
+        rec_name = state.get("assigned_stop_name")
+        if rec_lat and rec_lng:
+            dist_to_rec = haversine_miles(lat, lng, rec_lat, rec_lng)
+            visited = dist_to_rec <= 2.0  # within 2 miles = visited
+
+            # Find which actual stop truck is near
+            try:
+                from truck_stop_finder import find_current_stop
+                actual_stop = find_current_stop(lat, lng)
+
+                # If no stop found at current GPS — search location history
+                # (truck may have already driven away from the stop)
+                if not actual_stop:
+                    try:
+                        from samsara_client import get_vehicle_location_history
+                        history = get_vehicle_location_history(vid, hours_back=1)
+                        # Find where truck was parked (speed ~0) in last hour
+                        for point in reversed(history):
+                            stop_check = find_current_stop(point["lat"], point["lng"])
+                            if stop_check:
+                                actual_stop = stop_check
+                                log.info(f"  {vname}: found refuel stop via history: {stop_check['store_name']}")
+                                break
+                    except Exception as he:
+                        log.warning(f"  {vname}: history lookup failed: {he}")
+
+                actual_name = actual_stop["store_name"] if actual_stop else "Unknown"
+                actual_lat  = float(actual_stop["latitude"]) if actual_stop else lat
+                actual_lng  = float(actual_stop["longitude"]) if actual_stop else lng
+            except Exception:
+                actual_name = rec_name if visited else "Unknown"
+                actual_lat  = lat; actual_lng = lng
+
+            try:
+                from database import log_stop_visit
+                log_stop_visit(
+                    vehicle_name=vname,
+                    alert_id=state.get("open_alert_id"),
+                    recommended_stop_name=rec_name,
+                    recommended_lat=rec_lat, recommended_lng=rec_lng,
+                    actual_stop_name=actual_name,
+                    actual_lat=actual_lat, actual_lng=actual_lng,
+                    visited=visited,
+                    fuel_before=prev_fuel, fuel_after=fuel,
+                )
+                if visited:
+                    log.info(f"  {vname}: ✅ visited recommended stop {rec_name}")
+                else:
+                    log.info(f"  {vname}: ⚠️ skipped recommended stop — fueled at {actual_name} ({dist_to_rec:.1f}mi away)")
+            except Exception as e:
+                log.warning(f"  {vname}: stop visit logging failed: {e}")
+
         if state.get("open_alert_id"):
             resolve_alert(state["open_alert_id"])
-        send_refueled_alert(vname, stop_name, fuel)
+        # Pass actual location so refuel alert shows where truck fueled
+        _actual_stop = actual_stop if rec_lat and 'actual_stop' in dir() else None
+        send_refueled_alert(vname, stop_name, fuel, truck_lat=lat, truck_lng=lng, actual_stop=_actual_stop)
         _clear_alert(state)
         state["state"]     = "HEALTHY" if fuel > FUEL_ALERT_THRESHOLD_PCT else "WATCH"
         state["next_poll"] = _next_poll(POLL_INTERVAL_HEALTHY)

@@ -182,6 +182,23 @@ CREATE TABLE IF NOT EXISTS truck_routes (
     route_json      TEXT,
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS stop_visits (
+    id              SERIAL PRIMARY KEY,
+    vehicle_name    TEXT NOT NULL,
+    alert_id        INTEGER,
+    recommended_stop_name  TEXT,
+    recommended_stop_lat   FLOAT,
+    recommended_stop_lng   FLOAT,
+    actual_stop_name       TEXT,
+    actual_stop_lat        FLOAT,
+    actual_stop_lng        FLOAT,
+    visited         BOOLEAN,   -- TRUE=went to recommended, FALSE=went elsewhere, NULL=unknown
+    fuel_before     FLOAT,
+    fuel_after      FLOAT,
+    visited_at      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
 """
 
 
@@ -624,3 +641,53 @@ def get_all_truck_routes_from_db() -> dict[str, dict]:
 def get_last_qm_message(chat_id: str) -> dict | None:
     """Stub — routes stored via save_truck_route."""
     return None
+
+def log_stop_visit(vehicle_name: str, alert_id: int,
+                   recommended_stop_name: str,
+                   recommended_lat: float, recommended_lng: float,
+                   actual_stop_name: str,
+                   actual_lat: float, actual_lng: float,
+                   visited: bool,
+                   fuel_before: float, fuel_after: float) -> None:
+    """Log whether truck visited the recommended stop or went elsewhere."""
+    from datetime import datetime, timezone
+    with db_cursor() as cur:
+        cur.execute("""
+            INSERT INTO stop_visits (
+                vehicle_name, alert_id,
+                recommended_stop_name, recommended_stop_lat, recommended_stop_lng,
+                actual_stop_name, actual_stop_lat, actual_stop_lng,
+                visited, fuel_before, fuel_after, visited_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            vehicle_name, alert_id,
+            recommended_stop_name, recommended_lat, recommended_lng,
+            actual_stop_name, actual_lat, actual_lng,
+            visited, fuel_before, fuel_after,
+            datetime.now(timezone.utc)
+        ))
+
+
+def get_stop_compliance(vehicle_name: str = None, days: int = 7) -> list:
+    """Get stop visit compliance stats."""
+    from datetime import datetime, timezone, timedelta
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    with db_cursor() as cur:
+        if vehicle_name:
+            cur.execute("""
+                SELECT vehicle_name, recommended_stop_name, actual_stop_name,
+                       visited, fuel_before, fuel_after, visited_at
+                FROM stop_visits
+                WHERE vehicle_name = %s AND created_at >= %s
+                ORDER BY visited_at DESC LIMIT 20
+            """, (vehicle_name, since))
+        else:
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE visited = TRUE)  AS visited,
+                    COUNT(*) FILTER (WHERE visited = FALSE) AS skipped,
+                    COUNT(*) FILTER (WHERE visited IS NULL) AS unknown
+                FROM stop_visits WHERE created_at >= %s
+            """, (since,))
+        return cur.fetchall()

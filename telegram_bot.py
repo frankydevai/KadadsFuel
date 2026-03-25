@@ -174,8 +174,43 @@ def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_sto
     return _send_to_truck(vehicle_name, "\n".join(lines))
 
 
-def send_refueled_alert(vehicle_name, stop_name, fuel_pct):
-    _send_to_truck(vehicle_name, f"✅ *REFUELED*\n🚛 *Truck:* {vehicle_name}\n🏪 *At:* {stop_name}\n⛽ *Fuel now:* {fuel_pct:.0f}%")
+def send_refueled_alert(vehicle_name, stop_name, fuel_pct,
+                         truck_lat=None, truck_lng=None, actual_stop=None):
+    """Send refuel confirmation showing where truck actually fueled."""
+    lines = [
+        f"✅ *REFUELED — Truck {vehicle_name}*",
+        f"⛽ Fuel now: *{fuel_pct:.0f}%*",
+    ]
+
+    # Show actual stop if we detected it
+    if actual_stop and actual_stop.get("store_name"):
+        name    = actual_stop["store_name"]
+        address = ", ".join(filter(None, [
+            actual_stop.get("address",""), actual_stop.get("city",""),
+            actual_stop.get("state",""), actual_stop.get("zip",""),
+        ]))
+        price   = actual_stop.get("diesel_price")
+        slat    = actual_stop.get("latitude")
+        slng    = actual_stop.get("longitude")
+        maps_url = f"https://maps.google.com/?q={slat},{slng}" if slat and slng else None
+        lines += [
+            f"🏪 *Fueled at:* {name}",
+            f"📌 {address}",
+        ]
+        if price:
+            lines.append(f"💰 Diesel: ${price:.3f}/gal")
+        if maps_url:
+            lines.append(f"🗺 [Open in Google Maps]({maps_url})")
+    else:
+        # Fallback — show GPS location
+        lines.append(f"🏪 *Fueled at:* {stop_name}")
+        if truck_lat and truck_lng:
+            maps_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
+            lines.append(f"🗺 [View location]({maps_url})")
+
+    _send_to_truck(vehicle_name, "\n".join(lines))
+    # Also notify dispatcher
+    _send_to_dispatcher(f"✅ *{vehicle_name}* refueled at {stop_name} — {fuel_pct:.0f}% fuel")
 
 
 def send_left_yard_low_fuel(vehicle_name, fuel_pct, yard_name):
@@ -296,6 +331,10 @@ def poll_for_uploads():
                 _handle_loadroute(text, chat_id)
             elif text.startswith("/route"):
                 _handle_route(text, chat_id)
+            elif text.startswith("/compliance"):
+                _handle_compliance(text, chat_id)
+            elif text.startswith("/fuelhistory"):
+                _handle_fuelhistory(text, chat_id)
             elif text.startswith("/findstop"):
                 try:
                     _handle_findstop(text, chat_id)
@@ -742,6 +781,167 @@ def _handle_routelist(chat_id: str) -> None:
         _send_to(chat_id, msg)
 
 
+def _handle_fuelhistory(text: str, chat_id: str) -> None:
+    """/fuelhistory <truck_number> — show recent fuel stop visits"""
+    from database import db_cursor
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/fuelhistory 0792`")
+        return
+
+    truck_num = parts[1].strip()
+
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT alerted_at, best_stop_name, best_stop_price,
+                   savings_usd, alert_type, fuel_pct
+            FROM fuel_alerts
+            WHERE vehicle_name = %s
+            ORDER BY alerted_at DESC
+            LIMIT 10
+        """, (truck_num,))
+        rows = cur.fetchall()
+
+        # Also check if truck actually refueled (fuel went up after alert)
+        cur.execute("""
+            SELECT alerted_at, fuel_pct, best_stop_name
+            FROM fuel_alerts
+            WHERE vehicle_name = %s AND alert_type = 'refueled'
+            ORDER BY alerted_at DESC
+            LIMIT 5
+        """, (truck_num,))
+        refueled = cur.fetchall()
+
+    if not rows:
+        _send_to(chat_id, f"❌ No fuel alert history for truck *{truck_num}*.")
+        return
+
+    header = f"⛽ *Fuel History — Truck {truck_num}*"
+    lines = [header + "\n"]
+
+    if refueled:
+        lines.append("✅ *Confirmed Refuels:*")
+        for r in refueled:
+            dt   = r["alerted_at"].strftime("%b %d %H:%M")
+            stop = r["best_stop_name"] or "Unknown stop"
+            lines.append(f"   ✅ {dt} — {stop}")
+        lines.append("")
+
+    lines.append("📋 *Recent Alerts:*")
+    for r in rows:
+        dt    = r["alerted_at"].strftime("%b %d %H:%M")
+        stop  = r["best_stop_name"] or "No stop found"
+        price = f"${r['best_stop_price']:.3f}" if r["best_stop_price"] else "N/A"
+        saved = f"saved ${r['savings_usd']:.0f}" if r["savings_usd"] else ""
+        fuel  = f"{r['fuel_pct']:.0f}%" if r["fuel_pct"] else ""
+        lines.append(f"   🟡 {dt} | ⛽{fuel} | {stop} {price} {saved}")
+
+    _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_compliance(text: str, chat_id: str) -> None:
+    """/compliance [truck_number] — show fuel stop compliance report"""
+    from database import db_cursor
+    from datetime import datetime, timezone, timedelta
+
+    parts = text.strip().split()
+    truck_num = parts[1].strip() if len(parts) > 1 else None
+    now       = datetime.now(timezone.utc)
+    since     = now - timedelta(days=30)
+
+    with db_cursor() as cur:
+        if truck_num:
+            # Per-truck detail
+            cur.execute("""
+                SELECT recommended_stop_name, actual_stop_name, visited,
+                       fuel_before, fuel_after, visited_at
+                FROM stop_visits
+                WHERE vehicle_name = %s AND created_at >= %s
+                ORDER BY visited_at DESC LIMIT 15
+            """, (truck_num, since))
+            rows = cur.fetchall()
+
+            if not rows:
+                _send_to(chat_id, f"❌ No compliance data for truck *{truck_num}* in last 30 days.")
+                return
+
+            visited = sum(1 for r in rows if r["visited"] is True)
+            skipped = sum(1 for r in rows if r["visited"] is False)
+            total   = len(rows)
+            pct     = round(visited / total * 100) if total else 0
+
+            lines = [
+                f"📊 *Compliance — Truck {truck_num}*",
+                f"📅 Last 30 days",
+                f"",
+                f"✅ Visited recommended: *{visited}/{total}* ({pct}%)",
+                f"⚠️ Skipped recommended: *{skipped}/{total}*",
+                f"",
+            ]
+            for r in rows:
+                dt   = r["visited_at"].strftime("%b %d %H:%M") if r["visited_at"] else "?"
+                icon = "✅" if r["visited"] else "⚠️"
+                rec  = r["recommended_stop_name"] or "?"
+                act  = r["actual_stop_name"] or "?"
+                fb   = f"{r['fuel_before']:.0f}%" if r["fuel_before"] else "?"
+                fa   = f"{r['fuel_after']:.0f}%" if r["fuel_after"] else "?"
+                if r["visited"]:
+                    lines.append(f"{icon} {dt} | {rec} | {fb}→{fa}")
+                else:
+                    lines.append(f"{icon} {dt} | Rec: {rec} | Went to: {act} | {fb}→{fa}")
+
+        else:
+            # Fleet-wide summary
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                       AS total,
+                    COUNT(*) FILTER (WHERE visited = TRUE)        AS visited,
+                    COUNT(*) FILTER (WHERE visited = FALSE)       AS skipped,
+                    COUNT(*) FILTER (WHERE visited IS NULL)       AS unknown
+                FROM stop_visits WHERE created_at >= %s
+            """, (since,))
+            stats = dict(cur.fetchone())
+
+            cur.execute("""
+                SELECT vehicle_name,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE visited = TRUE) AS visited,
+                    COUNT(*) FILTER (WHERE visited = FALSE) AS skipped
+                FROM stop_visits WHERE created_at >= %s
+                GROUP BY vehicle_name
+                ORDER BY (COUNT(*) FILTER (WHERE visited = FALSE)) DESC
+                LIMIT 10
+            """, (since,))
+            trucks = cur.fetchall()
+
+            total   = stats["total"] or 0
+            visited = stats["visited"] or 0
+            skipped = stats["skipped"] or 0
+            pct     = round(visited / total * 100) if total else 0
+
+            lines = [
+                f"📊 *Fleet Compliance Report*",
+                f"📅 Last 30 days",
+                f"",
+                f"✅ Visited recommended stop: *{visited}/{total}* ({pct}%)",
+                f"⚠️ Skipped recommended stop: *{skipped}/{total}*",
+                f"",
+            ]
+
+            if trucks:
+                lines.append("🚛 *Trucks with most skips:*")
+                for t in trucks:
+                    if t["skipped"] > 0:
+                        lines.append(f"   • Truck *{t['vehicle_name']}* — {t['skipped']} skips / {t['total']} alerts")
+
+            lines += [
+                "",
+                "Type `/compliance <truck#>` for per-truck detail.",
+            ]
+
+    _send_to(chat_id, "\n".join(lines))
+
+
 def send_weekly_savings_report() -> None:
     from database import db_cursor
     from datetime import datetime, timezone, timedelta
@@ -786,6 +986,28 @@ def send_weekly_savings_report() -> None:
             lines.append(f"   {medals[i]} Truck {t['vehicle_name']} — *${float(t['saved']):.2f}* ({t['alerts']} alerts)")
     if total_savings == 0:
         lines += ["", "ℹ️ No savings recorded this week."]
+    # Compliance summary
+    try:
+        from datetime import timedelta
+        since_week = now - timedelta(days=7)
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE visited=TRUE) AS visited,
+                       COUNT(*) FILTER (WHERE visited=FALSE) AS skipped
+                FROM stop_visits WHERE created_at >= %s
+            """, (since_week,))
+            cv = dict(cur.fetchone())
+        if cv["total"]:
+            cpct = round((cv["visited"] or 0) / cv["total"] * 100)
+            lines += [
+                "", "─────────────────────────────",
+                f"🎯 *Stop Compliance:* {cv['visited']}/{cv['total']} followed recommendation ({cpct}%)",
+                f"⚠️ Skipped: {cv['skipped']} | Type `/compliance` for details",
+            ]
+    except Exception:
+        pass
+
     lines += ["", "─────────────────────────────", "⚙️ _FleetFuel AI — Automated Report_"]
     msg = "\n".join(lines)
     if DISPATCHER_GROUP_ID:

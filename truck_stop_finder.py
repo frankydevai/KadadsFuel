@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 EARTH_RADIUS_MILES  = 3958.8
 _PARKED_SPEED_MPH   = 10   # trucks showing up to 10mph due to GPS drift while parked
 _AT_STOP_RADIUS     = 0.25  # miles — truck must be in the actual lot (about 1300 feet)
-_AHEAD_ARC_DEGREES  = 120    # 60° left and right of heading
+_AHEAD_ARC_DEGREES  = 90     # 45° left and right of heading — strictly ahead only
 
 
 # -- Geo math -----------------------------------------------------------------
@@ -536,8 +536,9 @@ def find_best_stops_on_route(
             along = dist_from_seg_start * math.cos(math.radians(adiff))
             cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
 
-            # Stop is on this segment if: within 120° of direction AND within corridor AND before end
-            if adiff <= 120 and cross <= 75.0 and along <= seg_dist * 1.2:
+            # Stop must be AHEAD (along > 0) and within 90° of route direction
+            # This strictly prevents recommending stops behind the truck
+            if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
                 on_route = True
                 min_cross = min(min_cross, cross)
                 break

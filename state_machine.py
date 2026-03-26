@@ -636,6 +636,10 @@ def _fire_ca_reminder(state, data, tank_gal, mpg, state_code=""):
     state["truck_group"]               = result.get("truck_group")
     state["ca_reminder_sent"] = True
 
+    # Save immediately so restart doesn't re-send
+    from database import save_truck_state
+    save_truck_state(state)
+
     create_fuel_alert(
         vid, vname, fuel, lat, lng, heading, speed,
         alert_type="ca_border", best_stop=best,

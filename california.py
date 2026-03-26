@@ -80,6 +80,10 @@ def should_send_ca_reminder(
     if not _is_heading_toward_ca(heading):
         return False  # not heading west
 
+    # Only remind if fuel is below threshold — no point warning at 96%
+    if fuel_pct > CA_BORDER_FUEL_THRESHOLD:
+        return False
+
     dist = _dist_to_ca_border(lat, lng)
     if dist > CA_BORDER_REMINDER_MILES:
         return False  # too far from border yet

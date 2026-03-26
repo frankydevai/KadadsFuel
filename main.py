@@ -84,15 +84,42 @@ def main():
 
     log.info("Polling loop started.")
 
-    last_db_save      = _utcnow()
-    last_upload_check = _utcnow()
-    last_weekly_report = _utcnow()
-    poll_cycle        = 0
+    last_db_save        = _utcnow()
+    last_upload_check   = _utcnow()
+    last_weekly_report  = _utcnow()
+    last_route_fetch    = _utcnow() - timedelta(minutes=10)  # fetch immediately on start
+    poll_cycle          = 0
+
+    # Start background thread for QM route geocoding (slow — don't block alerts)
+    import threading
+    _route_lock = threading.Lock()
+
+    def _fetch_routes_background():
+        """Fetch + geocode QM routes in background. Saves to DB when done."""
+        try:
+            from config import QM_CLIENT_ID, QM_CLIENT_SECRET
+            if not QM_CLIENT_ID or not QM_CLIENT_SECRET:
+                return
+            from quickmanage_client import get_all_truck_routes
+            routes = get_all_truck_routes()
+            if routes:
+                from database import save_truck_route
+                for tn, route in routes.items():
+                    save_truck_route(tn, "", route)
+                log.info(f"Background: routes saved for {len(routes)} trucks")
+        except Exception as e:
+            log.warning(f"Background route fetch failed: {e}")
 
     while _running:
         try:
             poll_cycle += 1
             now = _utcnow()
+
+            # -- Background route fetch (every 5 min) ------------------------
+            if (now - last_route_fetch).total_seconds() >= 300:
+                t = threading.Thread(target=_fetch_routes_background, daemon=True)
+                t.start()
+                last_route_fetch = now
 
             # -- Weekly savings report (every Monday 08:00 UTC) --------------
             if (now - last_weekly_report).total_seconds() >= 3600:  # check every hour
@@ -120,31 +147,14 @@ def main():
                 time.sleep(60)
                 continue
 
-            # -- Fetch routes: QM API first, fall back to DB (QM Notifier) -
-            qm_routes = {}
+            # -- Fetch routes from DB (pre-cached by background thread) ------
+            # Routes are geocoded in background every 5 min — never blocks alerts
             try:
-                from config import QM_CLIENT_ID, QM_CLIENT_SECRET
-                if QM_CLIENT_ID and QM_CLIENT_SECRET:
-                    from quickmanage_client import get_all_truck_routes
-                    qm_routes = get_all_truck_routes()
-                    if qm_routes:
-                        log.info(f"QuickManage API: routes for {len(qm_routes)} trucks")
-                        # Save to DB so /route command works
-                        from database import save_truck_route
-                        for tn, route in qm_routes.items():
-                            save_truck_route(tn, "", route)
+                from database import get_all_truck_routes_from_db
+                qm_routes = get_all_truck_routes_from_db()
             except Exception as e:
-                log.warning(f"QuickManage API failed: {e}")
-
-            # Fall back to DB routes from QM Notifier messages
-            if not qm_routes:
-                try:
-                    from database import get_all_truck_routes_from_db
-                    qm_routes = get_all_truck_routes_from_db()
-                    if qm_routes:
-                        log.info(f"Routes from DB (QM Notifier): {len(qm_routes)} trucks")
-                except Exception as e:
-                    log.warning(f"DB route load failed: {e}")
+                log.warning(f"DB route load failed: {e}")
+                qm_routes = {}
 
             # -- Find trucks due for polling -----------------------------------
             due_trucks = []

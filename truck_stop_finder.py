@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 EARTH_RADIUS_MILES  = 3958.8
 _PARKED_SPEED_MPH   = 10   # trucks showing up to 10mph due to GPS drift while parked
-_AT_STOP_RADIUS     = 0.5   # miles — truck is in the lot (raised from 0.35 for large truck stops)
+_AT_STOP_RADIUS     = 0.25  # miles — truck must be in the actual lot (about 1300 feet)
 _AHEAD_ARC_DEGREES  = 120    # 60° left and right of heading
 
 
@@ -582,18 +582,13 @@ def find_best_stops_on_route(
 
     log.info(
         f"Route best: {best['store_name']} {best['distance_miles']:.1f}mi "
-        f"${best.get('diesel_price','?')}/gal corridor={cross_track:.1f}mi off-route"
+        f"${best.get('diesel_price','?')}/gal detour={best.get('detour_miles',0):.1f}mi"
     )
     return best, alt
 
 def calc_savings(best: dict, alt: dict) -> float | None:
     return None
 
-
-def is_near_stop(truck_lat, truck_lng, stop_lat, stop_lng,
-                 radius_miles=None) -> bool:
-    r = radius_miles or _AT_STOP_RADIUS
-    return haversine_miles(truck_lat, truck_lng, stop_lat, stop_lng) <= r
 
 def is_near_stop(truck_lat, truck_lng, stop_lat, stop_lng,
                  radius_miles=None) -> bool:

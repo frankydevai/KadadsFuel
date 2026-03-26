@@ -390,7 +390,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 (_utcnow() - assignment_time).total_seconds() / 60
                 if assignment_time else 0
             )
-            if dist_to_stop > 10 and minutes_since_assign > 15:
+            if dist_to_stop > 5 and minutes_since_assign > 10:
                 passed_assigned_stop = True
                 log.info(f"  {vname}: passed assigned stop ({dist_to_stop:.1f} mi away) — finding next stop")
                 # Clear assignment so next alert picks a fresh stop

@@ -331,6 +331,8 @@ def poll_for_uploads():
                 _handle_loadroute(text, chat_id)
             elif text.startswith("/route"):
                 _handle_route(text, chat_id)
+            elif text.startswith("/newalert"):
+                _handle_newalert(text)
             elif text.startswith("/compliance"):
                 _handle_compliance(text, chat_id)
             elif text.startswith("/fuelhistory"):
@@ -351,6 +353,7 @@ def poll_for_uploads():
                     elif text.startswith("/setgroup"):     _handle_setgroup(text)
                     elif text.startswith("/listtruck"):    _handle_listtruck()
                     elif text.startswith("/removetruck"):  _handle_removetruck(text)
+                    elif text.startswith("/checkall"):     _handle_checkall()
                     elif text.startswith("/checknow"):     _handle_checknow()
                     elif text.startswith("/dbstats"):      _handle_dbstats()
                     elif text.startswith("/resetpilot"):   _handle_resetpilot()
@@ -401,6 +404,114 @@ def poll_for_uploads():
 
 
 # -- Admin handlers -----------------------------------------------------------
+
+def _handle_checkall() -> None:
+    """/checkall — immediately check all trucks and report low fuel ones"""
+    from samsara_client import get_combined_vehicle_data
+    from truck_stop_finder import get_urgency
+    from config import FUEL_ALERT_THRESHOLD_PCT
+
+    _send_to(ADMIN_CHAT_ID, "🔄 Checking all trucks now...")
+
+    try:
+        vehicles = get_combined_vehicle_data()
+    except Exception as e:
+        _send_to(ADMIN_CHAT_ID, f"❌ Samsara error: `{e}`")
+        return
+
+    low_fuel   = []
+    critical   = []
+    healthy    = []
+
+    for v in vehicles:
+        fuel  = v.get("fuel_pct", 100)
+        name  = v.get("vehicle_name", "?")
+        speed = v.get("speed_mph", 0)
+        if fuel <= 10:
+            critical.append((name, fuel, speed))
+        elif fuel <= FUEL_ALERT_THRESHOLD_PCT:
+            low_fuel.append((name, fuel, speed))
+        else:
+            healthy.append(name)
+
+    # Sort by fuel level (lowest first)
+    critical.sort(key=lambda x: x[1])
+    low_fuel.sort(key=lambda x: x[1])
+
+    lines = [
+        f"📊 *Fleet Fuel Check — {len(vehicles)} trucks*",
+        f"✅ Healthy: {len(healthy)}  |  🟡 Low: {len(low_fuel)}  |  🚨 Critical: {len(critical)}",
+        "",
+    ]
+
+    if critical:
+        lines.append("🚨 *CRITICAL (≤10%):*")
+        for name, fuel, speed in critical:
+            lines.append(f"   🚨 Truck *{name}* — {fuel:.0f}% | {speed:.0f} mph")
+        lines.append("")
+
+    if low_fuel:
+        lines.append("🟡 *Low Fuel (≤35%):*")
+        for name, fuel, speed in low_fuel:
+            urgency = get_urgency(fuel)
+            emoji   = {"WARNING": "🟠", "CRITICAL": "🔴"}.get(urgency, "🟡")
+            lines.append(f"   {emoji} Truck *{name}* — {fuel:.0f}% | {speed:.0f} mph")
+        lines.append("")
+
+    if not critical and not low_fuel:
+        lines.append("✅ All trucks have sufficient fuel.")
+
+    _send_to(ADMIN_CHAT_ID, "\n".join(lines))
+
+    # Also trigger force check so alerts fire for low fuel trucks
+    global force_check_now
+    force_check_now = True
+    if low_fuel or critical:
+        _send_to(ADMIN_CHAT_ID, f"⚡ Alerts will fire for {len(low_fuel)+len(critical)} trucks in next poll cycle.")
+
+
+def _handle_newalert(text: str) -> None:
+    """/newalert <truck_number> — force immediate new alert for a truck"""
+    from database import load_all_truck_states, save_truck_state
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(ADMIN_CHAT_ID, "Usage: `/newalert 3663`")
+        return
+
+    truck_num = parts[1].strip()
+    states = load_all_truck_states()
+
+    # Find truck by name
+    found = None
+    for vid, state in states.items():
+        if str(state.get("vehicle_name","")) == truck_num:
+            found = (vid, state)
+            break
+
+    if not found:
+        _send_to(ADMIN_CHAT_ID, f"❌ Truck *{truck_num}* not found in active states.")
+        return
+
+    vid, state = found
+    # Reset alert timer and clear assignment so fresh stop is found
+    state["last_alert_time"]    = None
+    state["alert_sent"]         = False
+    state["assigned_stop_id"]   = None
+    state["assigned_stop_name"] = None
+    state["assigned_stop_lat"]  = None
+    state["assigned_stop_lng"]  = None
+    state["assignment_time"]    = None
+    save_truck_state(state)
+
+    # Also trigger force check
+    global force_check_now
+    force_check_now = True
+
+    _send_to(ADMIN_CHAT_ID,
+        f"✅ *Truck {truck_num}* — new alert triggered.\n"
+        f"Fresh stop recommendation will send in next poll cycle (~30 sec)."
+    )
+
 
 def _handle_checknow():
     global force_check_now

@@ -192,6 +192,64 @@ def process_truck(vid, prev_state, current_data, truck_states):
              f"state={state.get('state','NEW')}  sleeping={state.get('sleeping',False)}")
 
     # ══════════════════════════════════════════════════════════════════════════
+    # 0. FUEL STOP GEOFENCE — track if truck enters/exits any fuel stop
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        current_stop_gf = find_current_stop(lat, lng)
+        prev_stop_id    = state.get("at_stop_id")
+
+        if current_stop_gf:
+            stop_id   = current_stop_gf.get("id") or current_stop_gf.get("store_name")
+            stop_name = current_stop_gf.get("store_name", "Unknown")
+
+            if prev_stop_id != stop_id:
+                # Truck just entered this stop
+                log.info(f"  {vname}: 📍 entered fuel stop: {stop_name}")
+                state["at_stop_id"]    = stop_id
+                state["at_stop_name"]  = stop_name
+                state["at_stop_since"] = _utcnow()
+                state["at_stop_fuel"]  = fuel
+
+                # Check if this is the recommended stop
+                rec_name = state.get("assigned_stop_name")
+                rec_lat  = state.get("assigned_stop_lat")
+                rec_lng  = state.get("assigned_stop_lng")
+                if rec_lat and rec_lng:
+                    dist_to_rec = haversine_miles(lat, lng, rec_lat, rec_lng)
+                    visited     = dist_to_rec <= 0.5
+                    try:
+                        from database import log_stop_visit
+                        log_stop_visit(
+                            vehicle_name=vname,
+                            alert_id=state.get("open_alert_id"),
+                            recommended_stop_name=rec_name,
+                            recommended_lat=rec_lat, recommended_lng=rec_lng,
+                            actual_stop_name=stop_name,
+                            actual_lat=float(current_stop_gf.get("latitude", lat)),
+                            actual_lng=float(current_stop_gf.get("longitude", lng)),
+                            visited=visited,
+                            fuel_before=fuel, fuel_after=fuel,
+                        )
+                        if visited:
+                            log.info(f"  {vname}: ✅ entered RECOMMENDED stop {stop_name}")
+                        else:
+                            log.info(f"  {vname}: ⚠️ entered DIFFERENT stop {stop_name} (rec was {rec_name})")
+                    except Exception as e:
+                        log.warning(f"  {vname}: geofence visit log failed: {e}")
+        else:
+            if prev_stop_id:
+                # Truck just left a fuel stop
+                stop_name   = state.get("at_stop_name", "Unknown")
+                fuel_before = state.get("at_stop_fuel", fuel)
+                log.info(f"  {vname}: 🚗 left fuel stop: {stop_name} fuel {fuel_before:.0f}%→{fuel:.0f}%")
+            state["at_stop_id"]    = None
+            state["at_stop_name"]  = None
+            state["at_stop_since"] = None
+            state["at_stop_fuel"]  = None
+    except Exception as e:
+        log.warning(f"  {vname}: geofence check failed: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════════
     # 1. YARD CHECK — always first, silences everything
     # ══════════════════════════════════════════════════════════════════════════
     in_yard_now = is_in_yard(lat, lng)
@@ -529,8 +587,9 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
         delete_message(DISPATCHER_GROUP_ID, prev_dispatcher_msg_id)
         log.info(f"  {vname}: deleted prev dispatcher alert {prev_dispatcher_msg_id}")
 
-    # Check if truck is already parked at a fuel stop
-    current_stop = find_current_stop(lat, lng) if speed <= 10 else None
+    # Check if truck is already parked AT a fuel stop
+    # Only trigger if truly stopped (speed < 3mph) — not just slow traffic near a stop
+    current_stop = find_current_stop(lat, lng) if speed < 3 else None
     if current_stop:
         log.info(f"  {vname}: already at {current_stop['store_name']} — sending at-stop alert")
         result = send_at_stop_alert(
@@ -551,7 +610,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
     # Use route-based search if QuickManage route is available
     route = state.get("qm_route")
     if route:
-        best, alt = find_best_stops_on_route(lat, lng, route, fuel, speed, tank_gal, mpg)
+        best, alt = find_best_stops_on_route(lat, lng, route, fuel, speed, tank_gal, mpg, truck_heading=heading)
         if not best:
             log.info(f"  {vname}: route search found nothing — falling back to heading search")
             best, alt = find_best_stops(lat, lng, heading, speed, fuel, tank_gal, mpg, truck_state=state_code or "")

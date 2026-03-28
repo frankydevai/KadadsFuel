@@ -447,6 +447,7 @@ def find_best_stops_on_route(
     speed_mph: float,
     tank_gal: float = DEFAULT_TANK_GAL,
     mpg: float = DEFAULT_MPG,
+    truck_heading: float = 0.0,
 ) -> tuple[dict | None, dict | None]:
     """
     Find best fuel stop along the actual route from QuickManage.
@@ -521,8 +522,21 @@ def find_best_stops_on_route(
         if urgency not in ("CRITICAL", "EMERGENCY") and dist > max_range:
             continue
 
+        # HARD CHECK 1: Stop must be ahead based on CURRENT GPS heading
+        # This is the primary filter — if stop is behind the truck right now, skip it
+        stop_bear_from_truck = bearing(truck_lat, truck_lng, slat, slng)
+        adiff_from_truck     = angle_diff(truck_heading, stop_bear_from_truck)
+        along_from_truck     = dist * math.cos(math.radians(adiff_from_truck))
+
+        # Stop is behind the truck — skip regardless of route
+        if along_from_truck <= 0:
+            continue
+
+        # Stop is too far off heading — skip unless critical
+        if adiff_from_truck > 90 and urgency not in ("CRITICAL", "EMERGENCY"):
+            continue
+
         # Check if stop is near ANY segment of the route
-        # (truck → waypoint1, waypoint1 → waypoint2, etc.)
         on_route = False
         min_cross = float("inf")
         prev_lat, prev_lng = truck_lat, truck_lng
@@ -536,8 +550,6 @@ def find_best_stops_on_route(
             along = dist_from_seg_start * math.cos(math.radians(adiff))
             cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
 
-            # Stop must be AHEAD (along > 0) and within 90° of route direction
-            # This strictly prevents recommending stops behind the truck
             if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
                 on_route = True
                 min_cross = min(min_cross, cross)

@@ -286,7 +286,16 @@ def process_truck(vid, prev_state, current_data, truck_states):
 
     if should_send_ca_reminder(state_code or "", lat, lng, heading,
                                 fuel, state.get("ca_reminder_sent", False)):
-        _fire_ca_reminder(state, current_data, tank_gal, mpg, state_code=state_code or "")
+        # Check QM route — only send if truck is actually going to CA
+        route      = state.get("qm_route")
+        going_to_ca = True  # default: send if no route info
+        if route:
+            dest_state = (route.get("destination") or {}).get("state", "").upper()
+            if dest_state and dest_state != "CA":
+                going_to_ca = False
+                log.info(f"  {vname}: CA reminder suppressed — route dest is {dest_state}, not CA")
+        if going_to_ca:
+            _fire_ca_reminder(state, current_data, tank_gal, mpg, state_code=state_code or "")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 3. FUEL IS FINE

@@ -41,8 +41,8 @@ _CA_BORDER_POINTS = [
 _CA_BORDER_STATES = {"NV", "AZ", "OR"}
 
 # Westward heading range — widened to catch I-40, I-80, I-10 approaches
-_WEST_HEADING_MIN = 200
-_WEST_HEADING_MAX = 340
+_WEST_HEADING_MIN = 240
+_WEST_HEADING_MAX = 320
 
 # California average diesel price premium over surrounding states
 CA_PRICE_PREMIUM = float(1.10)   # $1.10/gal higher on average

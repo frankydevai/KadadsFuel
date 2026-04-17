@@ -1,4 +1,3 @@
-
 """
 config.py — Environment variable configuration.
 
@@ -41,9 +40,8 @@ Format: Name:latitude:longitude:radius_miles
 
 import os
 import sys
-from dotenv import load_dotenv
+# Environment variables set directly in Railway dashboard
 
-load_dotenv()
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

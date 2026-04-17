@@ -420,6 +420,7 @@ def poll_for_uploads():
                     elif text.startswith("/setgroup"):     _handle_setgroup(text)
                     elif text.startswith("/listtruck"):    _handle_listtruck()
                     elif text.startswith("/removetruck"):  _handle_removetruck(text)
+                    elif text.startswith("/resetstops"):   _handle_resetstops()
                     elif text.startswith("/checkall"):     _handle_checkall()
                     elif text.startswith("/checknow"):     _handle_checknow()
                     elif text.startswith("/dbstats"):      _handle_dbstats()
@@ -581,6 +582,17 @@ def _handle_newalert(text: str) -> None:
         f"Fresh stop recommendation will send in next poll cycle (~30 sec)."
     )
 
+
+def _handle_resetstops():
+    """/resetstops — wipe all fuel stops from DB (then re-upload CSV)"""
+    from database import db_cursor
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM fuel_stops")
+        deleted = cur.rowcount
+    _send_to(ADMIN_CHAT_ID,
+        f"🗑 *Deleted {deleted} fuel stops.*\n"
+        f"Now send the new CSV file to reload all stations."
+    )
 
 def _handle_checknow():
     global force_check_now

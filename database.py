@@ -745,3 +745,30 @@ def get_all_truck_efficiency() -> list:
             ORDER BY mpg ASC
         """)
         return cur.fetchall()
+
+def get_truck_params(vehicle_name: str) -> dict | None:
+    """Get tank size and MPG for a truck. Returns None if not found."""
+    with db_cursor() as cur:
+        cur.execute(
+            """SELECT tank_capacity_gal AS tank_gal, avg_mpg AS mpg
+               FROM trucks WHERE vehicle_name = %s AND is_active = TRUE""",
+            (vehicle_name,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def get_truck_mpg(vehicle_id: str) -> float:
+    """Get real MPG for a truck from Samsara efficiency data. Returns 6.5 default."""
+    with db_cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT mpg FROM truck_efficiency WHERE vehicle_id = %s AND mpg > 3",
+                (vehicle_id,)
+            )
+            row = cur.fetchone()
+            if row and row["mpg"]:
+                return float(row["mpg"])
+        except Exception:
+            pass
+    return 6.5

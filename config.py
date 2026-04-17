@@ -131,6 +131,10 @@ STATE_SAVE_INTERVAL_SECONDS = _int("STATE_SAVE_INTERVAL_SECONDS", 300)
 CA_BORDER_REMINDER_MILES = _float("CA_BORDER_REMINDER_MILES", 150.0)
 CA_BORDER_FUEL_THRESHOLD = _float("CA_BORDER_FUEL_THRESHOLD", 70.0)
 
+# IFTA home state — set this to your fleet's base state (e.g. "FL", "IN", "TX", "OH")
+# Leave blank to disable IFTA-adjusted pricing
+IFTA_HOME_STATE = os.environ.get("IFTA_HOME_STATE", "").upper().strip() or None
+
 
 # ── Yards ─────────────────────────────────────────────────────────────────────
 

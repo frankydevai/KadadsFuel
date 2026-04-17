@@ -87,43 +87,89 @@ def _urgency_emoji(fuel_pct: float) -> str:
 
 
 def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
-                        heading, speed_mph, best_stop, alt_stop, savings_usd) -> dict:
+                        heading, speed_mph, best_stop, alt_stop=None, savings_usd=None) -> dict:
+    """
+    Send fuel alert with single cheapest stop on route.
+    No comparisons. Shows: stop name, distance, pump price,
+    IFTA net cost, gallons needed, total fill cost.
+    """
     emoji     = _urgency_emoji(fuel_pct)
     truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
     compass   = _compass(heading)
+
     lines = [
         f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
         f"⛽ Fuel: *{fuel_pct:.0f}%*   🧭 {speed_mph:.0f} mph {compass}",
-        f"📍 [View on Map]({truck_url})",
+        f"📍 [Truck Location]({truck_url})",
+        f"🌐 `{truck_lat:.5f}, {truck_lng:.5f}`",
     ]
+
     if best_stop:
-        name = best_stop.get("store_name", "Unknown")
-        addr = ", ".join(filter(None, [best_stop.get("address",""), best_stop.get("city",""),
-                                        best_stop.get("state",""), best_stop.get("zip","")]))
-        dist  = best_stop.get("distance_miles", 0)
-        price = best_stop.get("diesel_price")
-        lat   = best_stop.get("latitude")
-        lng   = best_stop.get("longitude")
+        name     = best_stop.get("store_name", "Unknown")
+        street   = best_stop.get("address", "")
+        city     = best_stop.get("city", "")
+        state    = best_stop.get("state", "")
+        zip_code = best_stop.get("zip", "")
+        dist     = best_stop.get("distance_miles", 0)
+        pump     = best_stop.get("diesel_price")
+        net      = best_stop.get("net_price")
+        ifta_r   = best_stop.get("ifta_rate", 0)
+        lat      = best_stop.get("latitude")
+        lng      = best_stop.get("longitude")
+        discount = best_stop.get("discount_per_gallon")
+
+        addr     = ", ".join(filter(None, [street, city, state, zip_code]))
         maps_url = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None
-        lines += ["", f"⛽ *{name}*", f"📌 {addr}", f"🛣 {dist:.1f} mi away",
-                  f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A"]
-        if alt_stop and price and alt_stop.get("diesel_price"):
-            np = alt_stop["diesel_price"]
-            nd = alt_stop.get("distance_miles", 0)
-            nn = alt_stop.get("store_name", "nearest stop")
-            diff = np - price
-            if diff > 0.01:
-                from config import DEFAULT_TANK_GAL, SAFETY_RESERVE
-                gal = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100) * (1 - SAFETY_RESERVE))
-                sav = round(diff * gal, 2)
-                lines.append(f"💵 Saves *${diff:.2f}/gal × {gal} gal = ${sav:.0f}* vs {nn} ({nd:.1f} mi, ${np:.3f}/gal)")
+
+        # Gallons needed to fill tank
+        from config import DEFAULT_TANK_GAL
+        gallons_needed = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100), 1)
+
+        lines += ["", f"⛽ *{name}*", f"📌 {addr}", f"🛣 *{dist:.1f} mi ahead*"]
+
+        retail   = best_stop.get("retail_price")
+
+        # Line 1 — Retail price (what pump shows publicly)
+        if retail and retail != pump:
+            lines.append(f"💰 Retail:  ${retail:.3f}/gal")
+
+        # Line 2 — Card price (what driver actually pays with EFS card)
+        if pump:
+            if discount and discount > 0:
+                lines.append(f"💳 Card:    *${pump:.3f}/gal*  (save ${discount:.2f}/gal)")
+            else:
+                lines.append(f"💳 Card:    *${pump:.3f}/gal*")
+
+        # Line 3 — IFTA settlement estimate per gallon
+        if net and pump and abs(net - pump) > 0.005:
+            adj = net - pump
+            if adj > 0:
+                lines.append(f"📋 IFTA:    *+${adj:.3f}/gal* owed at settlement → true cost *${net:.3f}*")
+            else:
+                lines.append(f"📋 IFTA:    *-${abs(adj):.3f}/gal* credit → true cost *${net:.3f}*")
+        else:
+            net = pump  # no IFTA configured
+
+        # Line 4 — Total: what driver pays at pump vs true cost after IFTA
+        true_price = net if net else pump
+        if pump and true_price:
+            pay_pump = round(pump * gallons_needed, 2)
+            pay_net  = round(true_price * gallons_needed, 2)
+            if abs(pay_net - pay_pump) > 1:
+                lines.append(f"💵 Fill *{gallons_needed:.0f} gal* → Pump: ${pay_pump:.0f} · After IFTA: *${pay_net:.0f}*")
+            else:
+                lines.append(f"💵 Fill *{gallons_needed:.0f} gal = ${pay_pump:.0f}*")
+
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
+
     else:
-        lines += ["", "No diesel stops found within range.", "Dispatcher notified."]
-        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND")
+        lines += ["", "❌ No fuel stops found on route.", "Dispatcher has been notified."]
+        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND on route")
+
     if fuel_pct <= 15 and best_stop:
-        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — critically low at {fuel_pct:.0f}%")
+        _send_to_dispatcher(f"{emoji} *{vehicle_name}* critically low — {fuel_pct:.0f}%")
+
     result = _send_to_truck(vehicle_name, "\n".join(lines))
     return result if isinstance(result, dict) else {"truck_group": None, "truck_msg_id": result, "dispatcher_msg_id": None}
 
@@ -287,13 +333,32 @@ def poll_for_uploads():
                     chat = chat_member.get("chat", {})
                     g_id = str(chat.get("id", ""))
                     g_title = chat.get("title", "") or ""
-                    first_word = g_title.strip().split()[0] if g_title.strip() else ""
+                    # Extract truck number from group name
+                    # Supports formats:
+                    #   "1769 (32%) Kendy Louis"  → truck 1769
+                    #   "Truck 0792 John Smith"   → truck 0792
+                    #   "0792 Driver Name"        → truck 0792
+                    import re as _re
+                    first_word  = g_title.strip().split()[0] if g_title.strip() else ""
+                    # Also try matching any numeric sequence in the title
+                    num_matches = _re.findall(r'\b(\d{3,6})\b', g_title)
+                    candidates  = [first_word] + num_matches
+
                     matched = None
-                    if first_word:
+                    if candidates:
                         from database import get_all_registered_trucks, upsert_truck_group
-                        for truck in get_all_registered_trucks():
-                            if truck["vehicle_name"] == first_word:
-                                matched = first_word
+                        trucks = get_all_registered_trucks()
+                        truck_names = {t["vehicle_name"]: t for t in trucks}
+                        for candidate in candidates:
+                            if candidate in truck_names:
+                                matched = candidate
+                                break
+                            # Try partial match e.g. "0792" matches "Truck 0792"
+                            for name in truck_names:
+                                if candidate in name or name in candidate:
+                                    matched = name
+                                    break
+                            if matched:
                                 break
                     if matched:
                         upsert_truck_group(matched, g_id)
@@ -333,6 +398,8 @@ def poll_for_uploads():
                 _handle_route(text, chat_id)
             elif text.startswith("/newalert"):
                 _handle_newalert(text)
+            elif text.startswith("/stopvisits"):
+                _handle_stopvisits(text, chat_id)
             elif text.startswith("/compliance"):
                 _handle_compliance(text, chat_id)
             elif text.startswith("/fuelhistory"):
@@ -359,6 +426,8 @@ def poll_for_uploads():
                     elif text.startswith("/resetpilot"):   _handle_resetpilot()
                     elif text.startswith("/findload"):     _handle_findload(text, chat_id)
                     elif text.startswith("/testroute"):    _handle_testroute(text)
+                    elif text.startswith("/planroute"):     _handle_planroute(text, chat_id)
+                    elif text.startswith("/truckstats"):    _handle_truckstats(text, chat_id)
                     elif text.startswith("/routelist"):     _handle_routelist(chat_id)
                     else:
                         _send_to(ADMIN_CHAT_ID,
@@ -718,15 +787,21 @@ def _handle_route(text: str, chat_id: str) -> None:
         f"📋 Trip #: `{route.get('trip_num','')}` | Ref: `{route.get('ref_number','')}`",
         f"{status_label}", "",
     ]
-    for s in route.get("stops", []):
-        icon    = "📦" if s["pickup"] else "🏁"
-        stype   = "Pickup" if s["pickup"] else "Delivery"
-        loc     = f"{s['city']}, {s['state']} {s['zip']}".strip()
-        is_next = (s["city"] == dest.get("city") and s["state"] == dest.get("state"))
+    for i, s in enumerate(route.get("stops", []), 1):
+        icon    = "📦" if s.get("pickup") else "🏁"
+        stype   = "Pickup" if s.get("pickup") else "Delivery"
+        city    = s.get("city") or s.get("address", {}).get("city", "") if isinstance(s.get("address"), dict) else s.get("city","")
+        state   = s.get("state") or s.get("address", {}).get("state", "") if isinstance(s.get("address"), dict) else s.get("state","")
+        zip_    = s.get("zip","") or s.get("address", {}).get("zip_code","") if isinstance(s.get("address"), dict) else s.get("zip","")
+        company = s.get("company") or s.get("company_name","")
+        loc     = f"{city}, {state} {zip_}".strip()
+        stop_n  = s.get("stop_num", i)
+        is_next = (city == dest.get("city") and state == dest.get("state"))
         arrow   = "  ← *NEXT*" if is_next else ""
-        lines  += [f"{icon} *Stop {s['stop_num']} — {stype}*{arrow}", f"   {s['company']}", f"   📍 {loc}"]
-        if s.get("appt"):
-            lines.append(f"   🕐 {s['appt'][:16].replace('T',' ')}")
+        lines  += [f"{icon} *Stop {stop_n} — {stype}*{arrow}", f"   {company}", f"   📍 {loc}"]
+        appt = s.get("appt") or s.get("appointment_date","")
+        if appt:
+            lines.append(f"   🕐 {str(appt)[:16].replace('T',' ')}")
         lines.append("")
     lines.append(f"🏁 *Destination: {dest.get('city')}, {dest.get('state')}*")
     _send_to(chat_id, "\n".join(lines))
@@ -1053,75 +1128,318 @@ def _handle_compliance(text: str, chat_id: str) -> None:
     _send_to(chat_id, "\n".join(lines))
 
 
-def send_weekly_savings_report() -> None:
+def _handle_stopvisits(text: str, chat_id: str) -> None:
+    """/stopvisits <truck> — show all fuel stops truck entered recently"""
     from database import db_cursor
     from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    week_ago = now - timedelta(days=7)
+
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/stopvisits 2837`")
+        return
+
+    truck_num = parts[1].strip()
+    since     = datetime.now(timezone.utc) - timedelta(days=7)
+
     with db_cursor() as cur:
         cur.execute("""
-            SELECT COUNT(*) AS total_alerts, COUNT(DISTINCT vehicle_id) AS trucks_active,
+            SELECT recommended_stop_name, actual_stop_name,
+                   visited, fuel_before, fuel_after, visited_at
+            FROM stop_visits
+            WHERE vehicle_name = %s AND created_at >= %s
+            ORDER BY visited_at DESC LIMIT 20
+        """, (truck_num, since))
+        rows = cur.fetchall()
+
+    if not rows:
+        _send_to(chat_id,
+            f"❌ No stop visits recorded for truck *{truck_num}* in last 7 days.\n"
+            f"Geofence tracking requires trucks to pass within 0.25 miles of a known stop."
+        )
+        return
+
+    lines = [f"📍 *Stop Visits — Truck {truck_num}* (last 7 days)\n"]
+    for r in rows:
+        dt      = r["visited_at"].strftime("%b %d %H:%M") if r["visited_at"] else "?"
+        actual  = r["actual_stop_name"] or "Unknown"
+        rec     = r["recommended_stop_name"] or "none"
+        fb      = f"{r['fuel_before']:.0f}%" if r["fuel_before"] else "?"
+        fa      = f"{r['fuel_after']:.0f}%" if r["fuel_after"] else "?"
+        if r["visited"] is True:
+            icon = "✅"
+            lines.append(f"{icon} {dt} | *{actual}* | ⛽ {fb}→{fa} | followed recommendation")
+        elif r["visited"] is False:
+            icon = "⚠️"
+            lines.append(f"{icon} {dt} | *{actual}* | ⛽ {fb}→{fa} | rec was: {rec}")
+        else:
+            icon = "📍"
+            lines.append(f"{icon} {dt} | *{actual}* | ⛽ {fb}")
+
+    _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_planroute(text: str, chat_id: str) -> None:
+    """/planroute <truck> — full IFTA-aware fuel plan for entire route"""
+    parts = text.strip().split()
+    if len(parts) < 2:
+        _send_to(chat_id, "Usage: `/planroute 0792`")
+        return
+    truck_num = parts[1].strip()
+    _send_to(chat_id, f"🗺 Planning route for truck *{truck_num}*...")
+    try:
+        from samsara_client import get_combined_vehicle_data
+        from database import get_truck_route
+        from config import QM_CLIENT_ID, QM_CLIENT_SECRET
+        from route_planner import plan_route_fuel, format_route_plan
+
+        # Get truck GPS
+        vehicles = get_combined_vehicle_data()
+        truck = next((v for v in vehicles if truck_num.lower() in v.get("vehicle_name","").lower()), None)
+        if not truck:
+            _send_to(chat_id, f"❌ Truck *{truck_num}* not found in Samsara.")
+            return
+
+        lat  = truck.get("lat")
+        lng  = truck.get("lng")
+        fuel = truck.get("fuel_pct", 50)
+        vid  = truck.get("vehicle_id", "")
+
+        # Get route
+        route = None
+        if QM_CLIENT_ID and QM_CLIENT_SECRET:
+            from quickmanage_client import get_route_for_truck
+            route = get_route_for_truck(truck_num)
+        if not route:
+            route = get_truck_route(truck_num)
+        if not route:
+            _send_to(chat_id, f"❌ No active route for truck *{truck_num}*. Needs active QM load.")
+            return
+
+        plan = plan_route_fuel(lat, lng, fuel, vid, route)
+        msg  = format_route_plan(plan, truck_num)
+
+        # Split if too long
+        if len(msg) > 4000:
+            parts_msg = [msg[i:i+3900] for i in range(0, len(msg), 3900)]
+            for p in parts_msg:
+                _send_to(chat_id, p)
+        else:
+            _send_to(chat_id, msg)
+
+    except Exception as e:
+        _send_to(chat_id, f"❌ Route plan error: `{e}`")
+        log.error(f"/planroute error: {e}", exc_info=True)
+
+
+def _handle_truckstats(text: str, chat_id: str) -> None:
+    """/truckstats [truck] — show MPG and idle stats from Samsara"""
+    from database import get_all_truck_efficiency, db_cursor
+    parts = text.strip().split()
+
+    if len(parts) >= 2:
+        truck_num = parts[1].strip()
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM truck_efficiency WHERE vehicle_name = %s",
+                (truck_num,)
+            )
+            row = cur.fetchone()
+        if not row:
+            _send_to(chat_id, f"❌ No stats for truck *{truck_num}* yet. Stats update every hour.")
+            return
+        upd = row["updated_at"].strftime("%b %d %H:%M") if row["updated_at"] else "?"
+        msg = (
+            f"📊 *Truck {truck_num} — Efficiency Stats*\n"
+            f"⚡ MPG (30d avg): *{row['mpg']:.1f}*\n"
+            f"😴 Idle: *{row['idle_hours_30d']:.1f} hrs* ({row['idle_pct_30d']:.1f}%)\n"
+            f"⛽ Fuel used (30d): *{row['fuel_used_30d']:.0f} gal*\n"
+            f"🕐 Updated: {upd}"
+        )
+        _send_to(chat_id, msg)
+    else:
+        # Fleet summary
+        trucks = get_all_truck_efficiency()
+        if not trucks:
+            _send_to(chat_id, "❌ No efficiency data yet. Updating hourly from Samsara.")
+            return
+        valid = [t for t in trucks if t["mpg"] and t["mpg"] > 3]
+        avg_mpg = sum(t["mpg"] for t in valid) / len(valid) if valid else 0
+        total_idle = sum(t["idle_hours_30d"] or 0 for t in valid)
+        worst  = valid[:3] if valid else []
+        best   = valid[-3:] if len(valid) >= 3 else valid
+
+        lines = [
+            f"📊 *Fleet Efficiency — Last 30 Days*",
+            f"",
+            f"⚡ Fleet avg MPG: *{avg_mpg:.1f}*",
+            f"😴 Total idle hours: *{total_idle:.0f} hrs*",
+            f"",
+            f"🐢 *Worst MPG:*",
+        ]
+        for t in worst:
+            lines.append(f"   • Truck *{t['vehicle_name']}* — {t['mpg']:.1f} MPG | {t['idle_hours_30d']:.0f}h idle")
+        lines.append(f"")
+        lines.append(f"🚀 *Best MPG:*")
+        for t in reversed(best):
+            lines.append(f"   • Truck *{t['vehicle_name']}* — {t['mpg']:.1f} MPG | {t['idle_hours_30d']:.0f}h idle")
+        _send_to(chat_id, "\n".join(lines))
+
+
+def send_weekly_savings_report() -> None:
+    """Weekly owner report — savings, IFTA analysis, compliance. Owner only, not drivers."""
+    from database import db_cursor
+    from datetime import datetime, timezone, timedelta
+    now      = datetime.now(timezone.utc)
+    week_ago = now - timedelta(days=7)
+
+    # ── Core stats ──────────────────────────────────────────────────────────
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) AS total_alerts,
+                   COUNT(DISTINCT vehicle_id) AS trucks_active,
                    COALESCE(SUM(savings_usd),0) AS total_savings,
                    COUNT(*) FILTER (WHERE savings_usd > 0) AS alerts_with_savings
             FROM fuel_alerts WHERE alerted_at >= %s AND alert_type = 'low_fuel'
         """, (week_ago,))
         stats = dict(cur.fetchone())
+
         cur.execute("""
             SELECT vehicle_name, COALESCE(SUM(savings_usd),0) AS saved, COUNT(*) AS alerts
             FROM fuel_alerts WHERE alerted_at >= %s AND alert_type = 'low_fuel'
             GROUP BY vehicle_name ORDER BY saved DESC LIMIT 5
         """, (week_ago,))
         top_trucks = cur.fetchall()
+
+        # IFTA data — fuel purchased by state this week
         cur.execute("""
-            SELECT best_stop_name, best_stop_price FROM fuel_alerts
-            WHERE alerted_at >= %s AND best_stop_price IS NOT NULL ORDER BY best_stop_price ASC LIMIT 1
+            SELECT best_stop_state,
+                   COUNT(*) AS stops,
+                   COALESCE(SUM(gallons_purchased),0) AS total_gal,
+                   AVG(best_stop_price) AS avg_pump_price
+            FROM fuel_alerts
+            WHERE alerted_at >= %s
+              AND alert_type = 'refueled'
+              AND best_stop_state IS NOT NULL
+            GROUP BY best_stop_state
+            ORDER BY total_gal DESC
+            LIMIT 8
         """, (week_ago,))
-        cheapest = cur.fetchone()
+        ifta_by_state = cur.fetchall()
+
+        # Compliance
+        cur.execute("""
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE visited=TRUE)  AS visited,
+                   COUNT(*) FILTER (WHERE visited=FALSE) AS skipped
+            FROM stop_visits WHERE created_at >= %s
+        """, (week_ago,))
+        compliance = dict(cur.fetchone())
+
+        # Truck efficiency summary
+        cur.execute("""
+            SELECT AVG(mpg) AS fleet_mpg,
+                   SUM(idle_hours_30d) AS total_idle,
+                   SUM(fuel_used_30d) AS total_fuel
+            FROM truck_efficiency
+        """)
+        eff = cur.fetchone()
+
     total_savings = float(stats["total_savings"] or 0)
-    week_start = (now - timedelta(days=7)).strftime("%b %d")
-    week_end   = now.strftime("%b %d, %Y")
+    week_start    = week_ago.strftime("%b %d")
+    week_end      = now.strftime("%b %d, %Y")
+
     lines = [
-        f"📊 *FleetFuel AI — Weekly Savings Report*",
-        f"📅 {week_start} – {week_end}", f"─────────────────────────────", "",
-        f"🚛 Trucks monitored:     *{stats['trucks_active']}*",
-        f"⚡ Alerts fired:          *{stats['total_alerts']}*",
-        f"💡 Alerts with savings:  *{stats['alerts_with_savings']}*", "",
-        f"💰 *Total Diesel Savings:  ${total_savings:,.2f}*",
+        f"📊 *FleetFuel AI — Weekly Owner Report*",
+        f"📅 {week_start} – {week_end}",
+        f"─────────────────────────────",
+        f"",
+        f"🚛 Trucks monitored:    *{stats['trucks_active']}*",
+        f"⚡ Alerts fired:         *{stats['total_alerts']}*",
+        f"💡 Alerts with savings: *{stats['alerts_with_savings']}*",
+        f"",
+        f"💰 *Total Diesel Savings: ${total_savings:,.2f}*",
     ]
-    if cheapest:
-        lines += ["", f"🏆 *Cheapest stop:*", f"   {cheapest['best_stop_name']} — ${cheapest['best_stop_price']:.3f}/gal"]
+
+    # Top trucks
     if top_trucks:
         lines += ["", "🏅 *Top Trucks — Most Saved:*"]
+        medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
         for i, t in enumerate(top_trucks):
-            medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
-            lines.append(f"   {medals[i]} Truck {t['vehicle_name']} — *${float(t['saved']):.2f}* ({t['alerts']} alerts)")
-    if total_savings == 0:
-        lines += ["", "ℹ️ No savings recorded this week."]
-    # Compliance summary
-    try:
-        from datetime import timedelta
-        since_week = now - timedelta(days=7)
-        with db_cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) AS total,
-                       COUNT(*) FILTER (WHERE visited=TRUE) AS visited,
-                       COUNT(*) FILTER (WHERE visited=FALSE) AS skipped
-                FROM stop_visits WHERE created_at >= %s
-            """, (since_week,))
-            cv = dict(cur.fetchone())
-        if cv["total"]:
-            cpct = round((cv["visited"] or 0) / cv["total"] * 100)
-            lines += [
-                "", "─────────────────────────────",
-                f"🎯 *Stop Compliance:* {cv['visited']}/{cv['total']} followed recommendation ({cpct}%)",
-                f"⚠️ Skipped: {cv['skipped']} | Type `/compliance` for details",
-            ]
-    except Exception:
-        pass
+            lines.append(f"   {medals[i]} Truck *{t['vehicle_name']}* — ${float(t['saved']):.2f} ({t['alerts']} alerts)")
 
-    lines += ["", "─────────────────────────────", "⚙️ _FleetFuel AI — Automated Report_"]
+    # ── IFTA Section (owner only) ────────────────────────────────────────────
+    lines += [
+        "",
+        "─────────────────────────────",
+        "📋 *IFTA Analysis — Home State: Indiana*",
+        "",
+    ]
+
+    if ifta_by_state:
+        try:
+            from ifta import get_ifta_rate, HOME_STATE_RATE
+            total_pump     = 0.0
+            total_net      = 0.0
+            total_gal_all  = 0.0
+            ifta_lines     = []
+
+            for r in ifta_by_state:
+                state    = r["best_stop_state"] or "?"
+                gal      = float(r["total_gal"] or 0)
+                avg_pump = float(r["avg_pump_price"] or 0)
+                rate     = get_ifta_rate(state)
+                net_rate = HOME_STATE_RATE - rate  # adjustment per gallon
+                adj_cost = net_rate * gal           # + means owe IN, - means credit
+
+                total_pump    += avg_pump * gal
+                total_net     += (avg_pump + net_rate) * gal
+                total_gal_all += gal
+
+                sign = "⚠️ owes IN" if net_rate > 0 else "✅ credit"
+                ifta_lines.append(
+                    f"   {state}: {gal:.0f} gal @ ${avg_pump:.3f} pump | "
+                    f"IFTA adj: ${net_rate:+.3f}/gal | {sign}"
+                )
+
+            lines += ifta_lines
+            ifta_diff = total_net - total_pump
+            lines += [
+                "",
+                f"⛽ Total fuel purchased: *{total_gal_all:.0f} gal*",
+                f"💳 Total pump cost: *${total_pump:,.2f}*",
+                f"📋 IFTA settlement (est.): *${ifta_diff:+,.2f}*",
+                f"💵 *True net fuel cost: ${total_net:,.2f}*",
+            ]
+        except Exception as e:
+            lines.append(f"   _(IFTA calculation error: {e})_")
+    else:
+        lines.append("   _(No refuel data recorded this week)_")
+
+    # ── Fleet Efficiency ─────────────────────────────────────────────────────
+    if eff and eff["fleet_mpg"]:
+        lines += [
+            "",
+            "─────────────────────────────",
+            "⚡ *Fleet Efficiency (30 day):*",
+            f"   MPG avg: *{float(eff['fleet_mpg']):.1f}*",
+            f"   Total idle: *{float(eff['total_idle'] or 0):.0f} hrs*",
+            f"   Total fuel used: *{float(eff['total_fuel'] or 0):.0f} gal*",
+        ]
+
+    # ── Compliance ───────────────────────────────────────────────────────────
+    if compliance["total"]:
+        cpct = round((compliance["visited"] or 0) / compliance["total"] * 100)
+        lines += [
+            "",
+            "─────────────────────────────",
+            f"🎯 *Stop Compliance:* {compliance['visited']}/{compliance['total']} followed recommendation ({cpct}%)",
+            f"⚠️ Skipped: {compliance['skipped']} | `/compliance` for details",
+        ]
+
+    lines += ["", "─────────────────────────────", "⚙️ _FleetFuel AI — Owner Report (confidential)_"]
+
     msg = "\n".join(lines)
-    if DISPATCHER_GROUP_ID:
-        _send_to(DISPATCHER_GROUP_ID, msg)
+
+    # Send ONLY to admin (owner) — never to dispatcher group or driver groups
     _send_to(ADMIN_CHAT_ID, msg)
-    log.info(f"Weekly report sent — ${total_savings:,.2f} savings")
+    log.info(f"Weekly owner report sent — ${total_savings:,.2f} savings")

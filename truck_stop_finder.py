@@ -350,10 +350,22 @@ def find_best_stops(
         tc        = true_cost(stop, truck_lat, truck_lng,
                               truck_heading or 0, fuel_pct, tank_gal, mpg)
 
+        # IFTA-adjusted scoring
+        try:
+            from ifta import net_price_after_ifta, get_ifta_rate
+            state_     = (stop.get("state") or "").upper()
+            ifta_rate_ = get_ifta_rate(state_)
+            net_price_ = net_price_after_ifta(stop.get("diesel_price") or 0, state_)
+            ifta_tc    = net_price_ * fill_gal + (tc - fill_cost)
+        except Exception:
+            ifta_rate_ = 0.0
+            net_price_ = stop.get("diesel_price") or 0
+            ifta_tc    = tc
+
         # Parked: use true cost (price matters even when parked — truck has to drive there)
         # Critical/Emergency: nearest reachable regardless
         if price_matters:
-            score = tc
+            score = ifta_tc  # rank by IFTA-adjusted cost
         else:
             score = dist
 
@@ -366,6 +378,8 @@ def find_best_stops(
             "detour_miles":    round(detour_mi, 2),
             "fill_cost":       round(fill_cost, 2),
             "true_cost":       tc,
+            "ifta_rate":       round(ifta_rate_, 3),
+            "net_price":       round(net_price_, 4),
             "_score":          score,
             "_ahead":          ahead,
             "google_maps_url": f"https://maps.google.com/?q={slat},{slng}",

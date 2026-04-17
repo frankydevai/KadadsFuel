@@ -88,6 +88,9 @@ def main():
     last_upload_check   = _utcnow()
     last_weekly_report  = _utcnow()
     last_route_fetch    = _utcnow() - timedelta(minutes=10)  # fetch immediately on start
+    last_mpg_sync       = _utcnow() - timedelta(hours=2)     # sync MPG immediately on start
+    last_ifta_check     = _utcnow() - timedelta(hours=25)    # check IFTA rates immediately on start
+    last_ifta_update    = _utcnow() - timedelta(days=91)     # update IFTA rates immediately
     poll_cycle          = 0
 
     # Start background thread for QM route geocoding (slow — don't block alerts)
@@ -110,6 +113,51 @@ def main():
         except Exception as e:
             log.warning(f"Background route fetch failed: {e}")
 
+    def _update_ifta_background():
+        """Auto-update IFTA rates when new quarter starts."""
+        try:
+            from ifta import should_update_rates, scrape_and_update_ifta_rates, get_rates_info
+            if should_update_rates():
+                log.info("IFTA: new quarter detected — updating rates...")
+                result = scrape_and_update_ifta_rates()
+                if result:
+                    log.info(f"IFTA rates updated: {len(result)} states")
+                    from telegram_bot import _send_to
+                    from config import ADMIN_CHAT_ID
+                    _send_to(ADMIN_CHAT_ID, f"📋 *IFTA rates auto-updated*\n{get_rates_info()}")
+                else:
+                    log.warning("IFTA auto-update failed — keeping current rates")
+            else:
+                log.info(f"IFTA rates current: {get_rates_info()}")
+        except Exception as e:
+            log.warning(f"IFTA update check failed: {e}")
+
+    def _sync_mpg_background():
+        """Sync real MPG and idle data from Samsara every hour."""
+        try:
+            from samsara_client import get_vehicle_fuel_efficiency, get_combined_vehicle_data
+            from database import save_truck_efficiency
+            efficiency = get_vehicle_fuel_efficiency()
+            if not efficiency:
+                log.warning("Background MPG sync: no data from Samsara fuel report")
+                return
+            # Get vehicle names
+            vehicles = get_combined_vehicle_data()
+            name_map = {v["vehicle_id"]: v["vehicle_name"] for v in vehicles}
+            updated  = 0
+            for vid, stats in efficiency.items():
+                if stats.get("mpg") and stats["mpg"] > 3:
+                    name = name_map.get(vid, vid)
+                    save_truck_efficiency(
+                        vehicle_id=vid, vehicle_name=name,
+                        mpg=stats["mpg"], idle_hours=stats["idle_hours"],
+                        idle_pct=stats["idle_pct"], fuel_gal=stats["fuel_gal"],
+                    )
+                    updated += 1
+            log.info(f"Background MPG sync: updated {updated} trucks")
+        except Exception as e:
+            log.warning(f"Background MPG sync failed: {e}")
+
     while _running:
         try:
             poll_cycle += 1
@@ -120,6 +168,33 @@ def main():
                 t = threading.Thread(target=_fetch_routes_background, daemon=True)
                 t.start()
                 last_route_fetch = now
+
+            # -- IFTA rates update (every 90 days = quarterly) ---------------
+            if (now - last_ifta_update).total_seconds() >= 7776000:
+                def _update_ifta():
+                    try:
+                        from ifta import update_ifta_rates_from_web
+                        ok = update_ifta_rates_from_web()
+                        if ok:
+                            from telegram_bot import _send_to
+                            from config import ADMIN_CHAT_ID
+                            _send_to(ADMIN_CHAT_ID, "✅ IFTA rates updated from official source.")
+                    except Exception as e:
+                        log.warning(f"IFTA update failed: {e}")
+                threading.Thread(target=_update_ifta, daemon=True).start()
+                last_ifta_update = now
+
+            # -- IFTA rates check (every 24h — updates when new quarter starts) --
+            if (now - last_ifta_check).total_seconds() >= 86400:
+                t = threading.Thread(target=_update_ifta_background, daemon=True)
+                t.start()
+                last_ifta_check = now
+
+            # -- Background MPG sync (every hour) -----------------------------
+            if (now - last_mpg_sync).total_seconds() >= 3600:
+                t = threading.Thread(target=_sync_mpg_background, daemon=True)
+                t.start()
+                last_mpg_sync = now
 
             # -- Weekly savings report (every Monday 08:00 UTC) --------------
             if (now - last_weekly_report).total_seconds() >= 3600:  # check every hour

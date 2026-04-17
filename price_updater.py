@@ -169,6 +169,20 @@ def _parse_loves(xlsx_bytes: bytes) -> list[dict]:
 # ── Main entry point ───────────────────────────────────────────────────────
 
 def update_from_file(file_bytes: bytes, filename: str) -> tuple[int, str]:
+    """Route file to correct parser based on filename/content."""
+    fname = filename.lower()
+
+    # EFS fuel card format — has chain.name, fuelPrices, discountedPrice columns
+    if fname.endswith('.csv'):
+        try:
+            sample = file_bytes[:500].decode('utf-8-sig', errors='ignore')
+            if 'chain.name' in sample or 'discountedPrice' in sample or 'efsLocationId' in sample:
+                from efs_importer import import_efs_stations
+                return import_efs_stations(file_bytes, filename)
+        except Exception:
+            pass
+
+    # Fall through to original parser
     """
     Handle Telegram file uploads.
 

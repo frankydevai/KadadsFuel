@@ -144,10 +144,26 @@ def _clear_alert(state):
 
 
 def _get_truck_params(vehicle_name: str) -> tuple[float, float]:
-    config = get_truck_config(vehicle_name)
-    if config:
-        return float(config["tank_capacity_gal"]), float(config["avg_mpg"])
-    return DEFAULT_TANK_GAL, DEFAULT_MPG
+    """Return (tank_gal, mpg) — uses real Samsara MPG if available, else default."""
+    from database import get_truck_params, get_truck_mpg
+    try:
+        params = get_truck_params(vehicle_name)
+        tank = float(params.get("tank_gal") or DEFAULT_TANK_GAL) if params else DEFAULT_TANK_GAL
+    except Exception:
+        tank = DEFAULT_TANK_GAL
+    try:
+        # Get real MPG from Samsara data (updated every hour in background)
+        from database import db_cursor
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT mpg FROM truck_efficiency WHERE vehicle_name = %s AND mpg > 3",
+                (vehicle_name,)
+            )
+            row = cur.fetchone()
+            mpg = float(row["mpg"]) if row else DEFAULT_MPG
+    except Exception:
+        mpg = DEFAULT_MPG
+    return tank, mpg
 
 
 def _get_state_code(lat: float, lng: float) -> str | None:

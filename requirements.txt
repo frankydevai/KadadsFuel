@@ -1,5 +1,4 @@
-requests
-python-dotenv
-psycopg2-binary
-pandas
-openpyxl
+requests==2.31.0
+psycopg2-binary==2.9.9
+python-telegram-bot==20.7
+beautifulsoup4==4.12.3

@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS fuel_stops (
     latitude        REAL    NOT NULL,
     longitude       REAL    NOT NULL,
     phone           TEXT,
-    diesel_price    REAL,
+    diesel_price        REAL,
+    retail_price        REAL,
+    discount_per_gallon REAL,
     price_updated   TIMESTAMPTZ,
     has_diesel      BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -172,6 +174,16 @@ CREATE TABLE IF NOT EXISTS bot_config (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS truck_efficiency (
+    vehicle_id      TEXT PRIMARY KEY,
+    vehicle_name    TEXT,
+    mpg             FLOAT DEFAULT 6.5,
+    idle_hours_30d  FLOAT DEFAULT 0,
+    idle_pct_30d    FLOAT DEFAULT 0,
+    fuel_used_30d   FLOAT DEFAULT 0,
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS truck_routes (
@@ -690,4 +702,46 @@ def get_stop_compliance(vehicle_name: str = None, days: int = 7) -> list:
                     COUNT(*) FILTER (WHERE visited IS NULL) AS unknown
                 FROM stop_visits WHERE created_at >= %s
             """, (since,))
+        return cur.fetchall()
+
+def save_truck_efficiency(vehicle_id: str, vehicle_name: str, 
+                           mpg: float, idle_hours: float, 
+                           idle_pct: float, fuel_gal: float) -> None:
+    """Save real MPG and idle data from Samsara."""
+    with db_cursor() as cur:
+        cur.execute("""
+            INSERT INTO truck_efficiency 
+                (vehicle_id, vehicle_name, mpg, idle_hours_30d, idle_pct_30d, fuel_used_30d, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (vehicle_id) DO UPDATE SET
+                vehicle_name   = EXCLUDED.vehicle_name,
+                mpg            = EXCLUDED.mpg,
+                idle_hours_30d = EXCLUDED.idle_hours_30d,
+                idle_pct_30d   = EXCLUDED.idle_pct_30d,
+                fuel_used_30d  = EXCLUDED.fuel_used_30d,
+                updated_at     = NOW()
+        """, (vehicle_id, vehicle_name, mpg, idle_hours, idle_pct, fuel_gal))
+
+
+def get_truck_mpg(vehicle_id: str) -> float:
+    """Get real MPG for a truck. Returns 6.5 default if not available."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT mpg FROM truck_efficiency WHERE vehicle_id = %s",
+            (vehicle_id,)
+        )
+        row = cur.fetchone()
+        if row and row["mpg"] and row["mpg"] > 0:
+            return float(row["mpg"])
+    return 6.5  # default
+
+
+def get_all_truck_efficiency() -> list:
+    """Get all truck efficiency stats."""
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT vehicle_name, mpg, idle_hours_30d, idle_pct_30d, fuel_used_30d, updated_at
+            FROM truck_efficiency
+            ORDER BY mpg ASC
+        """)
         return cur.fetchall()

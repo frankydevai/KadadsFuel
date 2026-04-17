@@ -162,3 +162,96 @@ def get_vehicle_location_history(vehicle_id: str, hours_back: int = 1) -> list[d
         import logging
         logging.getLogger(__name__).warning(f"Location history failed for {vehicle_id}: {e}")
         return []
+
+def get_vehicle_fuel_efficiency(vehicle_id: str = None) -> dict:
+    """
+    Fetch real MPG and idle data from Samsara Fuel & Energy report.
+    Returns dict of vehicle_id -> {mpg, idle_hours, idle_pct, fuel_used_gal}
+    """
+    import requests as _req
+    from datetime import datetime, timezone, timedelta
+
+    end_time   = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=30)
+
+    params = {
+        "startTime": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endTime":   end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if vehicle_id:
+        params["vehicleIds"] = vehicle_id
+
+    try:
+        resp = _req.get(
+            "https://api.samsara.com/fleet/reports/vehicles/fuel-energy",
+            headers=HEADERS,
+            params=params,
+            timeout=15,
+        )
+        if not resp.ok:
+            import logging
+            logging.getLogger(__name__).warning(f"Samsara fuel report: {resp.status_code} {resp.text[:200]}")
+            return {}
+
+        data    = resp.json().get("data", [])
+        results = {}
+        for v in data:
+            vid        = v.get("id") or v.get("vehicleId", "")
+            stats      = v.get("stats") or v.get("fuelAndEnergyStats") or {}
+            mpg        = stats.get("mpg") or stats.get("fuelEfficiencyMpg") or 0
+            idle_hours = stats.get("idleTimeHours") or stats.get("idleHours") or 0
+            idle_pct   = stats.get("idleTimePercent") or stats.get("idlePercent") or 0
+            fuel_gal   = stats.get("fuelUsedGallons") or stats.get("totalFuelUsedGallons") or 0
+            if vid:
+                results[vid] = {
+                    "mpg":        round(float(mpg), 2) if mpg else 0,
+                    "idle_hours": round(float(idle_hours), 1) if idle_hours else 0,
+                    "idle_pct":   round(float(idle_pct), 1) if idle_pct else 0,
+                    "fuel_gal":   round(float(fuel_gal), 1) if fuel_gal else 0,
+                }
+        return results
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Samsara fuel efficiency failed: {e}")
+        return {}
+
+
+def get_vehicle_idle_events(vehicle_id: str, hours_back: int = 24) -> list[dict]:
+    """
+    Fetch idling events for a specific vehicle.
+    Returns list of {start_time, duration_minutes, location}
+    """
+    import requests as _req
+    from datetime import datetime, timezone, timedelta
+
+    end_time   = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=hours_back)
+
+    try:
+        resp = _req.get(
+            "https://api.samsara.com/idling/events",
+            headers=HEADERS,
+            params={
+                "vehicleIds": vehicle_id,
+                "startTime":  start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime":    end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            return []
+        events  = resp.json().get("data", [])
+        results = []
+        for e in events:
+            duration_ms  = e.get("durationMilliseconds") or e.get("duration", 0)
+            duration_min = round(duration_ms / 60000, 1) if duration_ms else 0
+            results.append({
+                "start_time":      e.get("startTime", ""),
+                "duration_minutes": duration_min,
+                "location":        e.get("location", {}).get("reverseGeo", {}).get("formattedLocation", ""),
+            })
+        return results
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Samsara idle events failed: {e}")
+        return []

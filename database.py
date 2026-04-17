@@ -77,32 +77,24 @@ CREATE TABLE IF NOT EXISTS trucks (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- fuel_stops: seeded from Pilot CSV + Love's XLSX
+-- fuel_stops: loaded daily from EFS price CSV
+-- Columns: Station, Address, City, State, longitude, latitude, Retail price, Discounted price
 CREATE TABLE IF NOT EXISTS fuel_stops (
-    id              SERIAL PRIMARY KEY,
-    source          TEXT    NOT NULL,
-    store_id        TEXT    NOT NULL,
-    store_name      TEXT    NOT NULL,
-    brand           TEXT    NOT NULL,
-    address         TEXT,
-    city            TEXT,
-    state           TEXT,
-    zip             TEXT,
-    latitude        REAL    NOT NULL,
-    longitude       REAL    NOT NULL,
-    phone           TEXT,
-    diesel_price        REAL,
-    retail_price        REAL,
-    discount_per_gallon REAL,
-    price_updated   TIMESTAMPTZ,
-    has_diesel      BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (source, store_id)
+    id               SERIAL PRIMARY KEY,
+    station_name     TEXT    NOT NULL,
+    address          TEXT,
+    city             TEXT,
+    state            TEXT    NOT NULL,
+    longitude        FLOAT   NOT NULL,
+    latitude         FLOAT   NOT NULL,
+    retail_price     REAL,
+    discounted_price REAL,
+    price_updated    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (station_name, city, state)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fuel_stops_lat_lng ON fuel_stops (latitude, longitude);
-CREATE INDEX IF NOT EXISTS idx_fuel_stops_state   ON fuel_stops (state);
-CREATE INDEX IF NOT EXISTS idx_fuel_stops_source  ON fuel_stops (source);
+CREATE INDEX IF NOT EXISTS idx_fuel_stops_location ON fuel_stops (latitude, longitude);
+CREATE INDEX IF NOT EXISTS idx_fuel_stops_state    ON fuel_stops (state);
 
 -- truck_states: full state persisted to survive Railway redeploys
 CREATE TABLE IF NOT EXISTS truck_states (
@@ -352,38 +344,101 @@ def bulk_upsert_fuel_stops(records: list[dict]) -> int:
     """Bulk insert/update fuel stops. Returns count inserted/updated."""
     if not records:
         return 0
-    sql = """
-        INSERT INTO fuel_stops
-            (source, store_id, store_name, brand, address, city, state, zip,
-             latitude, longitude, phone, diesel_price, price_updated, has_diesel)
-        VALUES
-            (%(source)s, %(store_id)s, %(store_name)s, %(brand)s,
-             %(address)s, %(city)s, %(state)s, %(zip)s,
-             %(latitude)s, %(longitude)s, %(phone)s,
-             %(diesel_price)s, %(price_updated)s, %(has_diesel)s)
-        ON CONFLICT (source, store_id) DO UPDATE SET
-            store_name    = EXCLUDED.store_name,
-            brand         = EXCLUDED.brand,
-            address       = EXCLUDED.address,
-            city          = EXCLUDED.city,
-            state         = EXCLUDED.state,
-            latitude      = EXCLUDED.latitude,
-            longitude     = EXCLUDED.longitude,
-            diesel_price  = EXCLUDED.diesel_price,
-            price_updated = EXCLUDED.price_updated,
-            has_diesel    = EXCLUDED.has_diesel
+    # Legacy function — use import_efs_csv instead
+    return 0
+
+
+def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
     """
+    Import daily EFS price CSV into fuel_stops.
+    Expected columns: Station, Address, City, State, longitude, latitude,
+                      Retail price, Discounted price
+    Clears existing data and reloads fresh every time (daily upload).
+    """
+    import csv, io
+    try:
+        text   = file_bytes.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        rows   = list(reader)
+    except Exception as e:
+        return 0, f"❌ Could not parse file: {e}"
+
+    records = []
+    skipped = 0
+    for r in rows:
+        try:
+            lat  = float(r["latitude"])
+            lng  = float(r["longitude"])
+            name = r["Station"].strip()
+            city  = r["City"].strip()
+            state = r["State"].strip().upper()
+            if not name or not state or not lat or not lng:
+                skipped += 1
+                continue
+            retail   = float(r["Retail price"])   if r.get("Retail price","").strip()    else None
+            discount = float(r["Discounted price"]) if r.get("Discounted price","").strip() else None
+            records.append({
+                "station_name":     name,
+                "address":          r.get("Address","").strip(),
+                "city":             city,
+                "state":            state,
+                "longitude":        lng,
+                "latitude":         lat,
+                "retail_price":     retail,
+                "discounted_price": discount,
+            })
+        except Exception:
+            skipped += 1
+
+    if not records:
+        return 0, "❌ No valid records found in file."
+
     with db_cursor() as cur:
-        cur.executemany(sql, records)
-    return len(records)
+        # Full reload — delete old, insert fresh
+        cur.execute("DELETE FROM fuel_stops")
+        cur.executemany("""
+            INSERT INTO fuel_stops
+                (station_name, address, city, state, longitude, latitude,
+                 retail_price, discounted_price, price_updated)
+            VALUES
+                (%(station_name)s, %(address)s, %(city)s, %(state)s,
+                 %(longitude)s, %(latitude)s,
+                 %(retail_price)s, %(discounted_price)s, NOW())
+            ON CONFLICT (station_name, city, state) DO UPDATE SET
+                address          = EXCLUDED.address,
+                longitude        = EXCLUDED.longitude,
+                latitude         = EXCLUDED.latitude,
+                retail_price     = EXCLUDED.retail_price,
+                discounted_price = EXCLUDED.discounted_price,
+                price_updated    = NOW()
+        """, records)
+
+    msg = (
+        f"✅ *Fuel prices updated*\n"
+        f"⛽ {len(records)} stations loaded\n"
+        f"⏭ {skipped} skipped (missing data)\n"
+        f"🔄 Using discounted (card) price for routing"
+    )
+    return len(records), msg
 
 
 def get_all_diesel_stops() -> list:
-    """Return all stops that have diesel and a known price."""
+    """Return all stops that have a discounted price (card price)."""
     with db_cursor() as cur:
         cur.execute("""
-            SELECT * FROM fuel_stops
-            WHERE has_diesel = TRUE AND diesel_price IS NOT NULL
+            SELECT
+                id,
+                station_name  AS store_name,
+                address,
+                city,
+                state,
+                longitude,
+                latitude,
+                retail_price,
+                discounted_price AS diesel_price,
+                price_updated
+            FROM fuel_stops
+            WHERE discounted_price IS NOT NULL
             ORDER BY state, city
         """)
         return _rows(cur.fetchall())
@@ -391,11 +446,11 @@ def get_all_diesel_stops() -> list:
 
 def get_stops_count() -> int:
     with db_cursor() as cur:
-        cur.execute("SELECT COUNT(*) as cnt FROM fuel_stops WHERE has_diesel = TRUE")
+        cur.execute("SELECT COUNT(*) as cnt FROM fuel_stops WHERE discounted_price IS NOT NULL")
         return cur.fetchone()["cnt"]
 
 
-def get_price_last_updated() -> datetime | None:
+def get_price_last_updated():
     with db_cursor() as cur:
         cur.execute("SELECT MAX(price_updated) as latest FROM fuel_stops")
         row = cur.fetchone()

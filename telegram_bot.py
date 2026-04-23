@@ -158,8 +158,7 @@ def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
 
     else:
-        lines += ["", "❌ No fuel stops found on route.", "Dispatcher has been notified."]
-        _send_to_dispatcher(f"{emoji} *{vehicle_name}* — {fuel_pct:.0f}% — NO STOP FOUND on route")
+        return {"truck_group": None, "truck_msg_id": None, "dispatcher_msg_id": None}
 
     if fuel_pct <= 15 and best_stop:
         _send_to_dispatcher(f"{emoji} *{vehicle_name}* critically low — {fuel_pct:.0f}%")
@@ -228,11 +227,11 @@ def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
     else:
-        lines += [
-            "❌ *NO FUEL STOPS found within range.*",
-            f"Range remaining: ~{range_miles:.0f} miles",
-            "Dispatcher has been notified — immediate assistance needed.",
-        ]
+        return {
+            "truck_group": None,
+            "truck_msg_id": None,
+            "dispatcher_msg_id": None
+        }
 
     # Always notify dispatcher on emergency
     _send_to_dispatcher("\n".join(lines))
@@ -268,7 +267,7 @@ def send_ca_border_reminder(vehicle_name, fuel_pct, truck_lat, truck_lng,
     return _send_to_truck(vehicle_name, "\n".join(lines))
 
 
-def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_stop) -> dict:
+def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_stop, assigned_stop_name=None) -> dict:
     emoji     = _urgency_emoji(fuel_pct)
     truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
     name      = current_stop.get("store_name", "Fuel Stop")
@@ -277,14 +276,28 @@ def send_at_stop_alert(vehicle_name, fuel_pct, truck_lat, truck_lng, current_sto
     price     = current_stop.get("diesel_price")
     slat      = current_stop.get("latitude"); slng = current_stop.get("longitude")
     maps_url  = f"https://maps.google.com/?q={slat},{slng}" if slat and slng else None
-    lines = [
-        f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
-        f"⛽ Fuel: *{fuel_pct:.0f}%*",
-        f"📍 [View on Map]({truck_url})", "",
-        f"🅿️ *Already stopped at:*",
-        f"⛽ *{name}*", f"📌 {address}",
-        f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
-    ]
+    
+    if assigned_stop_name:
+        lines = [
+            f"🚩 *Wrong Stop Warning — Truck {vehicle_name}*",
+            f"⛽ Fuel: *{fuel_pct:.0f}%*",
+            f"📍 [View on Map]({truck_url})", "",
+            f"⚠️ *You are parked at the wrong fuel stop!*",
+            f"❌ Current location: *{name}*",
+            f"✅ Assigned stop: *{assigned_stop_name}*",
+            "",
+            f"If you fuel here, it will be flagged as a financial loss."
+        ]
+    else:
+        lines = [
+            f"{emoji} *Low Fuel Alert — Truck {vehicle_name}*",
+            f"⛽ Fuel: *{fuel_pct:.0f}%*",
+            f"📍 [View on Map]({truck_url})", "",
+            f"🅿️ *Already stopped at:*",
+            f"⛽ *{name}*", f"📌 {address}",
+            f"💰 Diesel: *${price:.3f}/gal*" if price else "💰 Diesel: Price N/A",
+        ]
+        
     if maps_url:
         lines.append(f"🗺 [Open in Google Maps]({maps_url})")
     return _send_to_truck(vehicle_name, "\n".join(lines))

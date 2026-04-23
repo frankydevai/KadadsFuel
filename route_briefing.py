@@ -212,14 +212,19 @@ def _stops_on_segment(from_lat, from_lng, to_lat, to_lng,
 
         stop_bear = bearing(from_lat, from_lng, slat, slng)
         adiff     = angle_diff(seg_bearing, stop_bear)
-        if adiff > 75:
-            continue
+        
+        if dist > 5.0:
+            if adiff > 75:
+                continue
 
         along = dist * math.cos(math.radians(adiff))
         cross = abs(dist * math.sin(math.radians(adiff)))
 
-        if along <= 0 or cross > CORRIDOR_MILES:
-            continue
+        if dist > 5.0:
+            if along <= 0 or cross > CORRIDOR_MILES:
+                continue
+        else:
+            along = max(0.0, along)
 
         state    = stop.get("state", "")
         card     = float(stop["diesel_price"])
@@ -332,6 +337,7 @@ def plan_route_briefing(
     total_card     = 0.0
     total_net      = 0.0
     used_names     = set()
+    used_coords    = set()
 
     cur_lat        = truck_lat
     cur_lng        = truck_lng
@@ -396,7 +402,9 @@ def plan_route_briefing(
 
         reachable_candidates = [
             s for s in unique_candidates
-            if sim_dist < s["dist_from_truck"] <= max_reach_dist
+            if (sim_dist < s["dist_from_truck"] or (sim_dist == 0.0 and s["dist_from_truck"] <= 5.0))
+            and s["dist_from_truck"] <= max_reach_dist
+            and (s.get("latitude"), s.get("longitude")) not in used_coords
         ]
         viable_candidates = [
             s for s in reachable_candidates
@@ -482,6 +490,7 @@ def plan_route_briefing(
         })
 
         used_names.add(s["store_name"])
+        used_coords.add((s.get("latitude"), s.get("longitude")))
         stop_number += 1
 
         sim_fuel = FILL_TO
@@ -642,8 +651,8 @@ def format_route_briefing(plan: dict, truck_name: str,
         return ""
 
     if not plan["planned_stops"]:
-        lines.append("No fuel stop recommendation is available for this route yet.")
-        return "\n".join(lines)
+        return ""
+
 
 
     total = plan["stops_needed"]

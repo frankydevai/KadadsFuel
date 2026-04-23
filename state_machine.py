@@ -1251,13 +1251,48 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
     # ── Case 1: Truck is AT a fuel stop — send at-stop reminder ──────────────
     current_stop = find_current_stop(lat, lng) if speed < 3 else None
     if current_stop:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        last_stop = state.get("last_at_stop_name")
+        last_time = state.get("last_at_stop_time")
+        if isinstance(last_time, str):
+            from dateutil.parser import parse
+            try: last_time = parse(last_time)
+            except Exception: last_time = None
+            
+        minutes_since = (now - last_time).total_seconds() / 60 if last_time else 999
+        
+        if last_stop == current_stop["store_name"] and minutes_since < 60:
+            log.info(f"  {vname}: at stop {current_stop['store_name']} — skipping duplicate at-stop alert")
+            state["alert_sent"] = True
+            return
+            
         log.info(f"  {vname}: at stop {current_stop['store_name']} — at-stop alert")
-        result = send_at_stop_alert(vname, fuel, lat, lng, current_stop)
+        
+        assigned_name = state.get("assigned_stop_name")
+        assigned_lat  = state.get("assigned_stop_lat")
+        assigned_lng  = state.get("assigned_stop_lng")
+        
+        is_wrong_stop = False
+        if assigned_name and assigned_lat and assigned_lng:
+            from truck_stop_finder import haversine_miles
+            dist_to_assigned = haversine_miles(lat, lng, float(assigned_lat), float(assigned_lng))
+            if dist_to_assigned > 2.0:
+                is_wrong_stop = True
+
+        result = send_at_stop_alert(
+            vname, fuel, lat, lng, current_stop,
+            assigned_stop_name=assigned_name if is_wrong_stop else None
+        )
         if isinstance(result, dict):
             state["prev_truck_group"]       = result.get("truck_group")
             state["prev_truck_msg_id"]      = result.get("truck_msg_id")
             state["prev_dispatcher_msg_id"] = result.get("dispatcher_msg_id")
         state["alert_sent"] = True
+        state["last_at_stop_name"] = current_stop["store_name"]
+        
+        from datetime import datetime, timezone
+        state["last_at_stop_time"] = datetime.now(timezone.utc).isoformat()
         return
 
     # ── Case 2: Check if truck can reach planned stop ─────────────────────────

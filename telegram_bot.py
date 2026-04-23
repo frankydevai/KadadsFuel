@@ -219,10 +219,17 @@ def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
             lines.append(f"💳 Card: *${pump:.3f}/gal*" +
                          (f"  (save ${discount:.2f}/gal)" if discount else ""))
 
-        true_price = pump if pump else None
-        if true_price and gallons:
-            total = round(true_price * gallons, 2)
-            lines.append(f"💵 Fill *{gallons:.0f} gal = ${total:.0f}*")
+        if not (net and pump and abs(net - pump) > 0.005):
+            net = pump
+
+        true_price = net if net else pump
+        if pump and true_price and gallons:
+            pay_pump = round(pump * gallons, 2)
+            pay_net  = round(true_price * gallons, 2)
+            if abs(pay_net - pay_pump) > 1:
+                lines.append(f"💵 Fill *{gallons:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
+            else:
+                lines.append(f"💵 Fill *{gallons:.0f} gal = ${pay_pump:.0f}*")
 
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
@@ -233,8 +240,6 @@ def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
             "dispatcher_msg_id": None
         }
 
-    # Always notify dispatcher on emergency
-    _send_to_dispatcher("\n".join(lines))
     result = _send_to_truck(vehicle_name, "\n".join(lines))
     return result if isinstance(result, dict) else {
         "truck_group": None,

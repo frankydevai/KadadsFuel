@@ -11,6 +11,7 @@ import time
 import signal
 import sys
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from config import STATE_SAVE_INTERVAL_SECONDS
@@ -49,6 +50,30 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
+def _truck_route_keys(vehicle_name: str) -> list[str]:
+    """Possible QuickManage route keys for a Samsara vehicle name."""
+    text = str(vehicle_name or "").strip()
+    if not text:
+        return []
+
+    keys: list[str] = []
+
+    def _add(value: str):
+        value = str(value or "").strip()
+        if value and value not in keys:
+            keys.append(value)
+
+    _add(text)
+
+    for grp in re.findall(r"\d+", text):
+        _add(grp)
+        _add(grp.lstrip("0") or "0")
+
+    first = text.split()[0] if text.split() else ""
+    _add(first)
+    return keys
+
+
 # -- Price updater scheduler --------------------------------------------------
 _last_price_update = None   # Track last update time
 
@@ -76,6 +101,27 @@ def main():
     # Load persisted truck states
     truck_states = load_all_truck_states()
     log.info(f"Loaded {len(truck_states)} truck states from DB.")
+
+    # Restore trip planning state from DB into truck_states
+    # This ensures planned stops, briefing status survive restarts
+    try:
+        from database import load_all_trip_states
+        trip_states = load_all_trip_states()
+        for vname, tstate in trip_states.items():
+            # Find truck_states entry by vehicle_name
+            for vid, ts in truck_states.items():
+                if ts.get("vehicle_name") == vname or ts.get("vname") == vname:
+                    # Merge trip state into truck state — don't overwrite existing
+                    for key, val in tstate.items():
+                        if val is not None and key not in ts:
+                            ts[key] = val
+                    log.info(f"  Restored trip state for {vname}: "
+                             f"briefing={tstate.get('briefing_sent_trip')!r} "
+                             f"stop={tstate.get('assigned_stop_name')!r}")
+                    break
+        log.info(f"Trip states restored for {len(trip_states)} trucks.")
+    except Exception as e:
+        log.warning(f"Could not restore trip states: {e}")
 
     try:
         send_startup_message()
@@ -200,8 +246,14 @@ def main():
             if (now - last_weekly_report).total_seconds() >= 3600:  # check every hour
                 if now.weekday() == 0 and now.hour == 8:  # Monday 08:00 UTC
                     try:
-                        from telegram_bot import send_weekly_savings_report
+                        from telegram_bot import (
+                            send_weekly_savings_report,
+                            send_weekly_truck_report,
+                            send_weekly_fleet_report,
+                        )
                         send_weekly_savings_report()
+                        send_weekly_fleet_report()   # 4-sheet Excel → admin + dispatcher
+                        send_weekly_truck_report()   # per-truck Excel → admin + dispatcher
                         last_weekly_report = now
                     except Exception as e:
                         log.error(f"Weekly report error: {e}")
@@ -266,9 +318,22 @@ def main():
             for truck in due_trucks:
                 vid = truck["vehicle_id"]
                 # Attach QuickManage route to truck state if available
-                truck_num = truck.get("vehicle_name", "")
-                if truck_num in qm_routes:
-                    truck_states.setdefault(vid, {})["qm_route"] = qm_routes[truck_num]
+                vehicle_name = truck.get("vehicle_name", "")
+                route = None
+                matched_key = None
+                for key in _truck_route_keys(vehicle_name):
+                    if key in qm_routes:
+                        route = qm_routes[key]
+                        matched_key = key
+                        break
+                if route:
+                    prev_trip = (truck_states.get(vid, {}) or {}).get("qm_route", {}).get("trip_num")
+                    truck_states.setdefault(vid, {})["qm_route"] = route
+                    if prev_trip != route.get("trip_num"):
+                        log.info(
+                            f"Attached QM route to {vehicle_name}: key={matched_key} "
+                            f"trip={route.get('trip_num')} status={route.get('status')}"
+                        )
                 elif truck_states.get(vid, {}).get("qm_route"):
                     pass  # keep existing route
                 try:

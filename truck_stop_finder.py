@@ -280,6 +280,7 @@ def find_best_stops(
     tank_gal: float = DEFAULT_TANK_GAL,
     mpg: float = DEFAULT_MPG,
     truck_state: str = "",
+    max_radius: float | None = None,
 ) -> tuple[dict | None, dict | None]:
     """
     Find the best 2 diesel stops for a truck.
@@ -299,6 +300,8 @@ def find_best_stops(
     # Always search 100 miles in heading direction for best price comparison
     # Urgency radius only used as safety fallback for EMERGENCY
     radius        = 60.0 if urgency == "EMERGENCY" else 100.0
+    if max_radius is not None:
+        radius = min(radius, float(max_radius))
     price_matters = urgency in ("ADVISORY", "WARNING")
 
     log.info(f"Stop finder: urgency={urgency} radius={radius:.0f}mi "
@@ -340,6 +343,8 @@ def find_best_stops(
         if not parked and truck_heading is not None:
             bear  = bearing(truck_lat, truck_lng, slat, slng)
             ahead = angle_diff(truck_heading, bear) <= _AHEAD_ARC_DEGREES
+            if dist <= 5.0:
+                ahead = True
 
         detour_mi = perpendicular_distance(
             truck_lat, truck_lng, truck_heading or 0, slat, slng
@@ -400,6 +405,8 @@ def find_best_stops(
                 if not parked and truck_heading is not None:
                     bear  = bearing(truck_lat, truck_lng, slat, slng)
                     ahead = angle_diff(truck_heading, bear) <= _AHEAD_ARC_DEGREES
+                    if dist <= 5.0:
+                        ahead = True
                 detour_mi = perpendicular_distance(truck_lat, truck_lng, truck_heading or 0, slat, slng) if not parked else 0.0
                 fill_gal  = gallons_to_fill(fuel_pct, tank_gal)
                 fill_cost = (stop["diesel_price"] or 0) * fill_gal
@@ -426,20 +433,21 @@ def find_best_stops(
     # Sort by score (true cost for price-matters, distance for critical/emergency)
     candidates.sort(key=lambda s: s["_score"])
 
-    # Safety check: never recommend a stop more than 2x the nearest stop's distance.
-    # e.g. if Pilot is 25mi away, don't send driver 137mi to save $0.31/gal
-    nearest = min(candidates, key=lambda s: s["distance_miles"])
-    nearest_dist = nearest["distance_miles"]
-    max_recommend_dist = max(nearest_dist * 2.0, 60.0)  # at least 60mi window
-
-    # Filter out stops beyond the max recommend distance, keep at least 1
-    filtered = [c for c in candidates if c["distance_miles"] <= max_recommend_dist]
-    if not filtered:
-        filtered = candidates  # fallback: keep all if filter removes everything
-
-    # Re-sort filtered by score
+    # Re-sort candidates by score.
+    # For advisory/warning fuel levels, avoid recommending the very first nearby stop
+    # just because it is slightly cheaper, but DO allow searching the full max range.
+    filtered = candidates
     filtered.sort(key=lambda s: s["_score"])
-    best = filtered[0]
+    if price_matters:
+        late_distance_floor = min(30.0, max_range * 0.5)
+        late_candidates = [
+            s for s in filtered
+            if s.get("_ahead", True) and s["distance_miles"] >= late_distance_floor
+        ]
+        best_pool = late_candidates or filtered
+        best = min(best_pool, key=lambda s: (s["_score"], -s["distance_miles"]))
+    else:
+        best = filtered[0]
 
     # Alt = most expensive stop within range (for maximum savings comparison)
     # This shows driver how much they save vs the worst option nearby
@@ -462,6 +470,7 @@ def find_best_stops_on_route(
     tank_gal: float = DEFAULT_TANK_GAL,
     mpg: float = DEFAULT_MPG,
     truck_heading: float = 0.0,
+    max_radius: float | None = None,
 ) -> tuple[dict | None, dict | None]:
     """
     Find best fuel stop along the actual route from QuickManage.
@@ -489,11 +498,18 @@ def find_best_stops_on_route(
     max_range  = reachable_miles(fuel_pct, tank_gal, mpg)
     truck_in_ca = False  # will be set by caller if needed
 
-    # Search radius based on fuel level
-    search_radius = 100.0 if fuel_pct >= 30 else 50.0
+    # V2: Search radius should be the entire reachable range for True Cost search
+    search_radius = max_range
+    if max_radius is not None:
+        search_radius = min(search_radius, float(max_radius))
+
+    dist_to_final_dest = haversine_miles(truck_lat, truck_lng, dest_lat, dest_lng)
+    is_end_of_trip = dist_to_final_dest < 15.0
+
+    if is_end_of_trip:
+        search_radius = 30.0  # simple 30-mile radial search at end of trip
 
     # Build route segments: truck → each upcoming stop → destination
-    # This follows the actual highway path instead of a straight line
     route_stops = route.get("stops", [])
     upcoming_waypoints = []
     for s in route_stops:
@@ -542,37 +558,43 @@ def find_best_stops_on_route(
         adiff_from_truck     = angle_diff(truck_heading, stop_bear_from_truck)
         along_from_truck     = dist * math.cos(math.radians(adiff_from_truck))
 
-        # Stop is behind the truck — skip regardless of route
-        if along_from_truck <= 0:
-            continue
+        if not is_end_of_trip:
+            if dist > 5.0:
+                # Stop is behind the truck — skip regardless of route
+                if along_from_truck <= 0:
+                    continue
 
-        # Stop is too far off heading — skip unless critical
-        if adiff_from_truck > 90 and urgency not in ("CRITICAL", "EMERGENCY"):
-            continue
+                # Stop is too far off heading — skip unless critical
+                if adiff_from_truck > 90 and urgency not in ("CRITICAL", "EMERGENCY"):
+                    continue
 
         # Check if stop is near ANY segment of the route
         on_route = False
         min_cross = float("inf")
         prev_lat, prev_lng = truck_lat, truck_lng
 
-        for wp_lat, wp_lng in upcoming_waypoints:
-            seg_heading  = bearing(prev_lat, prev_lng, wp_lat, wp_lng)
-            seg_dist     = haversine_miles(prev_lat, prev_lng, wp_lat, wp_lng)
-            stop_bearing = bearing(prev_lat, prev_lng, slat, slng)
-            adiff        = angle_diff(seg_heading, stop_bearing)
-            dist_from_seg_start = haversine_miles(prev_lat, prev_lng, slat, slng)
-            along = dist_from_seg_start * math.cos(math.radians(adiff))
-            cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
+        if is_end_of_trip or dist <= 5.0:
+            on_route = True
+            min_cross = dist
+        else:
+            for wp_lat, wp_lng in upcoming_waypoints:
+                seg_heading  = bearing(prev_lat, prev_lng, wp_lat, wp_lng)
+                seg_dist     = haversine_miles(prev_lat, prev_lng, wp_lat, wp_lng)
+                stop_bearing = bearing(prev_lat, prev_lng, slat, slng)
+                adiff        = angle_diff(seg_heading, stop_bearing)
+                dist_from_seg_start = haversine_miles(prev_lat, prev_lng, slat, slng)
+                along = dist_from_seg_start * math.cos(math.radians(adiff))
+                cross = abs(dist_from_seg_start * math.sin(math.radians(adiff)))
 
-            if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
-                on_route = True
-                min_cross = min(min_cross, cross)
-                break
+                if along > 0 and adiff <= 90 and cross <= 50.0 and along <= seg_dist * 1.1:
+                    on_route = True
+                    min_cross = min(min_cross, cross)
+                    break
 
-            prev_lat, prev_lng = wp_lat, wp_lng
+                prev_lat, prev_lng = wp_lat, wp_lng
 
-        if not on_route:
-            continue
+            if not on_route:
+                continue
 
         seen_ids.add(stop_id)
         price    = stop.get("diesel_price") or 0
@@ -597,10 +619,9 @@ def find_best_stops_on_route(
 
     candidates.sort(key=lambda s: s["_score"])
 
-    # Safety cap: don't recommend stop more than 2x nearest distance
-    nearest      = min(candidates, key=lambda s: s["distance_miles"])
-    max_rec_dist = max(nearest["distance_miles"] * 2.0, 60.0)
-    filtered     = [c for c in candidates if c["distance_miles"] <= max_rec_dist] or candidates
+    # Re-sort candidates by score.
+    # We rely on max_range and search_radius entirely now for True Cost searching
+    filtered = candidates
     filtered.sort(key=lambda s: s["_score"])
 
     best  = filtered[0]

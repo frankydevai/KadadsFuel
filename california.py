@@ -67,9 +67,21 @@ def should_send_ca_reminder(
     heading: float,
     fuel_pct: float,
     ca_reminder_sent: bool,
+    tank_gal: float = 150.0,
+    mpg: float = 6.5,
+    route_dest_state: str = "",
 ) -> bool:
     """
-    Return True if a California border reminder should be sent.
+    Return True ONLY if truck genuinely needs to fuel before entering CA.
+
+    Logic:
+    1. Truck must be heading toward CA (west)
+    2. Truck must be within reminder distance of border
+    3. Truck must NOT have enough fuel to complete the CA crossing
+
+    CA is ~800 miles wide on I-10 (El Paso to LA) or ~300 miles on I-15 (NV to LA).
+    We estimate miles through CA based on route destination.
+    If truck can coast through CA on current fuel → no reminder.
     """
     if ca_reminder_sent:
         return False
@@ -78,18 +90,34 @@ def should_send_ca_reminder(
         return False
 
     if not _is_heading_toward_ca(heading):
-        return False  # not heading west
-
-    # Only remind if fuel is below threshold — no point warning at 96%
-    if fuel_pct > CA_BORDER_FUEL_THRESHOLD:
         return False
 
     dist = _dist_to_ca_border(lat, lng)
     if dist > CA_BORDER_REMINDER_MILES:
-        return False  # too far from border yet
+        return False
 
-    log.info(f"CA border reminder triggered: state={state_code} "
-             f"dist_to_border={dist:.0f}mi fuel={fuel_pct:.0f}%")
+    # Estimate miles through CA based on route destination
+    # If delivering IN CA → estimate 200mi average
+    # If passing through CA (dest outside CA) → estimate 300mi (I-5/I-10 crossing)
+    if route_dest_state and route_dest_state.upper() == "CA":
+        ca_miles = 200.0   # delivering inside CA
+    else:
+        ca_miles = 320.0   # passing through CA
+
+    # Total miles needed = dist to border + miles through CA
+    total_needed   = dist + ca_miles
+    range_miles    = (fuel_pct / 100) * tank_gal * mpg * 0.85  # 85% safety buffer
+
+    if range_miles >= total_needed:
+        # Truck has enough fuel — no reminder needed
+        log.info(f"CA border: range={range_miles:.0f}mi needed={total_needed:.0f}mi "
+                 f"— enough fuel, no reminder")
+        return False
+
+    # Truck needs fuel before CA
+    log.info(f"CA border reminder triggered: fuel={fuel_pct:.0f}% "
+             f"range={range_miles:.0f}mi needed={total_needed:.0f}mi "
+             f"dist_to_border={dist:.0f}mi")
     return True
 
 

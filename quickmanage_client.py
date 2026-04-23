@@ -235,28 +235,38 @@ def _build_route(trip: dict, truck_number: str) -> dict | None:
             "appt":         s.get("appointment_date", ""),
         })
 
-    # Origin = first pickup with coords
-    origin = next((s for s in stops if s["pickup"] and s["lat"]), None)
+    # ── Strict Origin / Destination Assignment ──────────────────────────────
+    # Origin  = FIRST stop in the array (pickup)
+    # Destination = LAST stop in the array (delivery)
+    # NO fallback — if geocoding fails, skip the trip entirely.
 
-    # Destination depends on status
-    if status == "dispatched":
-        dest = next((s for s in stops if s["pickup"] and s["lat"]), None)
-    else:
-        # in_transit — next stop after first pickup
-        passed_first = False
-        dest = None
-        for s in stops:
-            if s["pickup"] and not passed_first:
-                passed_first = True
-                continue
-            if s["lat"]:
-                dest = s
-                break
-        if not dest:
-            dest = next((s for s in reversed(stops) if s["lat"]), None)
+    origin = stops[0]
+    dest   = stops[-1]
 
-    if not origin or not dest:
-        log.warning(f"Trip {trip.get('trip_num')}: no coords for origin/dest")
+    if not origin["lat"]:
+        log.warning(
+            f"Trip {trip.get('trip_num')}: Origin failed to geocode "
+            f"({origin['city']}, {origin['state']})"
+        )
+        return None
+
+    if not dest["lat"]:
+        log.warning(
+            f"Trip {trip.get('trip_num')}: Destination failed to geocode "
+            f"({dest['city']}, {dest['state']})"
+        )
+        return None
+
+    # Loop prevention — never process a 0-mile trip on a multi-stop route
+    if (
+        origin["city"].lower() == dest["city"].lower()
+        and origin["state"].lower() == dest["state"].lower()
+        and len(stops_raw) > 1
+    ):
+        log.warning(
+            f"Trip {trip.get('trip_num')}: Origin and Destination are the same "
+            f"({origin['city']}, {origin['state']}) — skipping to prevent 0-mile loop"
+        )
         return None
 
     return {

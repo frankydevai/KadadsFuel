@@ -140,23 +140,17 @@ def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
             else:
                 lines.append(f"💳 Card:    *${pump:.3f}/gal*")
 
-        # Line 3 — IFTA settlement estimate per gallon
-        if net and pump and abs(net - pump) > 0.005:
-            adj = net - pump
-            if adj > 0:
-                lines.append(f"📋 IFTA:    *+${adj:.3f}/gal* owed at settlement → true cost *${net:.3f}*")
-            else:
-                lines.append(f"📋 IFTA:    *-${abs(adj):.3f}/gal* credit → true cost *${net:.3f}*")
-        else:
-            net = pump  # no IFTA configured
+        # IFTA used only for fill cost calculation — not shown as separate line
+        if not (net and pump and abs(net - pump) > 0.005):
+            net = pump  # no IFTA difference — use pump price
 
-        # Line 4 — Total: what driver pays at pump vs true cost after IFTA
+        # Line 3 — Total fill cost
         true_price = net if net else pump
         if pump and true_price:
             pay_pump = round(pump * gallons_needed, 2)
             pay_net  = round(true_price * gallons_needed, 2)
             if abs(pay_net - pay_pump) > 1:
-                lines.append(f"💵 Fill *{gallons_needed:.0f} gal* → Pump: ${pay_pump:.0f} · After IFTA: *${pay_net:.0f}*")
+                lines.append(f"💵 Fill *{gallons_needed:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
             else:
                 lines.append(f"💵 Fill *{gallons_needed:.0f} gal = ${pay_pump:.0f}*")
 
@@ -172,6 +166,82 @@ def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
 
     result = _send_to_truck(vehicle_name, "\n".join(lines))
     return result if isinstance(result, dict) else {"truck_group": None, "truck_msg_id": result, "dispatcher_msg_id": None}
+
+
+def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
+                          heading, speed_mph, best_stop,
+                          planned_stop_name=None, range_miles=0) -> dict:
+    """
+    Emergency alert — only fires when truck cannot reach planned stop.
+    Sent to driver group + dispatcher immediately.
+    """
+    compass   = _compass(heading)
+    truck_url = f"https://maps.google.com/?q={truck_lat:.6f},{truck_lng:.6f}"
+
+    lines = [
+        f"🔴 *Emergency — Truck {vehicle_name}*",
+        f"⛽ Fuel: *{fuel_pct:.0f}%*  🧭 {speed_mph:.0f} mph {compass}",
+        f"📍 [Truck Location]({truck_url})",
+        f"🌐 `{truck_lat:.5f}, {truck_lng:.5f}`",
+        "",
+    ]
+
+    if planned_stop_name:
+        lines.append(f"⚠️ Cannot reach planned stop: *{planned_stop_name}*")
+        lines.append(f"Range on current fuel: ~{range_miles:.0f} miles")
+        lines.append("")
+
+    if best_stop:
+        name     = best_stop.get("store_name", "Unknown")
+        street   = best_stop.get("address", "")
+        city     = best_stop.get("city", "")
+        state    = best_stop.get("state", "")
+        dist     = best_stop.get("distance_miles", 0)
+        pump     = best_stop.get("diesel_price")
+        net      = best_stop.get("net_price")
+        retail   = best_stop.get("retail_price")
+        discount = best_stop.get("discount_per_gallon")
+        lat      = best_stop.get("latitude")
+        lng      = best_stop.get("longitude")
+        addr     = ", ".join(filter(None, [street, city, state]))
+        maps_url = f"https://maps.google.com/?q={lat},{lng}" if lat and lng else None
+
+        from config import DEFAULT_TANK_GAL
+        gallons = round(DEFAULT_TANK_GAL * (1 - fuel_pct / 100), 1)
+
+        lines.append(f"Nearest reachable stop:")
+        lines.append(f"⛽ *{name}*")
+        lines.append(f"📌 {addr}")
+        lines.append(f"🛣 *{dist:.1f} mi ahead*")
+
+        if retail and pump and retail != pump:
+            lines.append(f"💰 Retail: ${retail:.3f}/gal")
+        if pump:
+            lines.append(f"💳 Card: *${pump:.3f}/gal*" +
+                         (f"  (save ${discount:.2f}/gal)" if discount else ""))
+
+        true_price = pump if pump else None
+        if true_price and gallons:
+            total = round(true_price * gallons, 2)
+            lines.append(f"💵 Fill *{gallons:.0f} gal = ${total:.0f}*")
+
+        if maps_url:
+            lines.append(f"🗺 [Open in Google Maps]({maps_url})")
+    else:
+        lines += [
+            "❌ *NO FUEL STOPS found within range.*",
+            f"Range remaining: ~{range_miles:.0f} miles",
+            "Dispatcher has been notified — immediate assistance needed.",
+        ]
+
+    # Always notify dispatcher on emergency
+    _send_to_dispatcher("\n".join(lines))
+    result = _send_to_truck(vehicle_name, "\n".join(lines))
+    return result if isinstance(result, dict) else {
+        "truck_group": None,
+        "truck_msg_id": result,
+        "dispatcher_msg_id": None
+    }
 
 
 def send_ca_border_reminder(vehicle_name, fuel_pct, truck_lat, truck_lng,
@@ -271,6 +341,8 @@ def register_commands():
         {"command": "findstop",    "description": "Find cheapest stops — /findstop 0792"},
         {"command": "route",       "description": "Show active load — /route 0792"},
         {"command": "findload",    "description": "Search QM trip — /findload 8656"},
+        {"command": "qmload",      "description": "Read QM load by truck - /qmload 0792"},
+        {"command": "report",      "description": "Generate weekly Excel report now"},
         {"command": "resetpilot",  "description": "Wipe Pilot DB rows"},
         {"command": "dbstats",     "description": "Show DB stats"},
         {"command": "addtruck",    "description": "Add truck — /addtruck 4821 -100123456"},
@@ -394,16 +466,28 @@ def poll_for_uploads():
             # Commands for any group
             if text.startswith("/loadroute"):
                 _handle_loadroute(text, chat_id)
+                continue
             elif text.startswith("/route"):
                 _handle_route(text, chat_id)
+                continue
+            elif text.startswith("/qmload"):
+                _handle_qmload(text, chat_id)
+                continue
             elif text.startswith("/newalert"):
                 _handle_newalert(text)
+                continue
+            elif text.startswith("/flags"):
+                _handle_flags(text, chat_id)
+                continue
             elif text.startswith("/stopvisits"):
                 _handle_stopvisits(text, chat_id)
+                continue
             elif text.startswith("/compliance"):
                 _handle_compliance(text, chat_id)
+                continue
             elif text.startswith("/fuelhistory"):
                 _handle_fuelhistory(text, chat_id)
+                continue
             elif text.startswith("/findstop"):
                 try:
                     _handle_findstop(text, chat_id)
@@ -430,15 +514,18 @@ def poll_for_uploads():
                     elif text.startswith("/planroute"):     _handle_planroute(text, chat_id)
                     elif text.startswith("/truckstats"):    _handle_truckstats(text, chat_id)
                     elif text.startswith("/routelist"):     _handle_routelist(chat_id)
+                    elif text.startswith("/report"):        _handle_report(text, chat_id)
                     else:
                         _send_to(ADMIN_CHAT_ID,
                             "Available commands:\n"
                             "/addtruck Unit4821 -100123456\n"
                             "/setgroup Unit4821 -100123456\n"
                             "/listtruck\n/removetruck Unit4821\n"
-                            "/findstop 0792  ← any group\n"
-                            "/route 0792  ← any group\n"
-                            "/findload 8656  ← search QM trip"
+                            "/findstop 0792  ? any group\n"
+                            "/route 0792  ? any group\n"
+                            "/qmload 0792  ? read QM load by truck\n"
+                            "/findload 8656  ? search QM trip\n"
+                            "/report  ? generate weekly Excel report"
                         )
                 except Exception as e:
                     log.error(f"Command error: {e}", exc_info=True)
@@ -584,14 +671,19 @@ def _handle_newalert(text: str) -> None:
 
 
 def _handle_resetstops():
-    """/resetstops — wipe all fuel stops from DB (then re-upload CSV)"""
+    """/resetstops — show fuel stop count (no deletion — data is permanent)"""
     from database import db_cursor
     with db_cursor() as cur:
-        cur.execute("DELETE FROM fuel_stops")
-        deleted = cur.rowcount
+        cur.execute("SELECT COUNT(*) as cnt FROM fuel_stops")
+        cnt = cur.fetchone()["cnt"]
+        cur.execute("SELECT MAX(price_updated) as latest FROM fuel_stops")
+        latest = cur.fetchone()["latest"]
     _send_to(ADMIN_CHAT_ID,
-        f"🗑 *Deleted {deleted} fuel stops.*\n"
-        f"Now send the new CSV file to reload all stations."
+        f"⛽ *Fuel Stops DB*\n"
+        f"📍 {cnt} stations loaded\n"
+        f"🕐 Last updated: {latest.strftime('%b %d %H:%M') if latest else 'never'}\n\n"
+        f"To update prices, send the new CSV file here.\n"
+        f"Prices are updated in place — nothing is deleted."
     )
 
 def _handle_checknow():
@@ -663,9 +755,9 @@ def _handle_removetruck(text):
 def _handle_resetpilot():
     from database import db_cursor
     with db_cursor() as cur:
-        cur.execute("DELETE FROM fuel_stops WHERE source = 'pilot'")
-        deleted = cur.rowcount
-    _send_to(ADMIN_CHAT_ID, f"🗑 Deleted *{deleted}* Pilot/Flying J stops.\nNow upload `merged_pilot_data.csv` to reload.")
+        cur.execute("SELECT COUNT(*) as cnt FROM fuel_stops WHERE station_name ILIKE '%pilot%' OR station_name ILIKE '%FJ%'")
+        cnt = cur.fetchone()["cnt"]
+    _send_to(ADMIN_CHAT_ID, f"⛽ *{cnt}* Pilot/Flying J stops in DB.\nTo update prices, send the new CSV file.")
 
 
 def _handle_dbstats():
@@ -811,12 +903,17 @@ def _handle_route(text: str, chat_id: str) -> None:
         is_next = (city == dest.get("city") and state == dest.get("state"))
         arrow   = "  ← *NEXT*" if is_next else ""
         lines  += [f"{icon} *Stop {stop_n} — {stype}*{arrow}", f"   {company}", f"   📍 {loc}"]
-        appt = s.get("appt") or s.get("appointment_date","")
         if appt:
             lines.append(f"   🕐 {str(appt)[:16].replace('T',' ')}")
         lines.append("")
     lines.append(f"🏁 *Destination: {dest.get('city')}, {dest.get('state')}*")
     _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_qmload(text: str, chat_id: str) -> None:
+    """/qmload <truck> - alias for active QuickManage load details by truck number."""
+    _handle_route(text.replace("/qmload", "/route", 1), chat_id)
+
 
 
 def _handle_loadroute(text: str, chat_id: str) -> None:
@@ -1297,6 +1394,185 @@ def _handle_truckstats(text: str, chat_id: str) -> None:
         _send_to(chat_id, "\n".join(lines))
 
 
+def _handle_flags(text: str, chat_id: str) -> None:
+    """/flags [truck] — show recent driver flags with financial impact"""
+    from flag_system import (
+        get_flags_summary, get_total_savings_lost,
+        FLAG_WRONG_STOP, FLAG_MISSED_STOP, FLAG_LOW_STOP_STATE, FLAG_LOW_FUEL,
+    )
+    from database import db_cursor
+    from datetime import datetime, timezone, timedelta
+
+    parts = text.strip().split()
+    since = datetime.now(timezone.utc) - timedelta(days=7)
+
+    if len(parts) >= 2:
+        truck_num = parts[1].strip()
+        with db_cursor() as cur:
+            cur.execute("""
+                SELECT flag_type, details, flagged_at, savings_lost
+                FROM driver_flags
+                WHERE vehicle_name = %s AND flagged_at >= %s
+                ORDER BY flagged_at DESC LIMIT 10
+            """, (truck_num, since))
+            rows = cur.fetchall()
+        if not rows:
+            _send_to(chat_id, f"✅ No flags for truck *{truck_num}* in last 7 days.")
+            return
+        total_lost = sum(float(r.get("savings_lost") or 0) for r in rows)
+        lines = [f"🚩 *Flags — Truck {truck_num}* (last 7 days)\n"]
+        for r in rows:
+            dt = r["flagged_at"].strftime("%b %d %H:%M")
+            ft = r["flag_type"].replace("_", " ").title()
+            loss = float(r.get("savings_lost") or 0)
+            loss_str = f" — *${loss:.2f} lost*" if loss > 0 else ""
+            lines.append(f"🚩 {dt} — *{ft}*{loss_str}")
+        if total_lost > 0:
+            lines.append(f"\n💸 *Total savings lost: ${total_lost:.2f}*")
+        _send_to(chat_id, "\n".join(lines))
+    else:
+        summary = get_flags_summary(days=7)
+        if not summary:
+            _send_to(chat_id, "✅ No flags in the last 7 days.")
+            return
+        lines = ["🚩 *Driver Flags — Last 7 Days*\n"]
+        icons = {
+            FLAG_WRONG_STOP:    "⛽ Wrong Stop",
+            FLAG_MISSED_STOP:   "🛣 Missed Stop",
+            FLAG_LOW_STOP_STATE: "⚠️ Low-Stop State",
+            FLAG_LOW_FUEL:       "🔋 Low Fuel Event",
+        }
+        for flag_type, data in summary.items():
+            label  = icons.get(flag_type, flag_type)
+            trucks = ", ".join(data["trucks"][:5])
+            loss_str = f" — *${data.get('total_lost', 0):.2f} lost*" if data.get('total_lost', 0) > 0 else ""
+            lines.append(f"*{label}:* {data['count']} times{loss_str}")
+            lines.append(f"   Trucks: {trucks}")
+
+        total_lost = get_total_savings_lost(days=7)
+        if total_lost > 0:
+            lines.append(f"\n💸 *Total fleet savings lost: ${total_lost:.2f}*")
+
+        lines.append("\nType `/flags <truck#>` for per-truck detail.")
+        _send_to(chat_id, "\n".join(lines))
+
+
+def _handle_report(text: str, chat_id: str) -> None:
+    """/report — generate and send weekly Excel reports on demand.
+
+    Generates both:
+      1. Fleet-wide report (Summary, Compliance, Flags, IFTA)
+      2. Per-truck report (one sheet per truck)
+
+    Sends to admin + dispatcher group (customer).
+    """
+    _send_to(chat_id, "📊 Generating weekly Excel reports...")
+
+    try:
+        # Fleet-wide 4-sheet report
+        send_weekly_fleet_report(send_to_chat_ids=[chat_id, DISPATCHER_GROUP_ID])
+    except Exception as e:
+        _send_to(chat_id, f"❌ Fleet report failed: `{e}`")
+        log.error(f"/report fleet error: {e}", exc_info=True)
+
+    try:
+        # Per-truck report
+        send_weekly_truck_report(send_to_chat_ids=[chat_id, DISPATCHER_GROUP_ID])
+    except Exception as e:
+        _send_to(chat_id, f"❌ Truck report failed: `{e}`")
+        log.error(f"/report truck error: {e}", exc_info=True)
+
+    _send_to(chat_id, "✅ Reports generated and sent to dispatcher group.")
+
+
+def send_weekly_truck_report(send_to_chat_ids: list = None) -> None:
+    """Send per-truck Excel report.
+
+    Sends to admin + dispatcher group by default.
+    Pass custom chat_ids to override recipients.
+    """
+    import tempfile, os
+    from truck_report import build_truck_report
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            path = f.name
+        build_truck_report(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        os.unlink(path)
+
+        import requests as _req
+        from datetime import datetime, timezone
+        url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        week = datetime.now(timezone.utc).strftime("%b %d %Y")
+        fname = f"DieselUp_Trucks_{week.replace(' ','_')}.xlsx"
+        caption = f"📊 Per-Truck Weekly Report  |  {week}"
+
+        # Default recipients: admin + dispatcher group
+        recipients = send_to_chat_ids or [ADMIN_CHAT_ID, DISPATCHER_GROUP_ID]
+
+        for chat_id in recipients:
+            if not chat_id:
+                continue
+            try:
+                _req.post(url, data={
+                    "chat_id":  chat_id,
+                    "caption":  caption,
+                }, files={"document": (fname, data,
+                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                         timeout=30)
+            except Exception as se:
+                log.warning(f"Excel report send to {chat_id} failed: {se}")
+
+        log.info(f"Per-truck Excel report sent to {len(recipients)} recipients")
+    except Exception as e:
+        log.error(f"Truck report send failed: {e}", exc_info=True)
+
+
+def send_weekly_fleet_report(send_to_chat_ids: list = None) -> None:
+    """Send fleet-wide weekly Excel report.
+
+    4 sheets: Summary, Compliance, Flags, IFTA by State.
+    Sends to admin + dispatcher group by default.
+    """
+    import tempfile, os
+    from weekly_report import get_real_data, build_report
+    try:
+        summary, compliance, flags, ifta_by_state = get_real_data()
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            path = f.name
+        build_report(summary, compliance, flags, ifta_by_state, path)
+        with open(path, "rb") as f:
+            data = f.read()
+        os.unlink(path)
+
+        import requests as _req
+        from datetime import datetime, timezone
+        url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        week = datetime.now(timezone.utc).strftime("%b %d %Y")
+        fname = f"DieselUp_Weekly_{week.replace(' ','_')}.xlsx"
+        caption = f"📊 DieselUp Weekly Report  |  {week}"
+
+        recipients = send_to_chat_ids or [ADMIN_CHAT_ID, DISPATCHER_GROUP_ID]
+
+        for chat_id in recipients:
+            if not chat_id:
+                continue
+            try:
+                _req.post(url, data={
+                    "chat_id":  chat_id,
+                    "caption":  caption,
+                }, files={"document": (fname, data,
+                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                         timeout=30)
+            except Exception as se:
+                log.warning(f"Fleet report send to {chat_id} failed: {se}")
+
+        log.info(f"Fleet weekly Excel report sent to {len(recipients)} recipients")
+    except Exception as e:
+        log.error(f"Fleet report send failed: {e}", exc_info=True)
+
+
 def send_weekly_savings_report() -> None:
     """Weekly owner report — savings, IFTA analysis, compliance. Owner only, not drivers."""
     from database import db_cursor
@@ -1323,20 +1599,23 @@ def send_weekly_savings_report() -> None:
         top_trucks = cur.fetchall()
 
         # IFTA data — fuel purchased by state this week
-        cur.execute("""
-            SELECT best_stop_state,
-                   COUNT(*) AS stops,
-                   COALESCE(SUM(gallons_purchased),0) AS total_gal,
-                   AVG(best_stop_price) AS avg_pump_price
-            FROM fuel_alerts
-            WHERE alerted_at >= %s
-              AND alert_type = 'refueled'
-              AND best_stop_state IS NOT NULL
-            GROUP BY best_stop_state
-            ORDER BY total_gal DESC
-            LIMIT 8
-        """, (week_ago,))
-        ifta_by_state = cur.fetchall()
+        try:
+            cur.execute("""
+                SELECT best_stop_state,
+                       COUNT(*) AS stops,
+                       COALESCE(SUM(gallons_purchased),0) AS total_gal,
+                       AVG(best_stop_price) AS avg_pump_price
+                FROM fuel_alerts
+                WHERE alerted_at >= %s
+                  AND alert_type = 'refueled'
+                  AND best_stop_state IS NOT NULL
+                GROUP BY best_stop_state
+                ORDER BY total_gal DESC
+                LIMIT 8
+            """, (week_ago,))
+            ifta_by_state = cur.fetchall()
+        except Exception:
+            ifta_by_state = []
 
         # Compliance
         cur.execute("""
@@ -1371,6 +1650,33 @@ def send_weekly_savings_report() -> None:
         f"",
         f"💰 *Total Diesel Savings: ${total_savings:,.2f}*",
     ]
+
+    # ── V2 Flag System Summary ──────────────────────────────────────────────
+    try:
+        from flag_system import get_flags_summary, get_total_savings_lost
+        flag_summary = get_flags_summary(days=7)
+        total_lost = get_total_savings_lost(days=7)
+
+        if flag_summary or total_lost > 0:
+            lines += [
+                "",
+                "─────────────────────────────",
+                "🚩 *Driver Accountability Flags:*",
+            ]
+            flag_icons = {
+                "WRONG_STOP":    "⛽ Wrong Stop",
+                "MISSED_STOP":   "🛣 Missed Stop",
+                "LOW_FUEL":      "🔋 Low Fuel Event",
+                "LOW_STOP_STATE": "⚠️ Low-Stop State",
+            }
+            for flag_type, data in flag_summary.items():
+                label = flag_icons.get(flag_type, flag_type)
+                loss_str = f" — *${data.get('total_lost', 0):.2f} lost*" if data.get('total_lost', 0) > 0 else ""
+                lines.append(f"   {label}: *{data['count']}*{loss_str}")
+            if total_lost > 0:
+                lines.append(f"   💸 *Total savings lost to flags: ${total_lost:.2f}*")
+    except Exception as fe:
+        log.warning(f"Weekly report flag summary failed: {fe}")
 
     # Top trucks
     if top_trucks:

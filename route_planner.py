@@ -222,7 +222,7 @@ def plan_route_fuel(
 
         # Update fuel level for next segment (assume truck fuels at recommended stop)
         if best_stop:
-            current_fuel_pct_ = 90.0  # assume filled to 90%
+            current_fuel_pct_ = 100.0  # assume filled to 100%
         else:
             current_fuel_pct_ = max(0, current_fuel_pct_ - fuel_needed_pct)
 

@@ -79,6 +79,18 @@ CREATE TABLE IF NOT EXISTS trucks (
 
 -- fuel_stops: loaded daily from EFS price CSV
 -- Columns: Station, Address, City, State, longitude, latitude, Retail price, Discounted price
+-- Drop old fuel_stops table if it has wrong schema, recreate clean
+DO $$
+BEGIN
+    -- Check if old schema (has 'source' column) — drop and recreate
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'fuel_stops' AND column_name = 'source'
+    ) THEN
+        DROP TABLE IF EXISTS fuel_stops CASCADE;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS fuel_stops (
     id               SERIAL PRIMARY KEY,
     station_name     TEXT    NOT NULL,
@@ -131,25 +143,27 @@ CREATE TABLE IF NOT EXISTS truck_states (
 
 -- fuel_alerts: history of every alert sent
 CREATE TABLE IF NOT EXISTS fuel_alerts (
-    id              SERIAL PRIMARY KEY,
-    vehicle_id      TEXT    NOT NULL,
-    vehicle_name    TEXT,
-    fuel_pct        REAL    NOT NULL,
-    latitude        REAL    NOT NULL,
-    longitude       REAL    NOT NULL,
-    heading         REAL,
-    speed_mph       REAL,
-    best_stop_id    INTEGER,
-    best_stop_name  TEXT,
-    best_stop_price REAL,
-    alt_stop_id     INTEGER,
-    alt_stop_name   TEXT,
-    alt_stop_price  REAL,
-    savings_usd     REAL,
-    alert_type      TEXT    NOT NULL DEFAULT 'low_fuel',
-    status          TEXT    NOT NULL DEFAULT 'open',
-    alerted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    resolved_at     TIMESTAMPTZ
+    id                  SERIAL PRIMARY KEY,
+    vehicle_id          TEXT    NOT NULL,
+    vehicle_name        TEXT,
+    fuel_pct            REAL    NOT NULL,
+    latitude            REAL    NOT NULL,
+    longitude           REAL    NOT NULL,
+    heading             REAL,
+    speed_mph           REAL,
+    best_stop_id        INTEGER,
+    best_stop_name      TEXT,
+    best_stop_price     REAL,
+    alt_stop_id         INTEGER,
+    alt_stop_name       TEXT,
+    alt_stop_price      REAL,
+    best_stop_state     TEXT,
+    gallons_purchased   REAL,
+    savings_usd         REAL,
+    alert_type          TEXT    NOT NULL DEFAULT 'low_fuel',
+    status              TEXT    NOT NULL DEFAULT 'open',
+    alerted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at         TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_fuel_alerts_vehicle ON fuel_alerts (vehicle_id);
@@ -187,6 +201,49 @@ CREATE TABLE IF NOT EXISTS truck_routes (
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- trip_state: persists all trip planning data across bot restarts
+-- One row per active truck — updated every time state changes
+CREATE TABLE IF NOT EXISTS trip_state (
+    vehicle_name            TEXT PRIMARY KEY,
+    trip_num                TEXT,
+    trip_status             TEXT,
+    briefing_sent_trip      TEXT,       -- trip_id of last briefing sent
+    all_planned_stops       TEXT,       -- JSON array of planned stops
+    planned_stop_index      INTEGER DEFAULT 0,
+    assigned_stop_name      TEXT,
+    assigned_stop_lat       REAL,
+    assigned_stop_lng       REAL,
+    assigned_stop_card_price REAL,
+    assigned_stop_net_price  REAL,
+    missed_stop_name        TEXT,
+    missed_stop_card_price  REAL,
+    completed_waypoints     TEXT,       -- JSON array of completed stop IDs
+    border_warned           TEXT,       -- JSON dict of {state: True} already warned
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+-- Add border_warned column if it doesn't exist (migration)
+DO $$ BEGIN
+    ALTER TABLE trip_state ADD COLUMN IF NOT EXISTS border_warned TEXT DEFAULT '{}';
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- driver_flags: wrong stop / missed stop / low-stop state flags
+CREATE TABLE IF NOT EXISTS driver_flags (
+    id               SERIAL PRIMARY KEY,
+    vehicle_name     TEXT NOT NULL,
+    flag_type        TEXT NOT NULL,
+    details          TEXT,
+    recommended_stop TEXT,
+    actual_stop      TEXT,
+    fuel_pct         REAL,
+    state            TEXT,
+    card_price       REAL,
+    savings_lost     REAL,
+    flagged_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_flags_truck ON driver_flags (vehicle_name);
+CREATE INDEX IF NOT EXISTS idx_flags_time  ON driver_flags (flagged_at);
+
 CREATE TABLE IF NOT EXISTS stop_visits (
     id              SERIAL PRIMARY KEY,
     vehicle_name    TEXT NOT NULL,
@@ -197,9 +254,12 @@ CREATE TABLE IF NOT EXISTS stop_visits (
     actual_stop_name       TEXT,
     actual_stop_lat        FLOAT,
     actual_stop_lng        FLOAT,
+    actual_stop_state      TEXT,
     visited         BOOLEAN,   -- TRUE=went to recommended, FALSE=went elsewhere, NULL=unknown
     fuel_before     FLOAT,
     fuel_after      FLOAT,
+    gallons_purchased REAL,
+    savings_usd     REAL,
     visited_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -214,6 +274,19 @@ def init_db():
     cur.execute(SCHEMA_SQL)
     # Migrations for existing DBs
     cur.execute("ALTER TABLE trucks ALTER COLUMN telegram_group_id DROP NOT NULL")
+    # Add missing fuel_alerts columns if not exists
+    for col_def in [
+        "alt_stop_id INTEGER",
+        "alt_stop_name TEXT",
+        "alt_stop_price REAL",
+        "best_stop_state TEXT",
+        "gallons_purchased REAL",
+    ]:
+        col_name = col_def.split()[0]
+        try:
+            cur.execute(f"ALTER TABLE fuel_alerts ADD COLUMN IF NOT EXISTS {col_def}")
+        except Exception:
+            pass
     for col, coltype in [
         ("prev_truck_group",       "TEXT"),
         ("prev_truck_msg_id",      "BIGINT"),
@@ -222,6 +295,26 @@ def init_db():
         ("prev_ca_dispatcher_msg_id", "BIGINT"),
     ]:
         cur.execute(f"ALTER TABLE truck_states ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    for col, coltype in [
+        ("assigned_stop_card_price", "REAL"),
+        ("assigned_stop_net_price",  "REAL"),
+        ("missed_stop_name",         "TEXT"),
+        ("missed_stop_card_price",   "REAL"),
+        ("completed_waypoints",      "TEXT"),
+        ("border_warned",            "TEXT"),
+    ]:
+        cur.execute(f"ALTER TABLE trip_state ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    for col, coltype in [
+        ("card_price",   "REAL"),
+        ("savings_lost", "REAL"),
+    ]:
+        cur.execute(f"ALTER TABLE driver_flags ADD COLUMN IF NOT EXISTS {col} {coltype}")
+    for col, coltype in [
+        ("actual_stop_state",  "TEXT"),
+        ("gallons_purchased",  "REAL"),
+        ("savings_usd",        "REAL"),
+    ]:
+        cur.execute(f"ALTER TABLE stop_visits ADD COLUMN IF NOT EXISTS {col} {coltype}")
     conn.commit()
     conn.close()
     log.info("✅ Database schema ready.")
@@ -355,31 +448,88 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
                       Retail price, Discounted price
     Clears existing data and reloads fresh every time (daily upload).
     """
-    import csv, io
+    import csv, io, re
+
+    def _norm(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+    def _pick(row: dict, aliases: tuple[str, ...], default: str = "") -> str:
+        for alias in aliases:
+            actual = header_map.get(_norm(alias))
+            if actual is not None:
+                return str(row.get(actual, default) or "").strip()
+        return default
+
+    def _to_float(value: str):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("$", "").replace(",", "")
+        return float(text)
+
+    def _norm_address(value: str) -> str:
+        text = str(value or "").strip().lower()
+        replacements = {
+            " street": " st",
+            " road": " rd",
+            " avenue": " ave",
+            " boulevard": " blvd",
+            " highway": " hwy",
+            " drive": " dr",
+            " lane": " ln",
+            " place": " pl",
+            " court": " ct",
+        }
+        for src, dst in replacements.items():
+            text = text.replace(src, dst)
+        return re.sub(r"[^a-z0-9]+", "", text)
     try:
         text   = file_bytes.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            return 0, "CSV file is missing a header row."
         rows   = list(reader)
     except Exception as e:
         return 0, f"❌ Could not parse file: {e}"
 
+    header_map = {_norm(name): name for name in (reader.fieldnames or [])}
+    required_groups = {
+        "station": ("Station", "station_name", "store_name", "name"),
+        "city": ("City", "city"),
+        "state": ("State", "state"),
+        "latitude": ("latitude", "lat"),
+        "longitude": ("longitude", "lng", "lon"),
+        "discounted_price": (
+            "Discounted price", "discounted_price", "discount_price",
+            "card price", "card_price", "diesel_price",
+        ),
+    }
+    missing = [
+        group for group, aliases in required_groups.items()
+        if not any(_norm(alias) in header_map for alias in aliases)
+    ]
+    if missing:
+        return 0, "CSV missing required columns: " + ", ".join(missing)
+
     records = []
     skipped = 0
+    duplicates = 0
+    conflicts = 0
     for r in rows:
         try:
-            lat  = float(r["latitude"])
-            lng  = float(r["longitude"])
-            name = r["Station"].strip()
-            city  = r["City"].strip()
-            state = r["State"].strip().upper()
-            if not name or not state or not lat or not lng:
+            lat = _to_float(_pick(r, required_groups["latitude"]))
+            lng = _to_float(_pick(r, required_groups["longitude"]))
+            name = _pick(r, required_groups["station"])
+            city = _pick(r, required_groups["city"])
+            state = _pick(r, required_groups["state"]).upper()
+            retail = _to_float(_pick(r, ("Retail price", "retail_price", "retail", "pump_price")))
+            discount = _to_float(_pick(r, required_groups["discounted_price"]))
+            if not name or not state or lat is None or lng is None or discount is None:
                 skipped += 1
                 continue
-            retail   = float(r["Retail price"])   if r.get("Retail price","").strip()    else None
-            discount = float(r["Discounted price"]) if r.get("Discounted price","").strip() else None
             records.append({
                 "station_name":     name,
-                "address":          r.get("Address","").strip(),
+                "address":          _pick(r, ("Address", "address", "street_address")),
                 "city":             city,
                 "state":            state,
                 "longitude":        lng,
@@ -391,11 +541,64 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
             skipped += 1
 
     if not records:
-        return 0, "❌ No valid records found in file."
+        return 0, "No valid records found in file."
+
+    # Reject conflicting rows that point to the same physical location/address
+    # but claim different city/state values. This protects routing from bad
+    # cleaned CSV merges like "Columbia, SC" with NJ coordinates.
+    conflict_indexes = set()
+    coord_groups = {}
+    addr_groups = {}
+    for idx, record in enumerate(records):
+        coord_key = (
+            round(float(record["latitude"]), 3),
+            round(float(record["longitude"]), 3),
+        )
+        coord_groups.setdefault(coord_key, []).append((idx, record))
+
+        addr_key = _norm_address(record.get("address", ""))
+        if addr_key:
+            addr_groups.setdefault(addr_key, []).append((idx, record))
+
+    def _mark_conflicts(groups: dict):
+        nonlocal conflicts
+        for items in groups.values():
+            locations = {
+                (
+                    str(rec.get("city", "")).strip().upper(),
+                    str(rec.get("state", "")).strip().upper(),
+                )
+                for _, rec in items
+                if rec.get("state")
+            }
+            if len(locations) > 1:
+                for idx, _ in items:
+                    if idx not in conflict_indexes:
+                        conflict_indexes.add(idx)
+                        conflicts += 1
+
+    _mark_conflicts(coord_groups)
+    _mark_conflicts(addr_groups)
+    if conflict_indexes:
+        records = [
+            record for idx, record in enumerate(records)
+            if idx not in conflict_indexes
+        ]
+
+    deduped = {}
+    for record in records:
+        key = (
+            str(record.get("station_name", "")).strip().upper(),
+            str(record.get("city", "")).strip().upper(),
+            str(record.get("state", "")).strip().upper(),
+        )
+        if key in deduped:
+            duplicates += 1
+        deduped[key] = record
+    records = list(deduped.values())
 
     with db_cursor() as cur:
-        # Full reload — delete old, insert fresh
-        cur.execute("DELETE FROM fuel_stops")
+        cur.execute("TRUNCATE TABLE fuel_stops RESTART IDENTITY")
         cur.executemany("""
             INSERT INTO fuel_stops
                 (station_name, address, city, state, longitude, latitude,
@@ -404,20 +607,15 @@ def import_efs_csv(file_bytes: bytes) -> tuple[int, str]:
                 (%(station_name)s, %(address)s, %(city)s, %(state)s,
                  %(longitude)s, %(latitude)s,
                  %(retail_price)s, %(discounted_price)s, NOW())
-            ON CONFLICT (station_name, city, state) DO UPDATE SET
-                address          = EXCLUDED.address,
-                longitude        = EXCLUDED.longitude,
-                latitude         = EXCLUDED.latitude,
-                retail_price     = EXCLUDED.retail_price,
-                discounted_price = EXCLUDED.discounted_price,
-                price_updated    = NOW()
         """, records)
 
     msg = (
-        f"✅ *Fuel prices updated*\n"
-        f"⛽ {len(records)} stations loaded\n"
-        f"⏭ {skipped} skipped (missing data)\n"
-        f"🔄 Using discounted (card) price for routing"
+        f"Fuel prices updated\n"
+        f"{len(records)} stations loaded\n"
+        f"{skipped} skipped (missing data)\n"
+        f"{conflicts} conflicting rows rejected\n"
+        f"{duplicates} duplicate rows merged\n"
+        f"Using discounted (card) price for routing"
     )
     return len(records), msg
 
@@ -607,12 +805,12 @@ def create_fuel_alert(vehicle_id, vehicle_name, fuel_pct, lat, lng,
         INSERT INTO fuel_alerts (
             vehicle_id, vehicle_name, fuel_pct, latitude, longitude,
             heading, speed_mph, alert_type,
-            best_stop_id, best_stop_name, best_stop_price,
+            best_stop_id, best_stop_name, best_stop_price, best_stop_state,
             alt_stop_id,  alt_stop_name,  alt_stop_price, savings_usd
         ) VALUES (
             %(vehicle_id)s, %(vehicle_name)s, %(fuel_pct)s, %(lat)s, %(lng)s,
             %(heading)s, %(speed_mph)s, %(alert_type)s,
-            %(best_stop_id)s, %(best_stop_name)s, %(best_stop_price)s,
+            %(best_stop_id)s, %(best_stop_name)s, %(best_stop_price)s, %(best_stop_state)s,
             %(alt_stop_id)s,  %(alt_stop_name)s,  %(alt_stop_price)s, %(savings_usd)s
         ) RETURNING id
     """
@@ -629,6 +827,7 @@ def create_fuel_alert(vehicle_id, vehicle_name, fuel_pct, lat, lng,
             "best_stop_id":    best_stop["id"]          if best_stop else None,
             "best_stop_name":  best_stop["store_name"]  if best_stop else None,
             "best_stop_price": best_stop["diesel_price"] if best_stop else None,
+            "best_stop_state": best_stop["state"]       if best_stop else None,
             "alt_stop_id":     alt_stop["id"]           if alt_stop else None,
             "alt_stop_name":   alt_stop["store_name"]   if alt_stop else None,
             "alt_stop_price":  alt_stop["diesel_price"]  if alt_stop else None,
@@ -715,22 +914,36 @@ def log_stop_visit(vehicle_name: str, alert_id: int,
                    actual_stop_name: str,
                    actual_lat: float, actual_lng: float,
                    visited: bool,
-                   fuel_before: float, fuel_after: float) -> None:
+                   fuel_before: float, fuel_after: float,
+                   actual_stop_state: str = None,
+                   gallons_purchased: float = None,
+                   savings_usd: float = None) -> None:
     """Log whether truck visited the recommended stop or went elsewhere."""
     from datetime import datetime, timezone
+    if gallons_purchased is None and fuel_before is not None and fuel_after is not None:
+        fuel_delta = max(float(fuel_after) - float(fuel_before), 0.0)
+        gallons_purchased = round(150.0 * fuel_delta / 100.0, 1) if fuel_delta > 0 else 0.0
+    if savings_usd is None and visited and alert_id:
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT savings_usd FROM fuel_alerts WHERE id = %s", (alert_id,))
+                row = cur.fetchone()
+                savings_usd = float(row["savings_usd"]) if row and row.get("savings_usd") is not None else None
+        except Exception:
+            savings_usd = None
     with db_cursor() as cur:
         cur.execute("""
             INSERT INTO stop_visits (
                 vehicle_name, alert_id,
                 recommended_stop_name, recommended_stop_lat, recommended_stop_lng,
-                actual_stop_name, actual_stop_lat, actual_stop_lng,
-                visited, fuel_before, fuel_after, visited_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                actual_stop_name, actual_stop_lat, actual_stop_lng, actual_stop_state,
+                visited, fuel_before, fuel_after, gallons_purchased, savings_usd, visited_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             vehicle_name, alert_id,
             recommended_stop_name, recommended_lat, recommended_lng,
-            actual_stop_name, actual_lat, actual_lng,
-            visited, fuel_before, fuel_after,
+            actual_stop_name, actual_lat, actual_lng, actual_stop_state,
+            visited, fuel_before, fuel_after, gallons_purchased, savings_usd,
             datetime.now(timezone.utc)
         ))
 
@@ -827,3 +1040,172 @@ def get_truck_mpg(vehicle_id: str) -> float:
         except Exception:
             pass
     return 6.5
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA RETENTION POLICY — NOTHING IS EVER DELETED
+# fuel_alerts, stop_visits, driver_flags, trip_state all grow forever
+# Weekly report queries by date range — data stays in DB permanently
+# ═══════════════════════════════════════════════════════════════════
+
+def get_flags_for_report(days: int = 7) -> list:
+    """Get all flags for weekly Excel report."""
+    from datetime import datetime, timezone, timedelta
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    with db_cursor() as cur:
+        try:
+            cur.execute("""
+                SELECT vehicle_name, flag_type, details,
+                       recommended_stop, actual_stop,
+                       fuel_pct, state, card_price, savings_lost,
+                       flagged_at
+                FROM driver_flags
+                WHERE flagged_at >= %s
+                ORDER BY flagged_at DESC
+            """, (since,))
+            return _rows(cur.fetchall())
+        except Exception:
+            return []
+
+
+def get_compliance_for_report(days: int = 7) -> list:
+    """Get per-truck compliance stats for weekly Excel report."""
+    from datetime import datetime, timezone, timedelta
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    with db_cursor() as cur:
+        try:
+            cur.execute("""
+                SELECT
+                    vehicle_name,
+                    COUNT(*) FILTER (WHERE visited = TRUE)  AS visited,
+                    COUNT(*) FILTER (WHERE visited = FALSE) AS skipped,
+                    COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN visited THEN savings_usd ELSE 0 END), 0) AS savings,
+                    COALESCE(SUM(CASE WHEN NOT visited THEN ABS(savings_usd) ELSE 0 END), 0) AS losses
+                FROM stop_visits
+                WHERE visited_at >= %s
+                GROUP BY vehicle_name
+                ORDER BY vehicle_name
+            """, (since,))
+            return _rows(cur.fetchall())
+        except Exception:
+            return []
+
+
+def save_trip_state(vehicle_name: str, state: dict) -> None:
+    """Save trip planning state to DB — survives bot restarts."""
+    import json
+
+    # Collect all border_warned_{STATE} keys into a single dict
+    border_warned = {
+        k.replace("border_warned_", ""): v
+        for k, v in state.items()
+        if k.startswith("border_warned_") and v
+    }
+
+    with db_cursor() as cur:
+        cur.execute("""
+            INSERT INTO trip_state (
+                vehicle_name, trip_num, trip_status,
+                briefing_sent_trip,
+                all_planned_stops, planned_stop_index,
+                assigned_stop_name, assigned_stop_lat, assigned_stop_lng,
+                assigned_stop_card_price, assigned_stop_net_price,
+                missed_stop_name, missed_stop_card_price,
+                completed_waypoints, border_warned, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+            )
+            ON CONFLICT (vehicle_name) DO UPDATE SET
+                trip_num                 = EXCLUDED.trip_num,
+                trip_status              = EXCLUDED.trip_status,
+                briefing_sent_trip       = EXCLUDED.briefing_sent_trip,
+                all_planned_stops        = EXCLUDED.all_planned_stops,
+                planned_stop_index       = EXCLUDED.planned_stop_index,
+                assigned_stop_name       = EXCLUDED.assigned_stop_name,
+                assigned_stop_lat        = EXCLUDED.assigned_stop_lat,
+                assigned_stop_lng        = EXCLUDED.assigned_stop_lng,
+                assigned_stop_card_price = EXCLUDED.assigned_stop_card_price,
+                assigned_stop_net_price  = EXCLUDED.assigned_stop_net_price,
+                missed_stop_name         = EXCLUDED.missed_stop_name,
+                missed_stop_card_price   = EXCLUDED.missed_stop_card_price,
+                completed_waypoints      = EXCLUDED.completed_waypoints,
+                border_warned            = EXCLUDED.border_warned,
+                updated_at               = NOW()
+        """, (
+            vehicle_name,
+            state.get("qm_route", {}).get("trip_num") if state.get("qm_route") else None,
+            state.get("last_trip_status"),
+            state.get("briefing_sent_trip"),
+            json.dumps(state.get("all_planned_stops") or []),
+            state.get("planned_stop_index", 0),
+            state.get("assigned_stop_name"),
+            state.get("assigned_stop_lat"),
+            state.get("assigned_stop_lng"),
+            state.get("assigned_stop_card_price"),
+            state.get("assigned_stop_net_price"),
+            state.get("missed_stop_name"),
+            state.get("missed_stop_card_price"),
+            json.dumps(list(state.get("completed_waypoints") or [])),
+            json.dumps(border_warned),
+        ))
+
+
+def load_trip_state(vehicle_name: str) -> dict:
+    """Load persisted trip state for a truck. Returns {} if not found."""
+    import json
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM trip_state WHERE vehicle_name = %s",
+            (vehicle_name,)
+        )
+        row = cur.fetchone()
+    if not row:
+        return {}
+    result = {}
+    try: result["briefing_sent_trip"]       = row["briefing_sent_trip"]
+    except: pass
+    try: result["all_planned_stops"]        = json.loads(row["all_planned_stops"] or "[]")
+    except: result["all_planned_stops"]     = []
+    try: result["planned_stop_index"]       = row["planned_stop_index"] or 0
+    except: result["planned_stop_index"]    = 0
+    try: result["assigned_stop_name"]       = row["assigned_stop_name"]
+    except: pass
+    try: result["assigned_stop_lat"]        = row["assigned_stop_lat"]
+    except: pass
+    try: result["assigned_stop_lng"]        = row["assigned_stop_lng"]
+    except: pass
+    try: result["assigned_stop_card_price"] = row["assigned_stop_card_price"]
+    except: pass
+    try: result["assigned_stop_net_price"]  = row["assigned_stop_net_price"]
+    except: pass
+    try: result["missed_stop_name"]         = row["missed_stop_name"]
+    except: pass
+    try: result["missed_stop_card_price"]   = row["missed_stop_card_price"]
+    except: pass
+    try:
+        wps = json.loads(row["completed_waypoints"] or "[]")
+        result["completed_waypoints"] = set(wps)
+    except:
+        result["completed_waypoints"] = set()
+    # Restore border_warned_{STATE} keys into state
+    try:
+        bw = json.loads(row.get("border_warned") or "{}")
+        for state_code, warned in bw.items():
+            if warned:
+                result[f"border_warned_{state_code}"] = True
+    except:
+        pass
+    return result
+
+
+def load_all_trip_states() -> dict:
+    """Load all persisted trip states on bot startup. Returns {vehicle_name: state_dict}."""
+    with db_cursor() as cur:
+        cur.execute("SELECT vehicle_name FROM trip_state")
+        rows = cur.fetchall()
+    result = {}
+    for row in rows:
+        vname = row["vehicle_name"]
+        result[vname] = load_trip_state(vname)
+    return result

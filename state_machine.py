@@ -47,7 +47,7 @@ from config import (
 from yard_geofence import is_in_yard, get_yard_name
 from truck_stop_finder import (
     find_best_stops, find_best_stops_on_route, calc_savings,
-    get_urgency, find_current_stop, haversine_miles,
+    get_urgency, find_current_stop, haversine_miles, reachable_miles,
 )
 from california import (
     should_send_ca_reminder,
@@ -55,6 +55,7 @@ from california import (
     get_ca_avg_diesel_price,
     _dist_to_ca_border,
 )
+from route_briefing import plan_route_briefing, format_route_briefing, format_next_stop
 from telegram_bot import (
     send_low_fuel_alert,
     send_at_stop_alert,

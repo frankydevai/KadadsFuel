@@ -219,8 +219,8 @@ def main():
             if (now - last_ifta_update).total_seconds() >= 7776000:
                 def _update_ifta():
                     try:
-                        from ifta import scrape_and_update_ifta_rates
-                        ok = scrape_and_update_ifta_rates()
+                        from ifta import update_ifta_rates_from_web
+                        ok = update_ifta_rates_from_web()
                         if ok:
                             from telegram_bot import _send_to
                             from config import ADMIN_CHAT_ID

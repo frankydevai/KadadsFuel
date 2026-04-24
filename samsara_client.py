@@ -85,10 +85,10 @@ def get_combined_vehicle_data() -> list[dict]:
         if fuel_events:
             latest = max(fuel_events, key=lambda x: x.get("time", ""))
             val = latest.get("value")
+            # value is 0.0-1.0 in feed (fraction) — convert to percentage
             if val is not None:
                 fval = float(val)
-                # Samsara returns fuelPercents as 0-100
-                stats_map[vid] = max(0.0, min(100.0, round(fval, 1)))
+                stats_map[vid] = round(fval * 100, 1) if fval <= 1.0 else round(fval, 1)
             else:
                 stats_map[vid] = 100.0
         else:

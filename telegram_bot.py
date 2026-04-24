@@ -149,10 +149,7 @@ def send_low_fuel_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
         if pump and true_price:
             pay_pump = round(pump * gallons_needed, 2)
             pay_net  = round(true_price * gallons_needed, 2)
-            if abs(pay_net - pay_pump) > 1:
-                lines.append(f"💵 Fill *{gallons_needed:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
-            else:
-                lines.append(f"💵 Fill *{gallons_needed:.0f} gal = ${pay_pump:.0f}*")
+            lines.append(f"💵 Fill *{gallons_needed:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
 
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
@@ -226,10 +223,7 @@ def send_emergency_alert(vehicle_name, fuel_pct, truck_lat, truck_lng,
         if pump and true_price and gallons:
             pay_pump = round(pump * gallons, 2)
             pay_net  = round(true_price * gallons, 2)
-            if abs(pay_net - pay_pump) > 1:
-                lines.append(f"💵 Fill *{gallons:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
-            else:
-                lines.append(f"💵 Fill *{gallons:.0f} gal = ${pay_pump:.0f}*")
+            lines.append(f"💵 Fill *{gallons:.0f} gal* → Pump: ${pay_pump:.0f} · Net after IFTA: *${pay_net:.0f}*")
 
         if maps_url:
             lines.append(f"🗺 [Open in Google Maps]({maps_url})")
@@ -343,14 +337,11 @@ def send_refueled_alert(vehicle_name, stop_name, fuel_pct,
             lines.append(f"🗺 [View location]({maps_url})")
 
     _send_to_truck(vehicle_name, "\n".join(lines))
-    # Also notify dispatcher
-    _send_to_dispatcher(f"✅ *{vehicle_name}* refueled at {stop_name} — {fuel_pct:.0f}% fuel")
 
 
 def send_left_yard_low_fuel(vehicle_name, fuel_pct, yard_name):
     text = f"🏠 *LEFT YARD — LOW FUEL*\n🚛 *Truck:* {vehicle_name}\n⛽ *Fuel:* {fuel_pct:.0f}%\n📍 *Departed:* {yard_name}"
     _send_to_truck(vehicle_name, text)
-    _send_to_dispatcher(f"🏠 *{vehicle_name}* left {yard_name} with {fuel_pct:.0f}% fuel.")
 
 
 def register_commands():

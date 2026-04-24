@@ -664,9 +664,15 @@ def format_route_briefing(plan: dict, truck_name: str,
         if s.get("low_stop_warning"):
             lines.append(s["low_stop_warning"])
 
-        lines.append(f"*Stop {s['stop_number']} — {s['store_name']}*")
-        lines.append(f"📌 {s['address']}, {s['city']}, {s['state']}")
-        lines.append(f"🛣 {s['dist_from_truck']:.0f} mi from current position")
+        dist = s.get('dist_from_truck', 0)
+        if dist <= 2.0:
+            lines.append(f"🅿️ *Already stopped at Stop {s['stop_number']} — {s['store_name']}*")
+            lines.append(f"📌 {s['address']}, {s['city']}, {s['state']}")
+            lines.append(f"🛣 Currently parked here")
+        else:
+            lines.append(f"*Stop {s['stop_number']} — {s['store_name']}*")
+            lines.append(f"📌 {s['address']}, {s['city']}, {s['state']}")
+            lines.append(f"🛣 {dist:.0f} mi from current position")
 
         if s.get("retail_price"):
             lines.append(f"💰 Retail: ${s['retail_price']:.3f}/gal")
@@ -676,17 +682,11 @@ def format_route_briefing(plan: dict, truck_name: str,
         lines.append("")
         
         if plan.get("ifta_enabled"):
-            if abs(s["total_net_cost"] - s["total_card_cost"]) >= 1:
-                lines.append(
-                    f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
-                    f"Pump: ${s['total_card_cost']:.0f} · "
-                    f"Net after IFTA: *${s['total_net_cost']:.0f}*"
-                )
-            else:
-                lines.append(
-                    f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
-                    f"Estimated total: *${s['total_card_cost']:.0f}*"
-                )
+            lines.append(
+                f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
+                f"Pump: ${s['total_card_cost']:.0f} · "
+                f"Net after IFTA: *${s['total_net_cost']:.0f}*"
+            )
         else:
             lines.append(
                 f"💵 Fill *{s['gallons_to_fill']:.0f} gal* → "
@@ -746,10 +746,8 @@ def format_next_stop(stop: dict, stop_num: int, total_stops: int,
     if card:
         lines.append(f"💳 Card:   *${card:.3f}/gal*")
     if pump_cost:
-        if IFTA_HOME_STATE and abs(net_cost - pump_cost) > 1:
+        if IFTA_HOME_STATE:
             lines.append(f"💵 Fill ~{gallons:.0f} gal → Pump: ${pump_cost:.0f} · Net after IFTA: *${net_cost:.0f}*")
-        elif IFTA_HOME_STATE:
-            lines.append(f"💵 Fill ~{gallons:.0f} gal → Estimated total: ${pump_cost:.0f}")
         else:
             lines.append(f"💵 Fill ~{gallons:.0f} gal → Card total: ${pump_cost:.0f}")
             lines.append("📋 IFTA adjustment is off because `IFTA_HOME_STATE` is not set.")

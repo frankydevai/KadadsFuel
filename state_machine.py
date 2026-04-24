@@ -276,8 +276,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
     if should_brief:
         # Trip is in_transit and briefing not yet sent — send now
         try:
-            from route_briefing import plan_route_briefing, format_route_briefing
-            from telegram_bot import _send_to_truck
+                        from telegram_bot import _send_to_truck
             from database import get_truck_group
 
             plan = plan_route_briefing(
@@ -301,7 +300,6 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     delete_message(str(DISPATCHER_GROUP_ID), prev_briefing_dispatcher)
 
                 truck_msg_id      = _send_to(truck_group, msg) if truck_group else None
-                dispatcher_msg_id = _send_to_dispatcher(msg)
 
                 # Store message IDs so next briefing can delete these
                 state["prev_briefing_truck_msg_id"]      = truck_msg_id
@@ -375,8 +373,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
             stop_lng = stop.get("lng") or stop.get("longitude")
             if not stop_lat or not stop_lng or stop_id in completed_wps:
                 continue
-            from truck_stop_finder import haversine_miles as _hav
-            dist_to_stop = _hav(lat, lng, float(stop_lat), float(stop_lng))
+                        dist_to_stop = _hav(lat, lng, float(stop_lat), float(stop_lng))
             if dist_to_stop < 0.5 and speed < 5:
                 completed_wps.add(stop_id)
                 state["completed_waypoints"] = completed_wps
@@ -384,8 +381,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                              if (s.get("id") or s.get("address","")) not in completed_wps]
                 if remaining or route.get("destination"):
                     try:
-                        from route_briefing import plan_route_briefing, format_route_briefing
-                        from telegram_bot import _send_to_truck
+                                                from telegram_bot import _send_to_truck
                         from database import get_truck_group, save_trip_state
                         updated_route = {**route, "stops": remaining}
                         plan = plan_route_briefing(lat, lng, fuel, tank_gal, mpg, updated_route)
@@ -401,10 +397,10 @@ def process_truck(vid, prev_state, current_data, truck_states):
                             delete_message(truck_group, prev_b_truck)
                         if prev_b_disp:
                             delete_message(str(DISPATCHER_GROUP_ID), prev_b_disp)
-                        tmid = _send_to(truck_group, hdr + msg) if truck_group else None
-                        dmid = _send_to_dispatcher(hdr + msg)
-                        state["prev_briefing_truck_msg_id"]      = tmid
-                        state["prev_briefing_dispatcher_msg_id"] = dmid
+                        from telegram_bot import _send_to_truck
+                        res = _send_to_truck(vname, hdr + msg)
+                        state["prev_briefing_truck_msg_id"]      = res.get("truck_msg_id")
+                        state["prev_briefing_dispatcher_msg_id"] = res.get("dispatcher_msg_id")
                         state["briefing_sent_trip"] = route_id  # keep same trip ID
                         save_trip_state(vname, state)
                         log.info(f"  {vname}: re-briefed after delivery at {stop_id}")
@@ -514,8 +510,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                 analyze_route_borders, build_border_strategy,
                 format_border_warnings, AVOID_FUEL_STATES, LOW_STOP_STATES
             )
-            from truck_stop_finder import haversine_miles, reachable_miles
-            from database import get_all_diesel_stops
+                        from database import get_all_diesel_stops
 
             waypoints = []
             for wp in route.get("stops", []):
@@ -751,8 +746,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
         rec_name  = state.get("assigned_stop_name")
 
         try:
-            from truck_stop_finder import find_current_stop
-            actual_stop = find_current_stop(lat, lng)
+                        actual_stop = find_current_stop(lat, lng)
 
             # If not found at current GPS — check location history
             # (truck may have already left the stop)
@@ -1088,8 +1082,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
 
                     # Send next stop alert to driver + dispatcher
                     try:
-                        from route_briefing import format_next_stop
-                        from telegram_bot import _send_to_truck
+                                                from telegram_bot import _send_to_truck
                         from database import get_truck_group
                         total_stops = len(state.get("all_planned_stops", []))
                         msg = format_next_stop(
@@ -1265,8 +1258,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
         
         is_wrong_stop = False
         if assigned_name and assigned_lat and assigned_lng:
-            from truck_stop_finder import haversine_miles
-            dist_to_assigned = haversine_miles(lat, lng, float(assigned_lat), float(assigned_lng))
+                        dist_to_assigned = haversine_miles(lat, lng, float(assigned_lat), float(assigned_lng))
             if dist_to_assigned > 2.0:
                 is_wrong_stop = True
             else:
@@ -1297,8 +1289,7 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
     range_miles       = (fuel / 100) * tank_gal * mpg * 0.85
 
     if planned_stop_lat and planned_stop_lng:
-        from truck_stop_finder import haversine_miles
-        dist_to_planned = haversine_miles(lat, lng,
+                dist_to_planned = haversine_miles(lat, lng,
                                           float(planned_stop_lat),
                                           float(planned_stop_lng))
         if range_miles >= dist_to_planned:
@@ -1312,15 +1303,15 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
     
     if fuel > 20 and route:
         log.info(f"  {vname}: fuel={fuel:.0f}% (>20%), bypassing emergency and generating Route Fuel Plan instead")
-        from route_briefing import plan_route_briefing, format_route_briefing
-        plan = plan_route_briefing(lat, lng, fuel, tank_gal, mpg, route)
+                plan = plan_route_briefing(lat, lng, fuel, tank_gal, mpg, route)
         
         if plan and plan.get("planned_stops"):
             msg = format_route_briefing(
-                vname, state.get("qm_trip_id", "Unknown"),
-                state.get("qm_origin_city", "Unknown"),
-                state.get("qm_dest_city", "Unknown"),
-                plan, mpg
+                plan=plan,
+                truck_name=vname,
+                route=route,
+                fuel_pct=fuel,
+                mpg=mpg
             )
             
             planned_stops = plan["planned_stops"]

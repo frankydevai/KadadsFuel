@@ -57,6 +57,8 @@ from california import (
 )
 from route_briefing import plan_route_briefing, format_route_briefing, format_next_stop
 from telegram_bot import (
+    _send_to,
+    _send_to_dispatcher,
     send_low_fuel_alert,
     send_at_stop_alert,
     delete_message,
@@ -301,7 +303,7 @@ def process_truck(vid, prev_state, current_data, truck_states):
                     delete_message(str(DISPATCHER_GROUP_ID), prev_briefing_dispatcher)
 
                 truck_msg_id      = _send_to(truck_group, msg) if truck_group else None
-
+                dispatcher_msg_id = _send_to_dispatcher(msg)
                 # Store message IDs so next briefing can delete these
                 state["prev_briefing_truck_msg_id"]      = truck_msg_id
                 state["prev_briefing_dispatcher_msg_id"] = dispatcher_msg_id

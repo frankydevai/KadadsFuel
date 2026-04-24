@@ -1308,6 +1308,38 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
             return
 
     # ── Case 3: EMERGENCY — can't reach planned stop or fuel < 15% ───────────
+    route = state.get("qm_route")
+    
+    if fuel > 20 and route:
+        log.info(f"  {vname}: fuel={fuel:.0f}% (>20%), bypassing emergency and generating Route Fuel Plan instead")
+        from route_briefing import plan_route_briefing, format_route_briefing
+        plan = plan_route_briefing(lat, lng, fuel, tank_gal, mpg, route)
+        
+        if plan and plan.get("planned_stops"):
+            msg = format_route_briefing(
+                vname, state.get("qm_trip_id", "Unknown"),
+                state.get("qm_origin_city", "Unknown"),
+                state.get("qm_dest_city", "Unknown"),
+                plan, mpg
+            )
+            
+            planned_stops = plan["planned_stops"]
+            state["all_planned_stops"]  = planned_stops
+            state["planned_stop_index"] = 0
+            
+            best = planned_stops[0]
+            state["assigned_stop_name"] = best["store_name"]
+            state["assigned_stop_lat"]  = best.get("latitude") or best.get("lat")
+            state["assigned_stop_lng"]  = best.get("longitude") or best.get("lng")
+            state["assigned_stop_card_price"] = best.get("card_price") or best.get("diesel_price")
+            state["assigned_stop_net_price"]  = best.get("net_price")
+            state["assignment_time"]    = _utcnow()
+            
+            from telegram_bot import _send_to_truck
+            _send_to_truck(vname, msg)
+            state["alert_sent"] = True
+            return
+
     log.warning(f"  {vname}: EMERGENCY — fuel={fuel:.0f}% range={range_miles:.0f}mi")
 
     # NOTE: We do NOT delete previous messages from driver chat
@@ -1315,7 +1347,6 @@ def _fire_alert(vid, state, data, tank_gal, mpg, state_code=""):
 
     # Find nearest reachable stop within emergency radius
     emergency_radius = min(range_miles * 0.70, 60)
-    route = state.get("qm_route")
     if route:
         best, _ = find_best_stops_on_route(
             lat, lng, route, fuel, speed, tank_gal, mpg,

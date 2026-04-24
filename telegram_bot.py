@@ -337,11 +337,14 @@ def send_refueled_alert(vehicle_name, stop_name, fuel_pct,
             lines.append(f"🗺 [View location]({maps_url})")
 
     _send_to_truck(vehicle_name, "\n".join(lines))
+    # Also notify dispatcher
+    _send_to_dispatcher(f"✅ *{vehicle_name}* refueled at {stop_name} — {fuel_pct:.0f}% fuel")
 
 
 def send_left_yard_low_fuel(vehicle_name, fuel_pct, yard_name):
     text = f"🏠 *LEFT YARD — LOW FUEL*\n🚛 *Truck:* {vehicle_name}\n⛽ *Fuel:* {fuel_pct:.0f}%\n📍 *Departed:* {yard_name}"
     _send_to_truck(vehicle_name, text)
+    _send_to_dispatcher(f"🏠 *{vehicle_name}* left {yard_name} with {fuel_pct:.0f}% fuel.")
 
 
 def register_commands():

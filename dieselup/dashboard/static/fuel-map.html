@@ -1,0 +1,64 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Fuel Map</title><link rel="stylesheet" href="app.css?v=20261002-prices"></head>
+<body data-page="fuel-map.html" data-title="Fuel Map" data-sub="Dated carrier quotes and recorded fueling observations">
+<script src="app.js?v=20261002-prices"></script><script>
+shell();
+content.innerHTML=`<div class="card" id="price-state" role="status" aria-live="polite">Checking carrier prices…</div><div class="card" id="price-imports" style="margin-top:15px"><h3>Price imports</h3><div id="imports-list">Checking uploaded files…</div></div><div class="grid cols-4" id="stats" style="margin-top:15px"></div><div class="card" style="margin-top:15px"><input id="q" aria-label="Search fuel stops" placeholder="Search station, city, state, truck…" style="padding:10px;width:min(100%,330px);box-sizing:border-box;background:var(--bg);border:1px solid var(--line);color:var(--ink);border-radius:8px"><button class="btn primary" id="refresh">Refresh</button></div><div class="grid cols-2" style="margin-top:15px"><div class="card"><div class="eyebrow">Price and fueling layer</div><svg id="map" viewBox="0 0 900 500" style="width:100%;min-height:300px"></svg></div><div class="card"><h3>Stops and fueling observations</h3><div id="events" class="quick-list"></div></div></div>`;
+let stops=[],fuel=[],drivers=[];
+const norm=(lat,lon)=>[80+((Number(lon)+125)/58)*760,430-((Number(lat)-24)/26)*360];
+const brand=s=>(s.network||'').includes('loves')?'Love’s':(s.network||'').includes('pilot')?'Pilot/FJ':'Other';
+function price(s){
+  if(s.price_status==='stale')return 'Price outdated · '+(s.effective_date||'date unknown');
+  if(s.price_status==='future')return 'Price date invalid';
+  if(s.price_status==='missing_date')return 'Supplier price date required';
+  if(s.your_price==null)return 'Price unavailable';
+  const date=s.price_date||s.effective_date;
+  return '$'+Number(s.your_price).toFixed(3)+'/gal'+(date?' · '+(s.price_date_source==='upload_day'?'uploaded ':'quote ')+date:'');
+}
+function observation(e){
+  if(e.stop_event_id==null)return 'No advice comparison';
+  return e.classification==='recommended'?'At advised stop':e.station_name?'Other observed stop':'Station unconfirmed';
+}
+function importIssues(i){
+  let rows=i.row_issues||[];
+  if(typeof rows==='string'){try{rows=JSON.parse(rows)}catch{rows=[]}}
+  if(!Array.isArray(rows)||!rows.length)return '';
+  return `<details><summary>${rows.length} excluded row details</summary>${rows.slice(0,20).map(r=>`<small>Row ${DU.esc(r.row)}: ${DU.esc(r.reason)}</small>`).join('')}${rows.length>20?'<small>Showing the first 20 exclusions.</small>':''}</details>`;
+}
+function priceState(status){
+  const el=document.getElementById('price-state');
+  if(PREVIEW){el.textContent='Preview mode · no live carrier prices loaded';return}
+  const sources=status.network_price_sources||{loves:'Synergy Carriers Inc',pilot_fj:'FTS Plus'};
+  const account=status.account_number||'configured carrier';
+  const mapping='Love’s: '+sources.loves+' · Pilot/Flying J: '+sources.pilot_fj+'. ';
+  const records=status.imports||[];
+  document.getElementById('imports-list').innerHTML=records.length?records.map(i=>
+    `<div class="move"><span><strong>${DU.esc(i.filename)}</strong><small>${DU.esc((i.provider||'Unrecognized format')+' · '+i.status+' · '+(i.effective_date?(i.date_source==='upload_day'?'Upload day ':'Quote date ')+i.effective_date:'Quote date unknown'))}</small><small>${DU.esc(i.reason||'Import accepted')}${i.uploaded_at?' · '+DU.esc(new Date(i.uploaded_at).toLocaleString()):''}</small>${importIssues(i)}</span><b>${i.matched_rows}/${i.row_count} matched · ${i.excluded_rows||0} excluded</b></div>`).join(''):
+    '<p class="muted">No imports recorded since import tracking was enabled. Earlier rejected uploads were not saved.</p>';
+  const feeds=(status.supplier_feeds||[]).filter(f=>f.current_stations>0);
+
+  if(status.status==='current'){
+    el.textContent=mapping+(feeds.length?feeds.map(f=>f.account_number+' · '+f.current_stations+' current station quotes').join(' / '):'Carrier '+account+' · quotes dated '+status.latest_price_date)+'. Undated sheets use the upload day automatically. Prices are estimates of fueling cost. Pilot/Flying J route advice uses FTS Plus prices.';
+  }else{
+    const detail=status.status==='stale'?'Last quote: '+status.latest_price_date+'. ':status.status==='future'?'The quote date is in the future. ':'';
+    el.textContent=mapping+'Current prices unavailable. '+detail+'Upload a current Pilot/Flying J, Love’s or FTS sheet to the bot admin chat. Undated sheets use the upload day automatically. Check the import result below.';
+  }
+  el.className='card '+(status.status==='current'?'lime':'amber');
+}
+function draw(){
+  const search=q.value.toLowerCase();
+  const stopList=stops.filter(x=>(x.station_name+' '+x.city+' '+x.state+' '+brand(x)).toLowerCase().includes(search)).slice(0,120);
+  const fuelList=fuel.filter(x=>(x.truck_unit+' '+x.station_name+' '+x.station_city+' '+x.station_state).toLowerCase().includes(search)).slice(0,40);
+  stats.innerHTML=[['Current carrier quotes',stops.filter(x=>x.price_status==='current'&&x.your_price!=null).length],['Pilot/FJ + Love’s',stops.filter(x=>['pilot_fj','loves'].includes(x.network)).length],['Fueling observations',fuel.length],['Drivers tracked',drivers.length]].map(x=>`<div class="card"><div class="big">${x[1]}</div>${x[0]}</div>`).join('');
+  map.innerHTML=`<rect width="900" height="500" rx="18" fill="#08100c" stroke="#202a23"/><text x="30" y="42" fill="#849087">US station overview · quoted prices require a current carrier sheet</text>${stopList.filter(x=>x.latitude!=null&&x.longitude!=null).map(x=>{const p=norm(x.latitude,x.longitude);return `<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="4" fill="${x.network==='loves'?'#f3b65e':'#54e875'}"><title>${DU.esc(x.station_name)} ${DU.esc(price(x))}</title></circle>`}).join('')}${drivers.filter(d=>d.latitude&&d.longitude).slice(0,120).map(d=>{const p=norm(d.latitude,d.longitude);return `<g><rect x="${p[0]-10}" y="${p[1]-8}" width="20" height="16" rx="4" fill="#172318" stroke="#64c8ff"/><text x="${p[0]+14}" y="${p[1]+4}" fill="#f4f8f5" font-size="10">${DU.esc(d.unit_number)}</text></g>`}).join('')}`;
+  events.innerHTML=[...fuelList.map(e=>`<a class="move" href="truck.html${PREVIEW?'?preview=1&id=':'?id='}${encodeURIComponent(e.truck_unit||'')}"><b>${DU.esc(e.truck_unit)}</b><span><strong>${DU.esc(e.station_name||'Station unconfirmed')}</strong><small>${DU.esc([e.station_address,e.station_city,e.station_state].filter(Boolean).join(', ')||'No confirmed address')} · ${DU.esc(observation(e))} · sensor-estimated gallons</small></span><i>${DU.esc(price(e))}</i></a>`),...stopList.slice(0,40).map(x=>`<button class="btn"><b>${DU.esc(x.station_name)}</b><br><span class="muted">${DU.esc([x.address,x.city,x.state].filter(Boolean).join(', ')||'No address')} · ${DU.esc(brand(x))}</span><br><span class="${x.price_status==='current'?'lime':'muted'}">${DU.esc(price(x))}</span></button>`)].join('')||'<div class="empty">No stops match.</div>';
+}
+async function load(){
+  try{
+    const [stationData,fuelData,driverData,status]=await Promise.all([DU.req('/api/fuel-stops?limit=5000'),DU.req('/api/fuel_events?limit=100'),DU.req('/api/drivers'),DU.req('/api/fuel-prices/status')]);
+    stops=Array.isArray(stationData)?stationData:[];fuel=Array.isArray(fuelData)?fuelData:[];drivers=driverData.drivers||[];
+    priceState(status);draw();
+  }catch(e){document.getElementById('price-state').textContent='Could not refresh prices: '+e.message}
+}
+q.oninput=draw;refresh.onclick=load;poll(load,30000);
+</script></body></html>

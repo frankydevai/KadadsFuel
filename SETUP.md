@@ -1,153 +1,65 @@
-# FleetFuel Bot — Setup Guide
+# Setup
 
-## Step 1 — Create Your Telegram Bot
+## Configuration
 
-1. Open Telegram → search **@BotFather** → send `/newbot`
-2. Follow the steps, pick a name and username
-3. BotFather gives you a token like `7123456789:AAFxxx...` — save this as `TELEGRAM_BOT_TOKEN`
+Create a Python 3.12 environment and install dependencies:
 
-## Step 2 — Get Your Telegram IDs
-
-**Your personal user ID (ADMIN_CHAT_ID):**
-1. Message **@userinfobot** on Telegram
-2. It replies with your ID, e.g. `123456789`
-
-**Your dispatcher group ID (DISPATCHER_GROUP_ID):**
-1. Create a Telegram group (or use existing one)
-2. Add your bot to the group
-3. Message **@userinfobot** inside the group
-4. It replies with the group ID, e.g. `-1009876543210` (starts with -100)
-
-## Step 3 — Railway PostgreSQL
-
-1. Go to [railway.app](https://railway.app) → your project
-2. Click **+ New** → **Database** → **Add PostgreSQL**
-3. Railway automatically sets `DATABASE_URL` — you don't need to copy it manually if deploying on Railway
-
-If running locally, click the PostgreSQL service → **Connect** tab → copy the **DATABASE_URL** and paste it in your `.env` file.
-
-## Step 4 — Create .env File
-
-Create a file called `.env` in your project folder:
-
-```
-SAMSARA_API_TOKEN       = your_samsara_token
-TELEGRAM_BOT_TOKEN      = your_bot_token
-DISPATCHER_GROUP_ID     = -1009876543210
-ADMIN_CHAT_ID           = 123456789
-DATABASE_URL            = postgresql://postgres:password@host:port/railway
-
-YARD_1 = Main Yard:28.0000:-81.0000:0.5
-YARD_2 = Second Yard:29.0000:-82.0000:0.5
+```sh
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+cp .env.example .env
 ```
 
-**How to get yard coordinates:**
-Open Google Maps → right-click your yard location → the lat/lng numbers appear at the top of the menu. The last number `0.5` is the radius in miles.
+Fill the blank required values in `.env` with your private development credentials. Use a separate database and Telegram bot for development. Keep `.env` untracked. The shared configuration validates QuickManage, Samsara, Telegram, and database settings even when the dashboard uses bootstrap mode.
 
-**Optional tuning (defaults are fine to start):**
-```
-FUEL_ALERT_THRESHOLD_PCT = 35
-DEFAULT_TANK_GAL         = 150
-DEFAULT_MPG              = 6.5
-CA_BORDER_FUEL_THRESHOLD = 70
-CA_BORDER_REMINDER_MILES = 150
-```
+Set `PILOT_ACCOUNT_NUMBER` to the actual account identifier. Set `FTS_PRICE_CUSTOMER` and `LOVES_PRICE_CUSTOMER` to the exact expected supplier-customer identities in your files. Do not copy account or driver details into public examples. `VALHALLA_URL` and `VALHALLA_API_SECRET` are required for `BOT_MODE=active`; live planning has no alternate routing-provider fallback.
 
-## Step 5 — Install & Run Locally
+For an exposed dashboard, set a unique random `DASHBOARD_SECRET` and configure `DASHBOARD_ADMIN_EMAIL` and `DASHBOARD_ADMIN_PASSWORD`. Do not rely on source defaults. Run it behind HTTPS; its login session cookie requires a secure connection. Keep dashboard authentication values in service variables, never in frontend files or browser links shared with others.
 
-```bash
-pip install -r requirements.txt
-python main.py
+## Database
+
+For a new, disposable development database only, review `schema.sql` and initialize it explicitly:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f schema.sql
 ```
 
-**Expected startup logs:**
-```
-✅ Database schema ready.
-FleetFuel Bot online. Monitoring fuel levels.
-```
+Export `DATABASE_URL` into that shell before running this command; the command does not read `.env` itself. Both services must use the same Kadads database. The application can seed the bundled price-free station catalog if the station table is empty.
 
-## Step 6 — Register Your Trucks
+For an existing database, back up first and review the required additive SQL separately. Preserve price receipts, quotes, advice history, outcomes, and connection evidence. Leave `RUN_SCHEMA_ON_STARTUP=false` for mature databases. Operators apply reviewed SQL changes explicitly; `BOT_MODE` is not a schema migration command. The supported service modes are `active` for the bot and `bootstrap` for the dashboard.
 
-After first run, connect to your PostgreSQL database and insert your trucks.
-Use **TablePlus**, **DBeaver**, or **pgAdmin** with your DATABASE_URL connection string.
+## Start the services
 
-```sql
-INSERT INTO trucks (vehicle_name, telegram_group_id) VALUES
-  ('Unit 4821', '-1009876543210'),
-  ('Unit 4822', '-1009876543210'),
-  ('Unit 4823', '-1009876543210');
+Run the bot with the environment's `BOT_MODE=active`:
+
+```sh
+python -m dieselup.main
 ```
 
-> `vehicle_name` must exactly match what Samsara shows for that truck.
-> In beta mode all alerts go to the same DISPATCHER_GROUP_ID.
+It starts polling and scheduled checks under a database singleton lock. A restart retains the configured truck scope and messaging mode. Silent mode still permits incoming commands, supplier-file downloads, and read-only Telegram group checks, while blocking output.
 
-**Optional — set known tank size and MPG per truck:**
-```sql
-UPDATE trucks SET tank_capacity_gal = 200, tank_size_known = TRUE WHERE vehicle_name = 'Unit 4821';
-UPDATE trucks SET avg_mpg = 7.2, mpg_known = TRUE WHERE vehicle_name = 'Unit 4821';
+Run the dashboard in a separate process with bootstrap mode:
+
+```sh
+BOT_MODE=bootstrap uvicorn dieselup.dashboard.server:create_app --factory --host 0.0.0.0 --port 8080
 ```
 
-## Step 7 — Upload Fuel Prices
+The dashboard process does not start bot polling or its scheduler. In a deployed dashboard service, set `BOT_MODE=bootstrap` as a service variable. Bot health is available at `/health`; the dashboard also exposes `/health`. A successful HTTP health response alone does not verify every upstream connection or a valid truck trip.
 
-Upload price files manually from your personal chat with the bot.
+## Railway
 
-**First time only — Pilot locations (never changes):**
-1. Send `all_locations.csv` to your private chat with the bot
-2. Bot replies: `✅ Pilot locations cached — 848 stores saved.`
+Use two services built from the repository root and `Dockerfile`:
 
-**Daily — Pilot prices:**
-1. Go to pilotflyingj.com → Fuel Prices → Download
-2. Send `Fuel_Prices.csv` to the bot
-3. Bot replies: `✅ Pilot: loaded 845 stops with prices.`
+| Service | Configuration file | `BOT_MODE` | Start command |
+| --- | --- | --- | --- |
+| Bot | `railway.json` | `active` | `python -m dieselup.main` |
+| Dashboard | `railway.dashboard.json` | `bootstrap` | `uvicorn dieselup.dashboard.server:create_app --factory --host 0.0.0.0 --port ${PORT:-8080}` |
 
-**Daily — Love's prices:**
-1. Go to loves.com → Fuel Prices → Download
-2. Send `LovesSearchResults.xlsx` to the bot
-3. Bot replies: `✅ Love's: loaded 606 stops.`
+Set the dashboard's Railway config file path to `railway.dashboard.json`. Both services need their required private environment variables. Keep `TEST_TRUCK_UNITS=6682,8089,8217`, `AUTO_LINK_ENABLED=false`, and `RUN_SCHEMA_ON_STARTUP=false` on both. A GitHub connection does not change service variables or import private historical data.
 
-## Step 8 — Deploy to Railway
+For an authorized three-driver activation: deploy and verify the recipient guard while `TELEGRAM_MESSAGING_MODE=silent`; verify every selected driver's actual ready group mapping; then change messaging to `live` and verify the same guarded release and restricted scope. Preserve queue history rather than replaying old driver warnings. If deployment is pending, keep the existing silent deployment until the guard is confirmed live.
 
-Create a `railway.toml` in your project root:
-```toml
-[deploy]
-startCommand = "python main.py"
-```
+## Verify a change
 
-Push to GitHub → connect repo in Railway → deploy.
-Add all `.env` variables in Railway → your service → **Variables** tab.
-
----
-
-## What the Alert Looks Like
-
-```
-🟡 LOW FUEL ALERT — Unit 4821
-⛽ Fuel: 32%  ·  📍 58 mph W
-
-🏆 Recommended Fuel Stop
-Pilot Travel Center
-Address: 100 Travel Plaza Dr, Shamrock, TX 79079
-Diesel #2: $3.389/gal
-31.2 mi away
-
-Book ahead to save time.
-
-📍 [map pin]
-```
-
----
-
-## Troubleshooting
-
-**No alerts sending?**
-Check that `vehicle_name` in the trucks table exactly matches the name in Samsara.
-
-**"No diesel stops found"?**
-Upload your price files first — bot has no stops until you send the CSV/XLSX files.
-
-**Prices not updating after upload?**
-Make sure you sent the file to your private chat with the bot, not a group.
-Make sure `ADMIN_CHAT_ID` matches your personal Telegram user ID exactly.
-
-**Bot not responding to uploads?**
-Confirm bot token is correct and `python main.py` is running with no errors.
+Run `python -m pytest -q` with test-only configuration. Before production activation, check exact deployment versions, scheduler freshness, upstream GPS and fuel freshness, assigned loads, forward truck routes, current supplier prices, authenticated dashboard data, and real recipient readiness. Synthetic simulations demonstrate behavior but do not establish actual visits, purchases, or savings.

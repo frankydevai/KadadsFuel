@@ -1,5 +1,18 @@
-requests==2.31.0
-psycopg2-binary==2.9.10
-python-telegram-bot==20.7
-beautifulsoup4==4.12.3
-openpyxl==3.1.2
+python-telegram-bot[job-queue]>=21.0   # Telegram bot framework
+asyncpg>=0.29                          # async Postgres driver
+httpx>=0.27                            # async HTTP for DataTruck and Samsara
+requests>=2.32                         # defensive QuickManage/Samsara clients
+psycopg2-binary>=2.9                   # dashboard and smoke-test DB access
+chardet>=5.2                           # Pilot workbook encoding detection
+pydantic-settings>=2.0                 # env var validation
+APScheduler>=3.10                      # cron jobs for sync + reports
+fastapi>=0.111                         # bot health and operations dashboard
+uvicorn[standard]>=0.30                # Railway web server
+python-dotenv>=1.0                     # loads .env file
+pandas>=2.0                            # XLSX parsing (locations file)
+xlrd>=2.0.1                            # legacy BIFF .xls support
+openpyxl>=3.1                          # .xlsx support (locations file)
+reportlab>=4.0                         # weekly PDF report
+tzdata>=2024.1                         # zoneinfo timezones on Windows
+pgeocode>=0.4                          # offline ZIP centroid fallback for QuickManage stops
+pyvalhalla>=3.7.0                      # self-hosted Valhalla truck routing

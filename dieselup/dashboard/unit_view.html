@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Truck Dashboard — Kadads Fuel</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root{ --green:#16a34a; --red:#dc2626; --amber:#f59e0b; --gray:#9ca3af; --bg:#0f172a; --card:#1e293b; --ink:#e2e8f0; --muted:#94a3b8; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--ink);padding:16px}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
+  h1{font-size:18px}
+  .muted{color:var(--muted);font-size:12px}
+  .toggle button{background:var(--card);color:var(--ink);border:1px solid #334155;padding:6px 12px;cursor:pointer;font-size:13px}
+  .toggle button.active{background:#2563eb;border-color:#2563eb}
+  .toggle button:first-child{border-radius:6px 0 0 6px}
+  .toggle button:last-child{border-radius:0 6px 6px 0}
+  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
+  .stat{background:var(--card);border-radius:10px;padding:12px}
+  .stat .v{font-size:20px;font-weight:700}
+  .stat .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:2px}
+  .stat.green .v{color:var(--green)} .stat.red .v{color:var(--red)}
+  .bar{height:8px;background:#334155;border-radius:4px;margin-top:6px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:var(--green)}
+  .grid{display:grid;grid-template-columns:300px 1fr;gap:14px}
+  .col .card{background:var(--card);border-radius:10px;padding:14px;margin-bottom:12px}
+  .card h3{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+  .row{display:flex;justify-content:space-between;font-size:13px;padding:3px 0}
+  .row span:first-child{color:var(--muted)}
+  #map{height:640px;border-radius:10px}
+  .legend{background:var(--card);border-radius:10px;padding:10px 14px;margin-top:10px;font-size:12px;display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}
+  .pin{font-weight:700;font-size:11px;color:#fff;padding:2px 5px;border-radius:5px;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  #err{color:var(--red);padding:20px}
+  #approx{display:none;background:#78350f;color:#fde68a;border:1px solid #b45309;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <div><h1 id="title">Unit Dashboard</h1><div class="muted" id="sub"></div></div>
+  <div class="toggle">
+    <button id="btn-discount" class="active" onclick="setMode('discount')">Discount</button>
+    <button id="btn-retail" onclick="setMode('retail')">Retail</button>
+  </div>
+</header>
+
+<div id="approx">⚠️ Approximate routing — straight-line corridor &amp; distances (Valhalla not enabled). Set <code>VALHALLA_URL</code> for truck-legal road routing.</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="grid">
+  <div class="col">
+    <div class="card" id="card-truck"></div>
+    <div class="card" id="card-load"></div>
+    <div class="card" id="card-station"></div>
+  </div>
+  <div>
+    <div id="map"></div>
+    <div class="legend" id="legend">
+      <b>ROUTE &amp; STATION MAP</b>
+      <span><i class="dot" style="background:var(--green)"></i>best</span>
+      <span><i class="dot" style="background:var(--amber)"></i>valid</span>
+      <span><i class="dot" style="background:var(--red)"></i>rejected</span>
+      <span><i class="dot" style="background:var(--gray)"></i>out of range</span>
+      <span id="footer" class="muted"></span>
+    </div>
+  </div>
+</div>
+<div id="err"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const UNIT = location.pathname.split('/').filter(Boolean).pop();
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const TIER_COLOR = { best:'#16a34a', valid:'#f59e0b', rejected:'#dc2626', out_of_range:'#9ca3af' };
+let mode = 'discount', map, layer;
+
+// Decode an encoded polyline at PRECISION 6 (Valhalla). precision 5 would scatter the line.
+function decodePolyline(str, precision = 6){
+  let index=0,lat=0,lng=0,coords=[],factor=Math.pow(10,precision);
+  while(index<str.length){
+    let shift=0,result=0,b;
+    do{ b=str.charCodeAt(index++)-63; result|=(b&0x1f)<<shift; shift+=5; }while(b>=0x20);
+    lat += (result&1)?~(result>>1):(result>>1);
+    shift=0;result=0;
+    do{ b=str.charCodeAt(index++)-63; result|=(b&0x1f)<<shift; shift+=5; }while(b>=0x20);
+    lng += (result&1)?~(result>>1):(result>>1);
+    coords.push([lat/factor,lng/factor]);
+  }
+  return coords;
+}
+const money = v => v==null ? '—' : '$'+Number(v).toFixed(3);
+const num = (v,d=0) => v==null ? '—' : Number(v).toFixed(d);
+
+function setMode(m){
+  mode=m;
+  document.getElementById('btn-discount').classList.toggle('active',m==='discount');
+  document.getElementById('btn-retail').classList.toggle('active',m==='retail');
+  load();
+}
+
+function statCard(v,l,cls=''){ return `<div class="stat ${cls}"><div class="v">${v}</div><div class="l">${l}</div></div>`; }
+
+function render(d){
+  document.getElementById('err').textContent='';
+  document.getElementById('title').textContent = `Unit #${d.unit} · ${d.current_station||'—'} · ${d.date}`;
+  document.getElementById('sub').textContent = `price mode: ${d.price_mode}`+(d.route&&d.route.approximate?' · approximate routing':'');
+  document.getElementById('approx').style.display = (d.route&&d.route.approximate) ? 'block' : 'none';
+  const s=d.stats;
+  document.getElementById('stats').innerHTML =
+    statCard(money(s.contracted_per_gal),'Contracted $/gal','green') +
+    statCard(money(s.route_avg_per_gal),'Route avg $/gal','red') +
+    statCard(money(s.savings_per_gal),'Savings / gal','green') +
+    statCard('$'+num(s.total_savings,2),'Total savings') +
+    statCard(num(s.fuel_at_send_pct)+'%','Fuel at send') +
+    statCard(num(s.miles_to_stop,1),'Miles to stop');
+  // progress bar under fuel card
+  const fuelCard=document.getElementById('stats').children[4];
+  fuelCard.innerHTML += `<div class="bar"><i style="width:${Math.min(100,s.fuel_at_send_pct||0)}%"></i></div>`;
+
+  const t=d.truck;
+  document.getElementById('card-truck').innerHTML = `<h3>Truck</h3>`+
+    row('Unit',t.unit)+row('Driver',t.driver||'—')+row('Tank',num(t.tank_size)+' gal')+
+    row('Avg MPG',num(t.avg_mpg,1))+row('Fuel at send',num(t.fuel_at_send_pct)+'%');
+  const l=d.load;
+  document.getElementById('card-load').innerHTML = `<h3>Load</h3>`+
+    row('Load #',l.load_id||'—')+row('Miles',num(l.miles))+
+    row('Pickup',(l.pickup&&l.pickup.address)||'—')+row('· time',(l.pickup&&l.pickup.time)||'—')+
+    row('Delivery',(l.delivery&&l.delivery.address)||'—')+row('· time',(l.delivery&&l.delivery.time)||'—');
+  const st=d.station;
+  document.getElementById('card-station').innerHTML = `<h3>Recommended Station</h3>`+
+    (st ? row('Name',st.name||'—')+row('City',`${st.city||''}, ${st.state||''}`)+
+          row('Your $/gal',money(st.your_price))+row('Retail $/gal',money(st.retail_price))+
+          row('IFTA net',money(st.ifta_adjusted))+row('Miles to stop',num(st.miles_to_stop,1))
+        : '<div class="muted">No usable stop in corridor.</div>');
+
+  drawMap(d);
+  const inRange=d.counts.in_range, off=d.counts.off_corridor;
+  document.getElementById('footer').textContent = `${inRange} other stations in range · ${off} off corridor`;
+}
+function row(k,v){ return `<div class="row"><span>${k}</span><span>${v}</span></div>`; }
+
+function drawMap(d){
+  if(!map){ map=L.map('map'); L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    {attribution:'© OpenStreetMap © CARTO',maxZoom:19}).addTo(map); }
+  if(layer) layer.remove();
+  layer=L.layerGroup().addTo(map);
+  const pts = d.route.shape ? decodePolyline(d.route.shape,6) : [];
+  if(pts.length){
+    const approx = d.route && d.route.approximate;
+    L.polyline(pts,{color:approx?'#f59e0b':'#2563eb',weight:4,opacity:.85,
+                    dashArray:approx?'8,8':null}).addTo(layer);
+  }
+  let bounds=[];
+  (d.stations||[]).forEach(s=>{
+    if(s.lat==null||s.lon==null) return;
+    const c=TIER_COLOR[s.tier]||'#9ca3af';
+    const icon=L.divIcon({className:'',html:`<span class="pin" style="background:${c}">${s.label}</span>`});
+    L.marker([s.lat,s.lon],{icon}).addTo(layer).bindPopup(`<b>${s.name||''}</b><br>${s.tier} · ${s.label}<br>${s.miles_to_stop!=null?s.miles_to_stop+' mi':''}`);
+    bounds.push([s.lat,s.lon]);
+  });
+  // truck current position
+  if(d.truck_pos){
+    const tp=[d.truck_pos.lat,d.truck_pos.lng];
+    const ticon=L.divIcon({className:'',html:`<span class="pin" style="background:#2563eb">🚛</span>`});
+    L.marker(tp,{icon:ticon}).addTo(layer).bindPopup('Truck #'+d.unit+' (current GPS)');
+    bounds.push(tp);
+  }
+  pts.forEach(p=>bounds.push(p));
+  if(bounds.length) map.fitBounds(bounds,{padding:[30,30]});
+  else map.setView([39,-96],4);
+}
+
+async function load(){
+  try{
+    const u=`/api/unit/${encodeURIComponent(UNIT)}/dashboard?price=${mode}`+(TOKEN?`&token=${encodeURIComponent(TOKEN)}`:'');
+    const r=await fetch(u);
+    if(!r.ok){ const j=await r.json().catch(()=>({})); throw new Error(j.detail||j.error||('HTTP '+r.status)); }
+    render(await r.json());
+  }catch(e){ document.getElementById('err').textContent='Error: '+e.message; }
+}
+load();
+</script>
+</body>
+</html>

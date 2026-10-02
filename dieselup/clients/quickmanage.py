@@ -1,0 +1,430 @@
+"""Read-only QuickManage TMS client normalized to DieselUp's order contract.
+
+Only documented read endpoints are used: token acquisition and `/x/*/search`.
+The rest of the bot consumes the same normalized order shape regardless of TMS,
+so the shipper-to-delivery planner and compliance engine remain provider-neutral.
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+import time
+from typing import Any, AsyncIterator
+
+import httpx
+
+from dieselup.circuit_breaker import CircuitOpenError, quickmanage_breaker
+from dieselup.config import settings
+from dieselup.core.trip_context import completion_state
+
+
+class QuickManageError(RuntimeError):
+    """Raised when QuickManage auth, transport, or payload validation fails."""
+
+
+class _RetryableResponse(RuntimeError):
+    """Internal wrapper that lets 429/5xx responses count toward the breaker."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        super().__init__(f"QuickManage returned {response.status_code}")
+
+
+class QuickManageClient:
+    _MAX_RETRIES = 3
+    _RATE_LIMIT_SECONDS = 3.0
+    _shared_next_allowed_at = 0.0
+    _shared_gate_lock: asyncio.Lock | None = None
+
+    def __init__(self, *, timeout: float = 30.0) -> None:
+        self._client = httpx.AsyncClient(
+            base_url=settings.QUICKMANAGE_BASE_URL,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+        self._token: str | None = None
+        self._token_expiry: datetime | None = None
+        self._truck_units: dict[str, str | None] = {}
+
+    async def __aenter__(self) -> "QuickManageClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def iter_orders(
+        self,
+        filters: dict[str, Any] | list[dict[str, Any]] | None = None,
+        *,
+        max_pages: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        page = 0
+        seen_trip_ids: set[str] = set()
+        while True:
+            payload = await self._post(
+                "/x/trips/search",
+                {
+                    "query": "",
+                    "filters": filters if isinstance(filters, list) else [],
+                    "page": page,
+                    "page_size": 100,
+                },
+            )
+            data = payload.get("data") if isinstance(payload, dict) else None
+            page_meta = data if isinstance(data, dict) else payload
+            items = _extract_items(payload)
+            if not isinstance(items, list):
+                raise QuickManageError("QuickManage trips search returned invalid items")
+            if not items:
+                return
+            new_items: list[dict[str, Any]] = []
+            for item in items:
+                trip_id = _clean(item.get("id"))
+                if trip_id and trip_id in seen_trip_ids:
+                    continue
+                if trip_id:
+                    seen_trip_ids.add(trip_id)
+                new_items.append(item)
+            # Observed QuickManage deployments can ignore the page number and
+            # return the first page forever without count metadata. Stop as
+            # soon as a page contributes no unseen trip IDs.
+            if not new_items:
+                raise QuickManageError("Trip search repeated a page; complete assignment coverage is unverified")
+            for item in new_items:
+                yield await self._normalize_trip(item)
+            count = _as_int(page_meta.get("count")) if isinstance(page_meta, dict) else None
+            page_size = (
+                _as_int(page_meta.get("page_size")) if isinstance(page_meta, dict) else None
+            ) or len(items)
+            if count is not None and (page + 1) * page_size >= count:
+                return
+            if max_pages is not None and page + 1 >= max_pages:
+                raise QuickManageError("Trip search reached the page limit before proving completion")
+            page += 1
+
+    async def get_order(self, order_id: int | str) -> dict[str, Any]:
+        payload = await self._post(
+            "/x/trips/search",
+            {
+                "query": "",
+                "filters": [{"field": "id", "operator": "eq", "value": str(order_id)}],
+                "page": 0,
+                "page_size": 1,
+            },
+        )
+        items = _extract_items(payload)
+        matching = [item for item in items if isinstance(item, dict) and str(item.get("id")) == str(order_id)]
+        if len(matching) != 1:
+            raise QuickManageError(f"QuickManage trip {order_id!r} was not found")
+        return await self._normalize_trip(matching[0])
+
+    async def _normalize_trip(self, trip: dict[str, Any]) -> dict[str, Any]:
+        raw_stops = trip.get("stops") or []
+        stops: list[dict[str, Any]] = []
+        trip_truck = trip.get("truck") if isinstance(trip.get("truck"), dict) else {}
+        truck_unit: str | None = _clean(
+            trip.get("truck_number")
+            or trip.get("tractor_unit")
+            or trip_truck.get("unit_number")
+            or trip_truck.get("unit")
+            or trip_truck.get("number")
+        )
+        trip_driver = trip.get("driver") if isinstance(trip.get("driver"), dict) else {}
+        driver_name: str | None = _person_name(trip_driver) if trip_driver else None
+
+        assigned_units: set[str] = set()
+        for index, raw in enumerate(raw_stops):
+            if not isinstance(raw, dict):
+                continue
+            assigned_truck = raw.get("assigned_truck") or {}
+            if isinstance(assigned_truck, dict):
+                truck_unit = truck_unit or _clean(
+                    assigned_truck.get("unit_number")
+                    or assigned_truck.get("unit")
+                    or assigned_truck.get("number")
+                )
+            truck_id = _clean(
+                raw.get("assigned_truck_id")
+                or (assigned_truck.get("id") if isinstance(assigned_truck, dict) else None)
+            )
+            if not truck_unit and truck_id:
+                truck_unit = await self._truck_unit(truck_id)
+            stop_unit = _clean(assigned_truck.get("unit_number") or assigned_truck.get("unit") or assigned_truck.get("number"))
+            if stop_unit:
+                assigned_units.add(stop_unit.lstrip("0") or stop_unit)
+
+            assigned_driver = _first_dict(raw.get("assigned_driver"), raw.get("assigned_drivers"))
+            if isinstance(assigned_driver, dict):
+                driver_name = driver_name or _person_name(assigned_driver)
+
+            pickup = bool(raw.get("pickup", raw.get("is_pickup", index == 0)))
+            address = raw.get("address") if isinstance(raw.get("address"), dict) else {}
+            lat = _as_float(raw.get("lat", raw.get("latitude")))
+            lng = _as_float(raw.get("lng", raw.get("longitude")))
+            coordinate_source = "exact"
+            if lat is None or lng is None:
+                coordinate_source = "missing"
+                coords = _geocode_zip(address.get("zip_code"))
+                if coords is not None:
+                    lat, lng = coords
+                    coordinate_source = "zip_centroid"
+            stops.append(
+                {
+                    "id": _clean(raw.get("id")) or str(index),
+                    "sequence": index,
+                    "type": "pickup" if pickup else "delivery",
+                    "pickup": pickup,
+                    "completed": completion_state(raw),
+                    "coordinate_source": coordinate_source,
+                    "address_line_1": _clean(address.get("address_line_1")),
+                    "assigned_truck_unit": stop_unit,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "city": _clean(address.get("city") or raw.get("city")),
+                    "state": _clean(address.get("state") or raw.get("state")),
+                    "zip_code": _clean(address.get("zip_code") or raw.get("zip_code")),
+                    "company_name": _clean(raw.get("company_name")),
+                }
+            )
+
+        status = str(trip.get("status") or "").strip().lower()
+        status = {
+            "upcoming": "dispatched",
+            "dispatching": "dispatched",
+            "completed": "completed",
+            "cancelled": "cancelled",
+            "canceled": "cancelled",
+        }.get(status, status)
+        trip_id = _clean(trip.get("id"))
+        if not trip_id:
+            raise QuickManageError("QuickManage trip is missing id")
+
+        return {
+            "id": trip_id,
+            "tms_order_id": trip_id,
+            "load_number": _clean(trip.get("ref_number") or trip.get("trip_num") or trip_id),
+            "load_id": _clean(trip.get("ref_number") or trip_id),
+            "status": status,
+            "raw_status": str(trip.get("status") or "").strip().lower(),
+            "assignment_conflict": len(assigned_units | ({truck_unit.lstrip("0") or truck_unit} if truck_unit else set())) > 1,
+            "truck_unit_number": truck_unit,
+            "driver_full_name": driver_name,
+            "stops": stops,
+            "tms_provider": "quickmanage",
+        }
+
+    async def _truck_unit(self, truck_id: str) -> str | None:
+        if truck_id in self._truck_units:
+            return self._truck_units[truck_id]
+        payload = await self._post(
+            "/x/trucks/search",
+            {
+                "query": "",
+                "filters": [{"field": "id", "operator": "eq", "value": truck_id}],
+                "page": 0,
+                "page_size": 1,
+            },
+        )
+        items = _extract_items(payload)
+        items = [item for item in items if isinstance(item, dict) and str(item.get("id")) == truck_id]
+        unit = None
+        if len(items) == 1:
+            unit = _clean(
+                items[0].get("unit_number")
+                or items[0].get("truck_unit_number")
+                or items[0].get("unit")
+                or items[0].get("number")
+            )
+        self._truck_units[truck_id] = unit
+        return unit
+
+    async def _ensure_token(self) -> str:
+        now = datetime.now(timezone.utc)
+        if self._token and self._token_expiry and now + timedelta(seconds=60) < self._token_expiry:
+            return self._token
+        try:
+            response = await self._request(
+                "/auth/token",
+                json={
+                    "client_id": settings.QUICKMANAGE_CLIENT_ID,
+                    "client_secret": settings.QUICKMANAGE_CLIENT_SECRET,
+                },
+            )
+            if not response.is_success:
+                response = await self._request(
+                    "/auth/token",
+                    data={
+                        "client_id": settings.QUICKMANAGE_CLIENT_ID,
+                        "client_secret": settings.QUICKMANAGE_CLIENT_SECRET,
+                    },
+                )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+            token = data.get("access_token") or data.get("token")
+            if not token:
+                raise KeyError("access_token")
+            self._token = str(token)
+            raw_expiry = str(data.get("expire") or "")
+            self._token_expiry = (
+                datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+                if raw_expiry
+                else now + timedelta(seconds=_as_int(data.get("expires_in")) or 3600)
+            )
+            return self._token
+        except CircuitOpenError as exc:
+            raise QuickManageError("QuickManage circuit is open; retry after cooldown") from exc
+        except Exception as exc:  # http and malformed auth payloads share one safe error
+            raise QuickManageError(f"QuickManage authentication failed: {exc}") from exc
+
+    async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        backoff = 1.0
+        for attempt in range(self._MAX_RETRIES + 1):
+            token = await self._ensure_token()
+            try:
+                await self._rate_limit()
+                response = await self._request(
+                    path,
+                    json=body,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except _RetryableResponse as exc:
+                response = exc.response
+                if attempt >= self._MAX_RETRIES:
+                    raise QuickManageError(
+                        f"QuickManage returned {response.status_code} for {path} after retries"
+                    ) from exc
+                retry_after = response.headers.get("Retry-After")
+                await asyncio.sleep(float(retry_after) if retry_after else backoff)
+                backoff *= 2
+                continue
+            except CircuitOpenError as exc:
+                raise QuickManageError("QuickManage circuit is open; retry after cooldown") from exc
+            except httpx.HTTPError as exc:
+                if attempt >= self._MAX_RETRIES:
+                    raise QuickManageError(f"QuickManage request failed: {exc}") from exc
+                await asyncio.sleep(backoff)
+                backoff *= 2
+                continue
+            if response.status_code == 401 and attempt == 0:
+                self._token = None
+                self._token_expiry = None
+                continue
+            if response.status_code >= 400:
+                raise QuickManageError(
+                    f"QuickManage returned {response.status_code} for {path}: "
+                    f"{response.text[:200]}"
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise QuickManageError(f"QuickManage response for {path} was not JSON") from exc
+            if not isinstance(payload, dict):
+                raise QuickManageError(f"QuickManage response for {path} had invalid shape")
+            return payload
+        raise QuickManageError(f"QuickManage request failed for {path}")
+
+    async def _request(self, path: str, **kwargs: Any) -> httpx.Response:
+        async def _send() -> httpx.Response:
+            response = await self._client.post(path, **kwargs)
+            if response.status_code == 429 or response.status_code >= 500:
+                raise _RetryableResponse(response)
+            return response
+
+        return await quickmanage_breaker.call(_send)
+
+    async def _rate_limit(self) -> None:
+        cls = type(self)
+        if cls._shared_gate_lock is None:
+            cls._shared_gate_lock = asyncio.Lock()
+        async with cls._shared_gate_lock:
+            wait = cls._shared_next_allowed_at - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            cls._shared_next_allowed_at = time.monotonic() + cls._RATE_LIMIT_SECONDS
+
+
+def _clean(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _person_name(value: dict[str, Any]) -> str | None:
+    full = _clean(value.get("full_name") or value.get("name"))
+    if full:
+        return full
+    return _clean(" ".join(
+        str(value.get(key) or "").strip() for key in ("first_name", "last_name")
+    ))
+
+
+def _first_dict(*values: Any) -> dict[str, Any]:
+    """Return a dict from either a single object or the first dict in a list."""
+    for value in values:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    return item
+    return {}
+
+
+def _extract_items(payload: Any) -> list[dict[str, Any]]:
+    """Normalize every documented/observed QuickManage search envelope."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("items", "trips", "results"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    for key in ("items", "trips", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _geocode_zip(value: Any) -> tuple[float, float] | None:
+    """Best-effort offline ZIP centroid for QuickManage stops missing lat/lng."""
+    text = _clean(value)
+    if not text:
+        return None
+    code = text.split("-", 1)[0][:5]
+    if not code.isdigit():
+        return None
+    try:
+        import pgeocode
+
+        result = pgeocode.Nominatim("us").query_postal_code(code)
+        lat, lng = float(result.latitude), float(result.longitude)
+        if lat != lat or lng != lng:  # NaN without importing math
+            return None
+        return lat, lng
+    except Exception:
+        return None

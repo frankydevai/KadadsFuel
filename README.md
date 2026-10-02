@@ -1,114 +1,68 @@
-# DieselUp — AI Fuel Optimization for Trucking Fleets
+# Kadads Fuel
 
-Real-time Telegram bot that monitors truck fuel levels via Samsara GPS,
-pulls active loads from QuickManage TMS, and sends drivers the cheapest
-fuel stop on their exact route — ranked by true net cost after IFTA
-quarterly settlement.
+Kadads combines a Telegram fuel-advice bot with an authenticated operations dashboard. Both services use the `dieselup` Python package and the same PostgreSQL database. QuickManage supplies assigned loads, Samsara supplies truck location and fuel observations, and a private authenticated Valhalla server supplies truck routes.
 
-## How It Works
+## What it does
 
-1. Samsara GPS detects truck fuel below 35%
-2. Bot pulls active load from QuickManage (shipper → all stops → receiver)
-3. Searches all Pilot/Flying J, Love's, TA/Petro stops along the route corridor
-4. Ranks every stop by: `card_price + (home_state_rate - stop_state_rate)`
-5. Sends single cheapest stop to driver's Telegram group instantly
-6. Re-alerts every 20 min if driver doesn't act
+- Matches the assigned truck to its actual load and remaining trip before planning from its current location.
+- Evaluates forward stops using truck routing, fuel reserves, current contracted prices, detour cost, and stop cost. Missing or stale evidence can suppress advice.
+- Records advice, delivery attempts, observed stops, missed stops, and unplanned fueling for dashboard review. A stop without a supported fuel increase is not automatically treated as a fuel purchase.
+- Shows driver connections, truck details, fuel prices, advice history, and evidence-based outcomes. Cost differences are estimates unless supported by reconciled purchase evidence; unknown prices do not become invented savings.
+- Imports supplier spreadsheets with source, pricing-date, matching, and excluded-row history.
 
-## Files
+## Repository layout
 
-| File | Purpose |
-|---|---|
-| `main.py` | Main polling loop + background threads |
-| `state_machine.py` | Core alert logic per truck |
-| `telegram_bot.py` | All Telegram commands + alerts |
-| `truck_stop_finder.py` | IFTA-aware stop search algorithm |
-| `samsara_client.py` | GPS + MPG + idle from Samsara API |
-| `quickmanage_client.py` | QuickManage TMS integration |
-| `ifta.py` | IFTA rates all 48 states + auto-scraper |
-| `route_planner.py` | Full A→B route fuel planning |
-| `efs_importer.py` | EFS fuel card CSV importer |
-| `database.py` | PostgreSQL schema + all queries |
-| `config.py` | All environment variables |
-| `california.py` | CA border reminder logic |
-| `price_updater.py` | Pilot CSV + Love's XLSX parser |
-| `route_reader.py` | QM Notifier message parser |
-| `yard_geofence.py` | Yard detection |
+| Path | Purpose |
+| --- | --- |
+| `dieselup/main.py` | Bot startup, Telegram polling, scheduler, and singleton leadership |
+| `dieselup/core/` | Trip validation, planning, compliance, outcomes, and processing scope |
+| `dieselup/ingestion/` | QuickManage, Samsara, and supplier-price ingestion |
+| `dieselup/bot/` | Commands, delivery, and recipient restrictions |
+| `dieselup/dashboard/` | FastAPI dashboard, API, and frontend assets |
+| `schema.sql` | Database schema for reviewed initialization and migrations |
+| `tests/` | Isolated regression tests using synthetic or mocked evidence |
+| `data/pilot_locations.csv` | Price-free station catalog |
+| `railway.json` | Bot service configuration |
+| `railway.dashboard.json` | Dashboard service configuration |
 
-## Railway Environment Variables
+## Run and test
 
-```
-SAMSARA_API_TOKEN        Your Samsara API token (Read Vehicles + Fuel & Energy)
-TELEGRAM_BOT_TOKEN       Your Telegram bot token from @BotFather
-DISPATCHER_GROUP_ID      Telegram group ID for dispatcher
-ADMIN_CHAT_ID            Your personal Telegram chat ID (owner reports here)
-QM_CLIENT_ID             QuickManage OAuth2 client ID
-QM_CLIENT_SECRET         QuickManage OAuth2 client secret
-IFTA_HOME_STATE          Fleet base state e.g. FL, IN, TX, OH
-DATABASE_URL             PostgreSQL connection string (auto-set by Railway)
-DEFAULT_TANK_GAL         Tank size in gallons (default: 150)
-DEFAULT_MPG              Fallback MPG if Samsara data missing (default: 6.5)
-CA_BORDER_FUEL_THRESHOLD Fuel % threshold for CA border reminder (default: 70)
-YARD_1                   Yard geofence: Name:lat:lng:radius_miles
+Use Python 3.12. Follow [SETUP.md](SETUP.md) to configure credentials, initialize a separate development database, and start each service.
+
+```sh
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
-## Setup
+Run tests with private production variables unset and without a populated production `.env` file. The test fixtures supply isolated fake credentials; their delivery simulations do not authorize sending production Telegram messages.
 
-1. Deploy to Railway — connect GitHub repo
-2. Add PostgreSQL plugin in Railway
-3. Set all environment variables above
-4. Upload fuel prices:
-   - Send EFS CSV file to bot in admin Telegram chat
-   - Bot auto-detects format and imports all stops
-5. Add bot to each driver's Telegram group
-   - Bot auto-assigns truck by matching number in group name
-   - Group name format: `1769 (32%) Driver Name` or `Truck 0792 Name`
-6. Run `/checkall` in admin chat to verify trucks are showing
+## Test-period controls
 
-## Telegram Commands
+The repository includes the selected-driver messaging guard. Keep these settings for the current three-truck trial:
 
-```
-/findstop <truck>      Find cheapest stops within range
-/route <truck>         Show active QM load
-/planroute <truck>     Full A→B IFTA fuel plan
-/newalert <truck>      Force fresh alert now
-/stopvisits <truck>    Fuel stop visit history
-/compliance [truck]    Stop compliance report
-/truckstats [truck]    MPG + idle from Samsara
-/checkall              Instant fleet fuel status
-/routelist             All trucks with active loads
-/findload <trip#>      Search QM by trip number
-/dbstats               Fuel stop DB breakdown
-/addtruck /setgroup /listtruck /removetruck
+```dotenv
+TEST_TRUCK_UNITS=6682,8089,8217
+AUTO_LINK_ENABLED=false
+TELEGRAM_MESSAGING_MODE=silent
+RUN_SCHEMA_ON_STARTUP=false
 ```
 
-## Alert Format
+Activation requires deploying and verifying the recipient guard first, then checking every selected driver's actual group connection. In restricted live mode, only a unique, ready, unpaused driver connection for an allowed truck can receive output. Admin, dispatch, duplicate, conflicting, unmapped, and unverifiable recipients are blocked. Empty `TEST_TRUCK_UNITS` expands processing to the fleet; preserve the explicit list during this trial.
 
-```
-🟡 Low Fuel Alert — Truck 1769
-⛽ Fuel: 32%   🧭 63 mph ENE
-📍 Truck Location
-🌐 35.15234, -90.14352
+This repository includes newer recipient restrictions that may be pending deployment. Keep the existing silent production configuration until the exact guarded release is verified. Publishing this repository does not deploy it or enable messaging.
 
-⛽ Pilot/J West Memphis #607
-📌 3400 Service Loop Rd, West Memphis, AR
-🛣 18.4 mi ahead
-💰 Retail:  $5.40/gal
-💳 Card:    $4.32/gal  (save $1.08/gal)
-📋 IFTA:    +$0.115/gal owed → true cost $4.435
-💵 Fill 102 gal → Pump: $441 · After IFTA: $452
-🗺 Open in Google Maps
-```
+## Fuel-price policy
 
-## IFTA Logic
+**Synergy Carriers sheets supply Love's prices. FTS Plus sheets supply Pilot/Flying J prices.** A supplier/account check and exact catalog matching keep networks separate. Configuring FTS for Pilot/Flying J prevents fallback to a different native Pilot account.
 
-- Home state set via `IFTA_HOME_STATE` env var — different per customer
-- Net cost = `card_price + (home_state_rate - stop_state_rate)`
-- Q1 2026 rates hardcoded for all 48 states
-- Auto-scraped quarterly from official Colorado IFTA source
-- Surcharge states handled: KY, VA, NY, NM, IN
+Supplier dates and explicit date captions are retained. An undated upload automatically uses its original upload day in `America/New_York`, recorded as `upload_day`; a date caption is not required. Price age, invalid values, unsupported brands, and station matching are still checked. Valid Love's rows can import while invalid rows retain exclusion reasons. Historical receipts and quotes are preserved.
 
-## Weekly Owner Report
+Love's route recommendations remain held pending reliable station-identity integration. Uploaded prices must be checked against accepted import records before being described as current. This remains a controlled trial, with no claim of industry readiness or verified driver savings.
 
-Sent every Monday 08:00 UTC to `ADMIN_CHAT_ID` only — never to drivers.
-Shows: total savings, IFTA settlement estimate, fleet MPG,
-idle hours, stop compliance rate, fuel by state breakdown.
+## Deployment and data
+
+The bot and dashboard are separate Railway services sharing this repository and database. Existing services currently use direct uploads; connecting GitHub is an optional later deployment configuration change. Choose `railway.json` for the bot and `railway.dashboard.json` for the dashboard, using the repository root for each build.
+
+Keep credentials, driver rosters, group identifiers, database exports, and private verification reports outside Git. Mature databases must keep startup schema execution disabled. Review and apply additive changes explicitly, with backups and verification; never reset production to make a deployment work.

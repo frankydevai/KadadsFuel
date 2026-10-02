@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["python313", "postgresql"]
+nixPkgs = ["python312", "python312Packages.pip"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "python main.py"
+cmd = "python -m dieselup.main"

@@ -199,13 +199,15 @@ def start_health_server() -> None:
     listening on PORT.
 
     PORT is read from env (Railway sets this). If unset, defaults to 8080.
+    Set HEALTH_HOST=127.0.0.1 to bind local runs to the Mac only.
     If port can't be bound, the server is skipped (do not crash the bot).
     """
     port = int(os.getenv("PORT", "8080"))
+    host = os.getenv("HEALTH_HOST", "0.0.0.0")
 
     def _run() -> None:
         try:
-            server = _ThreadedServer(("0.0.0.0", port), _Handler)
+            server = _ThreadedServer((host, port), _Handler)
         except OSError as exc:
             log.warning("health_server: could not bind PORT=%d: %s", port, exc)
             return

@@ -137,7 +137,7 @@ if(!r.ok){err.textContent='Wrong email or password';return} location.href='/'}
             "kadads_dashboard_token",
             secret,
             httponly=True,
-            secure=True,
+            secure=settings.DASHBOARD_COOKIE_SECURE,
             samesite="lax",
             max_age=60 * 60 * 24 * 30,
         )

@@ -17,6 +17,8 @@ Set `PILOT_ACCOUNT_NUMBER` to the actual account identifier. Set `FTS_PRICE_CUST
 
 For an exposed dashboard, set a unique random `DASHBOARD_SECRET` and configure `DASHBOARD_ADMIN_EMAIL` and `DASHBOARD_ADMIN_PASSWORD`. Do not rely on source defaults. Run it behind HTTPS; its login session cookie requires a secure connection. Keep dashboard authentication values in service variables, never in frontend files or browser links shared with others.
 
+For a dashboard running only on this Mac over HTTP, bind it to `127.0.0.1` and explicitly set `DASHBOARD_COOKIE_SECURE=false` in the private local configuration. This allows the login session at `http://127.0.0.1:8080`. Keep the default `DASHBOARD_COOKIE_SECURE=true` for HTTPS deployments.
+
 ## Database
 
 For a new, disposable development database only, review `schema.sql` and initialize it explicitly:

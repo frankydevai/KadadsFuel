@@ -14,6 +14,7 @@ def auth_client(monkeypatch):
     monkeypatch.setattr(server.settings, "DASHBOARD_SECRET", "isolated-dashboard-secret")
     monkeypatch.setattr(server.settings, "DASHBOARD_ADMIN_EMAIL", "")
     monkeypatch.setattr(server.settings, "DASHBOARD_ADMIN_PASSWORD", "")
+    monkeypatch.setattr(server.settings, "DASHBOARD_COOKIE_SECURE", True)
     fake_fetch = AsyncMock(return_value=[{"truck_unit": "test-truck"}])
     monkeypatch.setattr(server, "_fleet_data", fake_fetch)
     monkeypatch.setattr(
@@ -142,6 +143,31 @@ def test_login_uses_credentials_loaded_from_dotenv(auth_client, monkeypatch, tmp
     assert response.status_code == 200
     assert client.get("/api/fleet").status_code == 200
     fake_fetch.assert_awaited_once()
+    server.get_pool.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cookie_secure, expected_status", [(True, 401), (False, 200)])
+def test_http_login_requires_explicit_local_cookie_override(
+    auth_client, monkeypatch, cookie_secure, expected_status
+):
+    _, fake_fetch = auth_client
+    monkeypatch.setattr(server.settings, "DASHBOARD_ADMIN_EMAIL", "admin@example.test")
+    monkeypatch.setattr(server.settings, "DASHBOARD_ADMIN_PASSWORD", "isolated-password")
+    monkeypatch.setattr(server.settings, "DASHBOARD_COOKIE_SECURE", cookie_secure)
+    with TestClient(server.create_app(), base_url="http://127.0.0.1:8787") as client:
+        response = client.post(
+            "/api/login", json={"email": "admin@example.test", "password": "isolated-password"}
+        )
+        assert response.status_code == 200
+        cookie = response.headers["set-cookie"]
+        assert ("Secure" in cookie) is cookie_secure
+        assert "HttpOnly" in cookie
+        assert "SameSite=lax" in cookie
+        assert client.get("/api/fleet").status_code == expected_status
+    if cookie_secure:
+        fake_fetch.assert_not_awaited()
+    else:
+        fake_fetch.assert_awaited_once()
     server.get_pool.assert_not_awaited()
 
 

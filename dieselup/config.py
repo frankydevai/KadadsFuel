@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     DASHBOARD_SECRET: str = ''
     DASHBOARD_ADMIN_EMAIL: str = ''
     DASHBOARD_ADMIN_PASSWORD: str = Field(default='', repr=False)
+    # Disable only for an explicitly configured loopback HTTP dashboard.
+    DASHBOARD_COOKIE_SECURE: bool = True
 
     CORRIDOR_MILES: float = 5.0
 

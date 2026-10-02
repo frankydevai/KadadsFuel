@@ -56,3 +56,17 @@ def test_valhalla_url_is_normalized():
     )
     assert configured.VALHALLA_URL == "https://routing.example.com"
     assert configured.VALHALLA_API_SECRET == "secret"
+
+
+def test_dashboard_cookie_defaults_to_secure(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_COOKIE_SECURE", raising=False)
+    configured = Settings(_env_file=None, **BASE, BOT_MODE="bootstrap")
+    assert configured.DASHBOARD_COOKIE_SECURE is True
+
+
+def test_dashboard_cookie_local_http_override_from_dotenv(monkeypatch, tmp_path):
+    monkeypatch.delenv("DASHBOARD_COOKIE_SECURE", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("DASHBOARD_COOKIE_SECURE=false\n", encoding="utf-8")
+    configured = Settings(_env_file=env_file, **BASE, BOT_MODE="bootstrap")
+    assert configured.DASHBOARD_COOKIE_SECURE is False

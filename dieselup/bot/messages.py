@@ -677,10 +677,10 @@ def briefing_message(truck: str, load: str, candidates: Sequence[Any]) -> str:
 
 def status_message(truck: str, load: str | None, next_stop: Any | None) -> str:
     """Driver /status reply — current truck, current load, next recommended stop."""
-    load_line = f"Load: {escape(str(load))}" if load else "Load: none active"
+    load_line = f"Load: {escape(str(load))}" if load else "Load status not verified"
     lines = [f"<b>Truck {escape(str(truck))}</b>  ·  {load_line}"]
     if next_stop is None:
-        lines.append("No active fuel stop recommendation.")
+        lines.append("No verified fuel plan yet.")
     else:
         station = str(_f(next_stop, "station_name") or "Pilot Travel Center")
         address = _address_display(next_stop)

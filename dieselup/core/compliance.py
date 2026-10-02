@@ -114,6 +114,9 @@ EXPIRE_MOVED_MILES = 25.0
 FUELED_EVENT_GALLONS = 30.0
 
 PER_EVENT_TIMEOUT_SECONDS = 30.0
+# Finish or fail before the next five-minute scheduler slot. Per-event limits
+# alone do not cover the initial database read, replans, or cleanup passes.
+COMPLIANCE_CYCLE_TIMEOUT_SECONDS = 240.0
 ERROR_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
 _recent_error_alerts: dict[tuple[int, str, str], float] = {}
 
@@ -158,7 +161,26 @@ async def resolve_pending_events(bot: Bot) -> None:
     """APScheduler entrypoint — wire to IntervalTrigger(minutes=5)."""
     log.info("compliance: starting resolution sweep")
     metrics.incr("compliance_cycles_total")
+    deadline = asyncio.timeout(COMPLIANCE_CYCLE_TIMEOUT_SECONDS)
+    try:
+        async with deadline:
+            await _resolve_pending_events(bot)
+    except TimeoutError:
+        if not deadline.expired():
+            raise  # Preserve an upstream/database timeout's own diagnosis.
+        metrics.incr("compliance_cycle_timeouts_total")
+        log.exception(
+            "compliance: resolution sweep timed out (cycle limit %.0fs); "
+            "pending evidence is retained for the next sweep",
+            COMPLIANCE_CYCLE_TIMEOUT_SECONDS,
+        )
+        raise
+    # Only completed work counts as healthy, including post-fueling checks
+    # and requested replans. Exceptions and cancellation leave this unchanged.
+    metrics.gauge("compliance_last_heartbeat_mono", time.monotonic())
 
+
+async def _resolve_pending_events(bot: Bot) -> None:
     pending = await fetch_all(
         """
         SELECT id, truck_unit, driver_id, load_id, datatruck_order_id, tms_order_id,
@@ -176,8 +198,6 @@ async def resolve_pending_events(bot: Bot) -> None:
         log.info("compliance: no pending events")
         from dieselup.core.fuel_replan import run_requested_replans
         await run_requested_replans(bot)
-        import time as _t
-        metrics.gauge("compliance_last_heartbeat_mono", _t.monotonic())
         return
 
     saved = lost = skipped = expired = errored = still_pending = 0
@@ -212,8 +232,6 @@ async def resolve_pending_events(bot: Bot) -> None:
             else:
                 still_pending += 1
 
-    import time as _t
-    metrics.gauge("compliance_last_heartbeat_mono", _t.monotonic())
     metrics.gauge("compliance_last_cycle_pending", still_pending)
     metrics.gauge("compliance_last_cycle_errored", errored)
 

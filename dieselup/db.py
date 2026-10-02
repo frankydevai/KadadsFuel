@@ -25,6 +25,10 @@ from dieselup.config import settings
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
 _FUEL_STOPS_PATH = Path(__file__).resolve().parent.parent / "data" / "pilot_locations.csv"
 
+# A SQL command timeout does not bound waiting for a free pool connection.
+# asyncpg also uses this limit for its cancellation-safe connection release.
+POOL_ACQUIRE_TIMEOUT_SECONDS = 30.0
+
 _pool: asyncpg.Pool | None = None
 _lock = asyncio.Lock()
 log = logging.getLogger(__name__)
@@ -270,19 +274,19 @@ def _is_only_comments(stmt: str) -> bool:
 async def fetch_one(query: str, *args: Any) -> asyncpg.Record | None:
     """Run a parameterized SELECT and return the first row, or None."""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT_SECONDS) as conn:
         return await conn.fetchrow(query, *args)
 
 
 async def fetch_all(query: str, *args: Any) -> list[asyncpg.Record]:
     """Run a parameterized SELECT and return all rows."""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT_SECONDS) as conn:
         return await conn.fetch(query, *args)
 
 
 async def execute(query: str, *args: Any) -> str:
     """Run a parameterized INSERT/UPDATE/DELETE; returns the status string."""
     pool = await get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT_SECONDS) as conn:
         return await conn.execute(query, *args)

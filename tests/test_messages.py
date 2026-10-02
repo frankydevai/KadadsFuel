@@ -242,10 +242,13 @@ class TestBriefingMessage:
 # ---------------------------------------------------------------------------
 
 class TestStatusMessage:
-    def test_no_load(self):
-        text = status_message("702658", None, None)
-        assert "702658" in text
-        assert "none" in text.lower()
+    def test_missing_fuel_plan_does_not_claim_trip_is_inactive(self):
+        # An active trip held for missing route evidence has no pending advice.
+        text = status_message("8217", None, None)
+        assert "8217" in text
+        assert "Load status not verified" in text
+        assert "No verified fuel plan yet" in text
+        assert "none active" not in text.lower()
 
     def test_with_stop(self):
         text = status_message("702658", "ZAM-9981", _stop_dict())

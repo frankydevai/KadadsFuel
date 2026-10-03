@@ -15,7 +15,7 @@ import httpx
 
 from dieselup.circuit_breaker import CircuitOpenError, quickmanage_breaker
 from dieselup.config import settings
-from dieselup.core.trip_context import completion_state
+from dieselup.core.trip_context import completion_state, quickmanage_route_phase
 
 
 class QuickManageError(RuntimeError):
@@ -45,6 +45,9 @@ class QuickManageClient:
         self._token: str | None = None
         self._token_expiry: datetime | None = None
         self._truck_units: dict[str, str | None] = {}
+        self._location_samsara = None
+        self._stop_locations = None
+        self._street_addresses = None
 
     async def __aenter__(self) -> "QuickManageClient":
         return self
@@ -54,6 +57,10 @@ class QuickManageClient:
 
     async def close(self) -> None:
         await self._client.aclose()
+        if self._street_addresses is not None:
+            await self._street_addresses.aclose()
+        if self._location_samsara is not None:
+            await self._location_samsara.close()
 
     async def iter_orders(
         self,
@@ -119,42 +126,94 @@ class QuickManageClient:
         matching = [item for item in items if isinstance(item, dict) and str(item.get("id")) == str(order_id)]
         if len(matching) != 1:
             raise QuickManageError(f"QuickManage trip {order_id!r} was not found")
-        return await self._normalize_trip(matching[0])
+        order = await self._normalize_trip(matching[0])
+        return await self._resolve_stop_locations(order)
+
+    async def _resolve_stop_locations(self, order: dict[str, Any]) -> dict[str, Any]:
+        """Enrich selected current-trip addresses; fleet enumeration stays cheap."""
+        from dieselup.core.operating_scope import allows, unit_key
+        from dieselup.clients.samsara import SamsaraClient
+        from dieselup.core.stop_locations import StopLocationResolver, CensusStreetAddressResolver
+
+        if order.get("assignment_conflict") or not allows(order.get("truck_unit_number")) or order.get("route_phase") not in {
+            "pickup_then_delivery", "delivery_only"
+        }:
+            return order
+        unresolved = any(stop.get("coordinate_source") in {"zip_centroid", "missing"}
+                         and stop.get("address_line_1") for stop in order.get("stops", [])
+                         if order["route_phase"] != "delivery_only" or stop.get("type") == "delivery")
+        if not unresolved:
+            return order
+        if self._stop_locations is None:
+            self._location_samsara = SamsaraClient()
+            self._stop_locations = StopLocationResolver(self._location_samsara)
+        permitted_units = {unit_key(unit) for unit in settings.CENSUS_GEOCODING_TRUCK_UNITS.split(",") if unit.strip()}
+        census_permitted = settings.CENSUS_GEOCODING_ENABLED and unit_key(order.get("truck_unit_number")) in permitted_units
+        if census_permitted and self._street_addresses is None:
+            self._street_addresses = CensusStreetAddressResolver()
+        return await self._stop_locations.enrich_order(
+            order, street_address_resolver=self._street_addresses if census_permitted else None)
 
     async def _normalize_trip(self, trip: dict[str, Any]) -> dict[str, Any]:
         raw_stops = trip.get("stops") or []
         stops: list[dict[str, Any]] = []
         trip_truck = trip.get("truck") if isinstance(trip.get("truck"), dict) else {}
-        truck_unit: str | None = _clean(
-            trip.get("truck_number")
-            or trip.get("tractor_unit")
-            or trip_truck.get("unit_number")
-            or trip_truck.get("unit")
-            or trip_truck.get("number")
-        )
+        trip_units = _truck_units(trip_truck)
+        trip_units = [unit for unit in (_clean(trip.get("truck_number")),
+                                       _clean(trip.get("tractor_unit")), *trip_units) if unit]
+        truck_unit = next(iter(trip_units), None)
+        trip_ids = _truck_ids(trip.get("truck_id"), trip_truck.get("id"))
+        assigned_ids = set(trip_ids)
+        assigned_units = {_assignment_unit_key(unit) for unit in trip_units}
+        id_units: dict[str, set[str]] = {}
+        # An ID and unit supplied together identify one assignment. A bare ID
+        # must be resolved even when another part of the trip has a unit number.
+        for truck_id in trip_ids:
+            id_units.setdefault(truck_id, set()).update(trip_units)
+        for raw in raw_stops:
+            if not isinstance(raw, dict):
+                continue
+            assigned_truck = raw.get("assigned_truck")
+            assigned_truck = assigned_truck if isinstance(assigned_truck, dict) else {}
+            ids = _truck_ids(raw.get("assigned_truck_id"), assigned_truck.get("id"))
+            units = _truck_units(assigned_truck)
+            assigned_ids.update(ids)
+            assigned_units.update(_assignment_unit_key(unit) for unit in units)
+            if len(ids) == 1:
+                id_units.setdefault(ids[0], set()).update(units)
+        unresolved_id = False
+        # Two different TMS truck records cannot prove a single physical truck,
+        # even if both happen to report the same display unit. Hold immediately.
+        if len(assigned_ids) == 1:
+            truck_id = next(iter(assigned_ids))
+            if not id_units.get(truck_id):
+                try:
+                    resolved_unit = await self._truck_unit(truck_id)
+                except QuickManageError:
+                    resolved_unit = None
+                if resolved_unit:
+                    id_units[truck_id] = {resolved_unit}
+                    assigned_units.add(_assignment_unit_key(resolved_unit))
+                else:
+                    unresolved_id = True
+            known_units = id_units.get(truck_id, set())
+            truck_unit = truck_unit or (sorted(known_units)[0] if known_units else None)
         trip_driver = trip.get("driver") if isinstance(trip.get("driver"), dict) else {}
         driver_name: str | None = _person_name(trip_driver) if trip_driver else None
 
-        assigned_units: set[str] = set()
         for index, raw in enumerate(raw_stops):
             if not isinstance(raw, dict):
                 continue
-            assigned_truck = raw.get("assigned_truck") or {}
-            if isinstance(assigned_truck, dict):
-                truck_unit = truck_unit or _clean(
-                    assigned_truck.get("unit_number")
-                    or assigned_truck.get("unit")
-                    or assigned_truck.get("number")
-                )
-            truck_id = _clean(
-                raw.get("assigned_truck_id")
-                or (assigned_truck.get("id") if isinstance(assigned_truck, dict) else None)
-            )
-            if not truck_unit and truck_id:
-                truck_unit = await self._truck_unit(truck_id)
-            stop_unit = _clean(assigned_truck.get("unit_number") or assigned_truck.get("unit") or assigned_truck.get("number"))
-            if stop_unit:
-                assigned_units.add(stop_unit.lstrip("0") or stop_unit)
+            assigned_truck = raw.get("assigned_truck")
+            assigned_truck = assigned_truck if isinstance(assigned_truck, dict) else {}
+            stop_ids = _truck_ids(raw.get("assigned_truck_id"), assigned_truck.get("id"))
+            truck_id = stop_ids[0] if len(stop_ids) == 1 else None
+            stop_unit = next(iter(_truck_units(assigned_truck)), None)
+            if not stop_unit and truck_id:
+                known_units = id_units.get(truck_id, set())
+                if len({_assignment_unit_key(unit) for unit in known_units}) == 1:
+                    stop_unit = sorted(known_units)[0]
+            truck_unit = truck_unit or stop_unit
 
             assigned_driver = _first_dict(raw.get("assigned_driver"), raw.get("assigned_drivers"))
             if isinstance(assigned_driver, dict):
@@ -180,6 +239,8 @@ class QuickManageClient:
                     "completed": completion_state(raw),
                     "coordinate_source": coordinate_source,
                     "address_line_1": _clean(address.get("address_line_1")),
+                    "assigned_truck_id": truck_id,
+                    "assigned_truck_ids": stop_ids,
                     "assigned_truck_unit": stop_unit,
                     "latitude": lat,
                     "longitude": lng,
@@ -190,7 +251,13 @@ class QuickManageClient:
                 }
             )
 
-        status = str(trip.get("status") or "").strip().lower()
+        raw_status = str(trip.get("status") or "").strip().lower()
+        route_context = {
+            "route_phase": quickmanage_route_phase(raw_status),
+            "route_context_source": "quickmanage_status",
+            "route_phase_status": raw_status,
+        }
+        status = raw_status
         status = {
             "upcoming": "dispatched",
             "dispatching": "dispatched",
@@ -208,12 +275,20 @@ class QuickManageClient:
             "load_number": _clean(trip.get("ref_number") or trip.get("trip_num") or trip_id),
             "load_id": _clean(trip.get("ref_number") or trip_id),
             "status": status,
-            "raw_status": str(trip.get("status") or "").strip().lower(),
-            "assignment_conflict": len(assigned_units | ({truck_unit.lstrip("0") or truck_unit} if truck_unit else set())) > 1,
+            "raw_status": raw_status,
+            "assignment_conflict": len(assigned_ids) > 1 or len(assigned_units) > 1 or unresolved_id,
+            "assignment_conflict_reason": (
+                "multiple_truck_ids" if len(assigned_ids) > 1 else
+                "multiple_truck_units" if len(assigned_units) > 1 else
+                "unresolved_truck_id" if unresolved_id else None),
+            "truck_id": next(iter(assigned_ids)) if len(assigned_ids) == 1 else None,
+            "assigned_truck_ids": sorted(assigned_ids),
             "truck_unit_number": truck_unit,
             "driver_full_name": driver_name,
             "stops": stops,
             "tms_provider": "quickmanage",
+            **route_context,
+            "trip_metadata": route_context.copy(),
         }
 
     async def _truck_unit(self, truck_id: str) -> str | None:
@@ -232,12 +307,9 @@ class QuickManageClient:
         items = [item for item in items if isinstance(item, dict) and str(item.get("id")) == truck_id]
         unit = None
         if len(items) == 1:
-            unit = _clean(
-                items[0].get("unit_number")
-                or items[0].get("truck_unit_number")
-                or items[0].get("unit")
-                or items[0].get("number")
-            )
+            units = _truck_units(items[0])
+            if len({_assignment_unit_key(value) for value in units}) == 1:
+                unit = units[0]
         self._truck_units[truck_id] = unit
         return unit
 
@@ -352,6 +424,19 @@ def _clean(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _truck_ids(*values: Any) -> list[str]:
+    return sorted({text for value in values if (text := _clean(value))})
+
+
+def _truck_units(truck: dict[str, Any]) -> list[str]:
+    return [unit for key in ("unit_number", "truck_unit_number", "unit", "number")
+            if (unit := _clean(truck.get(key)))]
+
+
+def _assignment_unit_key(unit: str) -> str:
+    return unit.strip().upper().lstrip("0") or "0"
 
 
 def _as_float(value: Any) -> float | None:

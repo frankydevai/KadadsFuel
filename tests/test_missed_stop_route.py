@@ -120,3 +120,99 @@ def test_silent_advice_is_audited_without_sending(monkeypatch):
     bot.send_message.assert_not_called()
     assert recorder.call_args.args[0] == "message_suppressed"
     assert recorder.call_args.kwargs["details"]["reason"] == "silent_test_mode"
+
+
+@pytest.mark.parametrize("change", ["phase", "phase_unresolved", "target", "legacy_proof", "unresolved_context", "missing_fresh_metadata", "resolver_outage", "assignment_conflict", "late_assignment_conflict"])
+def test_quickmanage_context_change_or_unavailability_never_penalizes_driver(monkeypatch, change):
+    from copy import deepcopy
+    from dieselup.core import stop_visits, advice_guard
+    from dieselup.core.trip_context import route_context_signature, TripContextError
+
+    original = {
+        "id": "trip", "load_number": "L1", "status": "dispatched", "raw_status": "dispatched",
+        "truck_unit_number": "100", "driver_full_name": "Jane Driver", "tms_provider": "quickmanage",
+        "route_phase": "pickup_then_delivery", "route_phase_status": "dispatched",
+        "route_context_source": "quickmanage_status",
+        "stops": [
+            {"id": "pickup", "type": "pickup", "latitude": 32.6, "longitude": -97},
+            {"id": "delivery", "type": "delivery", "latitude": 33, "longitude": -97},
+        ],
+    }
+    route = proof()
+    route.update({key: original[key] for key in (
+        "tms_provider", "route_phase", "route_phase_status", "route_context_source")})
+    route["route_context_sha256"] = route_context_signature(original)
+    fresh = deepcopy(original)
+    if change in {"phase", "phase_unresolved"}:
+        fresh.update(status="in_transit", raw_status="in_transit", route_phase="delivery_only", route_phase_status="in_transit")
+        if change == "phase_unresolved":
+            fresh["stops"][1]["latitude"] = None
+    elif change == "target":
+        fresh["stops"][0]["latitude"] = 32.7
+    elif change == "legacy_proof":
+        route.pop("route_context_sha256")
+    elif change == "unresolved_context":
+        fresh["stops"][0]["latitude"] = None
+    elif change == "missing_fresh_metadata":
+        fresh.pop("route_phase")
+    elif change in {"assignment_conflict", "late_assignment_conflict"}:
+        fresh["assignment_conflict"] = True
+    else:
+        def unavailable_context(order):
+            raise TripContextError("Temporary location resolver outage")
+        monkeypatch.setattr(advice_guard, "route_context_signature", unavailable_context)
+    event = {
+        "id": 10, "truck_unit": "100", "load_id": "L1", "tms_order_id": "trip",
+        "samsara_vehicle_id": "v1", "candidates": [{"latitude": 32.5, "longitude": -97,
+            "plan": {"route_evidence": route}}], "recommended_site_id": 1,
+        "recommended_true_cost": 3, "worst_candidate_true_cost": 4, "gallons": 80,
+        "fuel_pct_before": 50, "approach_ping_sent_at": None,
+        "recommended_at": datetime.now(timezone.utc),
+    }
+    async def fetch(sql, *args):
+        if "FROM fuel_events" in sql:
+            return None
+        return {"samsara_vehicle_id": "v1", "driver_telegram_id": -100, "driver_full_name": "Jane Driver"}
+    location = SimpleNamespace(lat=32.55, lng=-97, gps_age_minutes=1, speed_mph=55)
+    client = SimpleNamespace(get_vehicle_location=AsyncMock(return_value=location),
+        get_vehicle_stats=AsyncMock(return_value=SimpleNamespace(fuel_age_minutes=1)))
+    tms = SimpleNamespace(get_order=AsyncMock(
+        side_effect=[original, fresh] if change == "late_assignment_conflict" else None,
+        return_value=fresh))
+    monkeypatch.setattr(compliance, "fetch_one", fetch)
+    monkeypatch.setattr(compliance, "execute", AsyncMock())
+    monkeypatch.setattr(compliance, "_fuel_delta_since_recommendation", AsyncMock(return_value=None))
+    monkeypatch.setattr(compliance, "_send_approach_reminder", AsyncMock())
+    missed_alert = AsyncMock()
+    monkeypatch.setattr(compliance, "_send_missed_stop_alert", missed_alert)
+    visit = AsyncMock()
+    monkeypatch.setattr(stop_visits, "observe_visit", visit)
+    marked = AsyncMock()
+    monkeypatch.setattr(compliance, "_mark_resolved", marked)
+    recorder = AsyncMock()
+    monkeypatch.setattr(advice_audit, "record", recorder)
+
+    result = asyncio.run(compliance._resolve_one(event, samsara=client, datatruck=tms, bot=object()))
+    if change in {"unresolved_context", "missing_fresh_metadata", "resolver_outage", "assignment_conflict", "late_assignment_conflict"}:
+        assert result is None
+        marked.assert_not_awaited()
+        assert recorder.call_args.args[0] == "monitor_held"
+        expected_reason = ("current_assignment_conflict" if change in {
+            "assignment_conflict", "late_assignment_conflict"} else "current_route_context_unverified")
+        assert recorder.call_args.kwargs["details"]["reason"] == expected_reason
+    else:
+        assert result == "expired"
+        assert marked.call_args.kwargs["status"] == "expired"
+        assert marked.call_args.kwargs["dollar_impact"] == 0
+        expected_reason = "legacy_plan_requires_route_refresh" if change == "legacy_proof" else "current_route_phase_changed"
+        assert marked.call_args.kwargs["evidence"]["reason"] == expected_reason
+    missed_alert.assert_not_awaited()
+    if change == "late_assignment_conflict":
+        # The first observation used verified assignment; the second check
+        # became uncertain and must not resolve or score the stored route.
+        visit.assert_awaited_once()
+    else:
+        compliance._send_approach_reminder.assert_not_awaited()
+        visit.assert_not_awaited()
+    # Resolution is mocked separately: no expiry may delete delivery claims.
+    compliance.execute.assert_not_awaited()

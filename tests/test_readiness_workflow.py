@@ -39,6 +39,7 @@ def test_no_send_workflow_gates(monkeypatch, scenario, driver_sends, dispatch_se
         if scenario == 'group_mismatch': verified = {'100': -999}
         if scenario == 'paused_preflight': verified = {}
         pending = scenario in {'existing_pending', 'passed_pending'}
+        accepted_driver_id = 1 if scenario == 'existing_pending' else None
         event_candidates = json.dumps([{'site_id': 1, 'distance_miles': 10, 'plan': {'route_evidence': {'model': 'remaining_route_v1'}}}])
         inserts = []
 
@@ -48,11 +49,15 @@ def test_no_send_workflow_gates(monkeypatch, scenario, driver_sends, dispatch_se
             if sql.lstrip().startswith('INSERT INTO stop_events'):
                 inserts.append(args); pending = True; return {'id': 1}
             if 'FROM stop_events' in sql:
-                return {"id": 1, "recommended_site_id": 1, "gallons": 80, "candidates": event_candidates} if "status = 'pending'" in sql and pending else None
+                return {"id": 1, "driver_id": -101, "samsara_vehicle_id": "vehicle-1", "recommended_site_id": 1, "gallons": 80, "candidates": event_candidates, "briefing_driver_msg_id": accepted_driver_id} if "status = 'pending'" in sql and pending else None
             raise AssertionError('Unexpected database access in isolated simulation')
 
         monkeypatch.setattr(load_sync, 'fetch_one', fetch_one)
-        monkeypatch.setattr(load_sync, 'execute', AsyncMock())
+        async def execute(sql, *args):
+            nonlocal accepted_driver_id
+            if 'COALESCE($2, briefing_driver_msg_id)' in sql:
+                accepted_driver_id = args[1]
+        monkeypatch.setattr(load_sync, 'execute', execute)
         monkeypatch.setattr(load_sync, '_claim_driver_briefing_fingerprint', AsyncMock(return_value=True))
         monkeypatch.setattr(load_sync, '_claim_admin_alert_fingerprint', AsyncMock(return_value=True))
         monkeypatch.setattr(load_sync, '_safe_send_admin', AsyncMock())

@@ -51,7 +51,21 @@ RUN_SCHEMA_ON_STARTUP=false
 
 Activation requires deploying and verifying the recipient guard first, then checking every selected driver's actual group connection. In restricted live mode, only a unique, ready, unpaused driver connection for an allowed truck can receive output. Admin, dispatch, duplicate, conflicting, unmapped, and unverifiable recipients are blocked. Empty `TEST_TRUCK_UNITS` expands processing to the fleet; preserve the explicit list during this trial.
 
-This repository includes newer recipient restrictions that may be pending deployment. Keep the existing silent production configuration until the exact guarded release is verified. Publishing this repository does not deploy it or enable messaging.
+The configuration template stays silent. The owner has authorized live messaging for the three selected driver groups after the guarded release is verified. Publishing this repository does not deploy it or change a running service's messaging settings. Run one active bot, either on the Mac or Railway, to avoid duplicate polling and alerts.
+
+## QuickManage navigation rules
+
+QuickManage assigns the physical truck and supplies the trip status. Samsara supplies the current GPS, motion and fuel readings. The owner's status rules determine the remaining route:
+
+| QuickManage status | Navigation |
+| --- | --- |
+| `dispatched` / `dispatching` | Current truck location → ordered shipper pickups → delivery |
+| `in_transit` | Current truck location → remaining delivery |
+| `reserved` / `upcoming` | Record the next load separately; preserve the current trip |
+
+These rules do not mark a customer stop completed or establish a fuel visit. Conflicting assignments, contradictory explicit stop progress, ambiguous remaining deliveries, stale sensors and unresolved locations hold advice. Plans record the phase, coordinate source and route context; a changed phase replaces old advice without a missed-stop penalty. An unsent plan held while resting is freshly checked again when the truck moves. Accepted driver messages remain protected from duplicate delivery.
+
+ZIP centers cannot guide trucks. Full street addresses can match a unique saved Samsara facility. Optional Census street interpolation is disabled by default and requires owner authorization before commercial addresses are transmitted. It is separately limited to the three trial trucks and tagged as an approximate fuel-route point; it cannot prove a visit, fueling or driver savings. Valhalla supplies the truck route after locations are resolved.
 
 ## Fuel-price policy
 

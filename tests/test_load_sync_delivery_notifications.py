@@ -29,6 +29,17 @@ def test_driver_briefing_fingerprint_is_per_truck_load_stop():
     assert first != different_stop
 
 
+def test_driver_briefing_fingerprint_tracks_phase_context_quantity_and_fill_mode():
+    base = dict(alert_kind="briefing", truck_unit="6682", load_id="LOAD",
+                recommended_site_id=1, route_phase="pickup_then_delivery",
+                route_context_sha256="shipper-context", planned_gallons=80, fill_to_full=False)
+    first = load_sync._driver_briefing_fingerprint(**base)
+    for change in ({"route_phase": "delivery_only"}, {"route_context_sha256": "delivery-context"},
+                   {"planned_gallons": 100}, {"fill_to_full": True}):
+        assert load_sync._driver_briefing_fingerprint(**{**base, **change}) != first
+    assert load_sync._driver_briefing_fingerprint(**{**base, "planned_gallons": 80.0}) == first
+
+
 class _FakeBot:
     async def delete_message(self, *args, **kwargs):
         return None

@@ -45,6 +45,10 @@ def test_quickmanage_trip_normalizes_for_shipper_to_delivery_planner():
     assert normalized["status"] == "in_transit"
     assert normalized["truck_unit_number"] == "5145"
     assert normalized["driver_full_name"] == "Jane Driver"
+    assert normalized["route_phase"] == "delivery_only"
+    assert normalized["route_context_source"] == "quickmanage_status"
+    assert normalized["route_phase_status"] == "in_transit"
+    assert all(stop["completed"] is None for stop in normalized["stops"])
     assert ctx["load_id"] == "REF001"
     assert ctx["datatruck_order_id"] is None
     assert ctx["tms_order_id"] == trip["id"]
@@ -196,3 +200,142 @@ def test_quickmanage_iter_orders_sends_filter_list():
     seen, rows = asyncio.run(run())
     assert rows == [{"id": "trip-1", "status": "in_transit"}]
     assert seen[0]["filters"] == [{"field": "status", "operator": "in", "value": ["in_transit"]}]
+
+
+def test_trip_unit_does_not_hide_two_distinct_stop_truck_ids():
+    async def run():
+        async with QuickManageClient() as client:
+            async def fake_post(_path, body):
+                truck_id = body["filters"][0]["value"]
+                return {"items": [{"id": truck_id, "unit": "8089"}]}
+            client._post = fake_post
+            return await client._normalize_trip({
+                "id": "mixed-trucks", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck_id": "truck-a"},
+                          {"pickup": False, "assigned_truck_id": "truck-b"}],
+            })
+
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is True
+    assert row["assigned_truck_ids"] == ["truck-a", "truck-b"]
+    assert [stop["assigned_truck_id"] for stop in row["stops"]] == ["truck-a", "truck-b"]
+
+
+@pytest.mark.parametrize("looked_up_unit", ["8217", None])
+def test_trip_unit_still_verifies_id_only_stop_assignment(looked_up_unit):
+    async def run():
+        async with QuickManageClient() as client:
+            calls = []
+            async def fake_post(path, body):
+                calls.append((path, body["filters"]))
+                return {"items": [{"id": "truck-a", "unit": looked_up_unit}]}
+            client._post = fake_post
+            row = await client._normalize_trip({
+                "id": "unproven-truck", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck_id": "truck-a"}],
+            })
+            return row, calls
+
+    row, calls = asyncio.run(run())
+    assert calls == [("/x/trucks/search", [{"field": "id", "operator": "eq", "value": "truck-a"}])]
+    assert row["assignment_conflict"] is True
+
+
+def test_id_only_stop_assignment_accepts_verified_leading_zero_alias():
+    async def run():
+        async with QuickManageClient() as client:
+            async def fake_post(path, body):
+                assert path == "/x/trucks/search"
+                assert body["filters"][0]["value"] == "truck-a"
+                return {"items": [{"id": "truck-a", "unit": "08089"}]}
+            client._post = fake_post
+            return await client._normalize_trip({
+                "id": "verified-truck", "status": "in_transit", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck_id": "truck-a"},
+                          {"pickup": False, "assigned_truck_id": "truck-a"}],
+            })
+
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is False
+    assert row["assigned_truck_ids"] == ["truck-a"]
+    assert [stop["assigned_truck_unit"] for stop in row["stops"]] == ["08089", "08089"]
+
+
+def test_nested_and_top_level_stop_ids_cannot_disagree():
+    async def run():
+        async with QuickManageClient() as client:
+            return await client._normalize_trip({
+                "id": "contradictory-stop", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck_id": "truck-a",
+                           "assigned_truck": {"id": "truck-b", "unit": "8089"}}],
+            })
+
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is True
+    assert row["assigned_truck_ids"] == ["truck-a", "truck-b"]
+
+
+def test_trip_level_truck_id_must_match_stop_assignment_id():
+    async def run():
+        async with QuickManageClient() as client:
+            return await client._normalize_trip({
+                "id": "contradictory-trip", "status": "dispatched",
+                "truck": {"id": "truck-a", "unit": "8089"},
+                "stops": [{"pickup": True, "assigned_truck": {"id": "truck-b", "unit": "8089"}}],
+            })
+
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is True
+    assert row["assigned_truck_ids"] == ["truck-a", "truck-b"]
+
+
+def test_paired_id_and_unit_is_reused_without_a_truck_lookup():
+    async def run():
+        async with QuickManageClient() as client:
+            async def forbidden(*args):
+                pytest.fail("A complete, consistent ID/unit pair should not need another request")
+            client._post = forbidden
+            return await client._normalize_trip({
+                "id": "consistent-pair", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck": {"id": "truck-a", "unit": "08089"}},
+                          {"pickup": False, "assigned_truck_id": "truck-a"}],
+            })
+
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is False
+    assert row["stops"][1]["assigned_truck_unit"] == "08089"
+
+
+def test_truck_lookup_failure_holds_the_assignment_without_geocoding():
+    async def run():
+        async with QuickManageClient() as client:
+            async def unavailable(*args):
+                raise QuickManageError("Truck lookup unavailable")
+            client._post = unavailable
+            return await client._normalize_trip({
+                "id": "lookup-outage", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck_id": "truck-a"}],
+            })
+
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is True
+    assert row["assignment_conflict_reason"] == "unresolved_truck_id"
+
+
+@pytest.mark.parametrize("items", [
+    [{"id": "unrelated", "unit": "8089"}],
+    [{"id": "truck-a", "unit": "8089"}, {"id": "truck-a", "unit": "8089"}],
+    [{"id": "truck-a", "unit_number": "8089", "unit": "8217"}],
+])
+def test_truck_lookup_must_prove_one_exact_record_and_consistent_unit(items):
+    async def run():
+        async with QuickManageClient() as client:
+            async def fake_post(*args):
+                return {"items": items}
+            client._post = fake_post
+            return await client._normalize_trip({
+                "id": "ambiguous-lookup", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck_id": "truck-a"}],
+            })
+
+    assert asyncio.run(run())["assignment_conflict"] is True

@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from telegram import Bot
@@ -37,7 +38,7 @@ from dieselup.config import settings
 from dieselup.core.operating_scope import allows, allowed_units, unit_key
 from dieselup.core.fuel_plan import NoFeasibleFuelPlan
 from dieselup.core.remaining_route import plan_remaining_route
-from dieselup.core.trip_context import TripContextError, remaining_stops
+from dieselup.core.trip_context import TripContextError, remaining_stops, route_context_signature
 from dieselup.core import advice_audit
 from dieselup.core.optimizer import (
     NoValidStopError,
@@ -51,7 +52,7 @@ _truck_plan_locks: dict[str, asyncio.Lock] = {}
 
 ACTIVE_STATUSES = {
     "active", "upcoming", "dispatching", "dispatched", "in_transit",
-    "in transit", "enroute", "en route",
+    "in transit", "enroute", "en route", "reserved",
 }
 DELIVERED_STATUSES = {"delivered", "invoiced", "completed", "complete"}
 
@@ -75,7 +76,7 @@ _recent_error_alerts: dict[tuple[str, str, str], float] = {}
 # TMS feed from blocking the scheduler forever.
 LOAD_SYNC_MAX_PAGES = 50
 ORDER_ENUMERATION_TIMEOUT_SECONDS = settings.LOAD_SYNC_ORDER_ENUMERATION_TIMEOUT_SECONDS
-QUICKMANAGE_ACTIVE_FILTER_STATUSES = ["upcoming", "dispatching", "dispatched", "in_transit"]
+QUICKMANAGE_ACTIVE_FILTER_STATUSES = ["reserved", "upcoming", "dispatching", "dispatched", "in_transit"]
 QUICKMANAGE_DELIVERED_FILTER_STATUSES = ["completed", "delivered"]
 QUICKMANAGE_DELIVERED_MAX_PAGES = 5
 DELIVERED_ENUMERATION_TIMEOUT_SECONDS = 60.0
@@ -124,7 +125,7 @@ def _select_current_loads(orders: list[dict], unit_map: dict[str, list[VehicleSu
     blocked: set[str] = set()
     for order in orders:
         status = str(order.get("raw_status") or order.get("status") or "").strip().lower()
-        if not _is_active(order) or status == "upcoming": continue
+        if not _is_current(order): continue
         unit = _extract_truck_unit(order)
         if unit and not allows(unit):
             continue
@@ -155,6 +156,25 @@ def _select_current_loads(orders: list[dict], unit_map: dict[str, list[VehicleSu
             metrics.incr("load_sync_ambiguous_current_trip")
             log.warning("load_sync: multiple current trips; holding truck %s", _extract_truck_unit(group[0][1]))
     return result
+
+
+def _select_reserved_loads(orders: list[dict], unit_map: dict[str, list[VehicleSummary]]) -> list[dict]:
+    """Record a unique next assignment separately; it cannot block a current trip."""
+    grouped: dict[str, dict[str, dict]] = {}
+    blocked = set()
+    for order in orders:
+        status = str(order.get("raw_status") or order.get("status") or "").strip().lower()
+        unit = _extract_truck_unit(order)
+        order_id = str(order.get("tms_order_id") or order.get("id") or "").strip()
+        if status not in {"reserved", "upcoming"} or not unit or not allows(unit) or not order_id:
+            continue
+        try:
+            vehicle = _assigned_vehicle(order, unit_map)
+        except LoadContextError:
+            blocked.update(v.id for v in _resolve_samsara_matches(unit, unit_map))
+            continue
+        grouped.setdefault(vehicle.id, {})[order_id] = order
+    return [next(iter(rows.values())) for key, rows in grouped.items() if key not in blocked and len(rows) == 1]
 
 
 async def sync_active_loads(bot: Bot) -> None:
@@ -234,14 +254,29 @@ async def sync_active_loads(bot: Bot) -> None:
             # scan. A large completed-load archive must not delay live fuel
             # alerts to drivers.
             # A partial list cannot prove that another current trip is absent.
+            if enumeration_complete:
+                for reserved in _select_reserved_loads(active_orders, samsara_by_unit):
+                    unit = _extract_truck_unit(reserved)
+                    await advice_audit.record("next_load_reserved", truck_unit=unit,
+                        load_id=_load_id_of(reserved),
+                        key=f"reserved:{unit}:{reserved.get('id')}:{reserved.get('raw_status') or reserved.get('status')}",
+                        details={"tms_order_id": str(reserved.get("tms_order_id") or reserved.get("id")),
+                                 "status": reserved.get("raw_status") or reserved.get("status"),
+                                 "routing": "wait_for_dispatched_or_in_transit"})
             selected_orders = _select_current_loads(active_orders, samsara_by_unit) if enumeration_complete else []
             for order in selected_orders:
                 truck_unit = _extract_truck_unit(order) or ""
                 followup = truck_unit in delivered_now
                 try:
                     if settings.TMS_PROVIDER == "quickmanage":
-                        fresh = await asyncio.wait_for(datatruck.get_order(order.get("tms_order_id") or order["id"]), timeout=PER_LOAD_TIMEOUT_SECONDS)
-                        if _extract_truck_unit(fresh) != _extract_truck_unit(order) or not _is_active(fresh):
+                        try:
+                            fresh = await asyncio.wait_for(datatruck.get_order(order.get("tms_order_id") or order["id"]), timeout=PER_LOAD_TIMEOUT_SECONDS)
+                        except Exception as exc:
+                            await advice_audit.record("plan_held", truck_unit=truck_unit,
+                                load_id=_load_id_of(order), details={
+                                    "reason": type(exc).__name__, "stage": "current_trip_detail"})
+                            raise
+                        if _extract_truck_unit(fresh) != _extract_truck_unit(order) or not _is_current(fresh):
                             raise LoadContextError("Trip assignment/status changed during planning")
                         order = fresh
                     outcome = await asyncio.wait_for(
@@ -857,6 +892,7 @@ async def _build_routed_leg(
     delivery_complete_followup: bool = False,
 ) -> dict[str, Any] | None:
     """Plan from fresh GPS through every verified remaining customer stop."""
+    telemetry_age_observed = time.monotonic()
     age = getattr(stats, "gps_age_minutes", None)
     if age is None or not 0 <= age <= settings.MAX_ADVICE_GPS_AGE_MINUTES:
         raise LoadContextError("Fresh truck GPS is required before fuel advice")
@@ -929,6 +965,8 @@ async def _build_routed_leg(
     # briefed leg — the recompute model would otherwise discard legs 2..n every
     # sweep. candidates[0] stays the briefed stop for back-compat.
     legs_payload = [_leg_dict(leg, i) for i, leg in enumerate(lane.legs)]
+    telemetry_recorded_at = datetime.now(timezone.utc)
+    telemetry_elapsed_minutes = max(0.0, time.monotonic()-telemetry_age_observed)/60.0
     legs_payload[0]["plan"] = {
         "mpg": mpg,
         "mpg_fallback": mpg_fallback,
@@ -948,7 +986,17 @@ async def _build_routed_leg(
         "degraded": lane.degraded,
         "ranking_strategy": settings.RANK_STRATEGY,
         "distance_model": "remaining_route_directed_truck_road_matrix",
-        "route_evidence": lane.route_evidence,
+        "route_evidence": {
+            **lane.route_evidence,
+            "tms_provider": ctx["order"].get("tms_provider", settings.TMS_PROVIDER),
+            "route_phase": ctx["order"].get("route_phase"),
+            "route_phase_status": ctx["order"].get("route_phase_status") or ctx["order"].get("raw_status") or ctx["order"].get("status"),
+            "route_context_source": ctx["order"].get("route_context_source", "explicit_stop_progress"),
+            "route_context_sha256": route_context_signature(ctx["order"]),
+            "telemetry_checked_at": telemetry_recorded_at.isoformat(),
+            "gps_age_minutes_at_check": age+telemetry_elapsed_minutes,
+            "fuel_age_minutes_at_check": fuel_age+telemetry_elapsed_minutes,
+        },
         "terminal_reserve_gal": plan_kwargs["terminal_reserve_gal"],
     }
 
@@ -1090,7 +1138,7 @@ async def _process_one_load_unlocked(
     # A pending recommendation must be compared to a fresh plan, never used
     # as a reason to skip GPS/route validation after the truck has moved.
     existing = await fetch_one(
-        "SELECT id, recommended_site_id, gallons, candidates, fuel_pct_before FROM stop_events "
+        "SELECT id, driver_id, samsara_vehicle_id, recommended_site_id, gallons, candidates, fuel_pct_before, briefing_driver_msg_id, approach_driver_msg_id, delivery_driver_msg_id, red_flag_driver_msg_id FROM stop_events "
         "WHERE truck_unit = $1 AND load_id = $2 AND status = 'pending' "
         "ORDER BY recommended_at DESC LIMIT 1",
         ctx["truck_unit"],
@@ -1142,31 +1190,43 @@ async def _process_one_load_unlocked(
             await advice_audit.record("replan_completed", truck_unit=truck_unit, event_id=replaces_event_id,
                                       key=f"replan_completed:{replaces_event_id}", details={"outcome":"no_fuel_needed"})
         return "skipped"
+    retry_existing = None
     if existing is not None:
         previous = _selected_candidate(existing["candidates"]) or {}
         fresh = _selected_candidate(leg["candidates_json"]) or {}
-        model = previous.get("plan", {}).get("route_evidence", {}).get("model")
-        same = (model == "remaining_route_v1"
-                and str(existing["recommended_site_id"]) == str(leg["recommended_site_id"])
-                and int(existing["gallons"]) == int(leg["gallons"])
-                and abs(float(previous.get("distance_miles", -100)) - float(fresh.get("distance_miles", 100))) < 1)
-        if same:
-            return "skipped"
-        replaces_event_id = existing["id"]
-        from dieselup.core.route_progress import passed_stop_evidence
-        evidence = passed_stop_evidence(previous.get("plan", {}).get("route_evidence", {}), stats)
-        if evidence:
-            observed = await fetch_one("SELECT id FROM fuel_events WHERE stop_event_id=$1 AND gallons>=30 LIMIT 1", existing["id"])
-            before = existing.get("fuel_pct_before")
-            fuel_rose = before is not None and stats.fuel_gallons - float(before)/100*settings.TANK_CAPACITY_GALLONS >= 30
-            if observed is None and not fuel_rose:
-                from dieselup.core.compliance import _mark_resolved
-                await _mark_resolved(event_id=existing["id"], status="skipped", actual_site_id=None,
-                                     actual_true_cost=None, dollar_impact=0, evidence=evidence)
+        if _same_pending_plan(existing, leg, order):
+            if _has_accepted_driver_alert(existing):
+                return "skipped"
+            if _same_event_recipient(existing, driver):
+                retry_existing = existing
             else:
-                await advice_audit.expire_pending(existing["id"], "fueling_detected_route_changed")
+                replaces_event_id = existing["id"]
+                await advice_audit.expire_pending(existing["id"], "driver_delivery_identity_changed")
         else:
-            await advice_audit.expire_pending(existing["id"], "current_route_or_quantity_changed")
+            replaces_event_id = existing["id"]
+            previous_proof = previous.get("plan", {}).get("route_evidence", {})
+            fresh_proof = fresh.get("plan", {}).get("route_evidence", {})
+            phase_changed = (order.get("tms_provider") == "quickmanage"
+                             and not _same_quickmanage_context(previous_proof, fresh_proof))
+            if phase_changed:
+                # A phase/endpoint transition changes the navigation contract;
+                # it is not evidence that the driver missed or lost anything.
+                await advice_audit.expire_pending(existing["id"], "route_context_changed")
+            else:
+                from dieselup.core.route_progress import passed_stop_evidence
+                evidence = passed_stop_evidence(previous_proof, stats)
+                if evidence:
+                    observed = await fetch_one("SELECT id FROM fuel_events WHERE stop_event_id=$1 AND gallons>=30 LIMIT 1", existing["id"])
+                    before = existing.get("fuel_pct_before")
+                    fuel_rose = before is not None and stats.fuel_gallons - float(before)/100*settings.TANK_CAPACITY_GALLONS >= 30
+                    if observed is None and not fuel_rose:
+                        from dieselup.core.compliance import _mark_resolved
+                        await _mark_resolved(event_id=existing["id"], status="skipped", actual_site_id=None,
+                                             actual_true_cost=None, dollar_impact=0, evidence=evidence)
+                    else:
+                        await advice_audit.expire_pending(existing["id"], "fueling_detected_route_changed")
+                else:
+                    await advice_audit.expire_pending(existing["id"], "current_route_or_quantity_changed")
 
 
     if leg.get("degraded"):
@@ -1213,46 +1273,74 @@ async def _process_one_load_unlocked(
 
     fuel_pct_before = round(stats.fuel_gallons / settings.TANK_CAPACITY_GALLONS * 100.0, 2)
 
-    inserted = await fetch_one(
-        """
-        INSERT INTO stop_events
-            (truck_unit, driver_id, load_id, datatruck_order_id, tms_order_id,
-             recommended_site_id, recommended_true_cost, candidates,
-             worst_candidate_true_cost, gallons, status, fuel_pct_before,
-             samsara_vehicle_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, 'pending', $11, $12)
-        RETURNING id
-        """,
-        ctx["truck_unit"],
-        driver["driver_telegram_id"],
-        ctx["load_id"],
-        ctx["datatruck_order_id"],
-        ctx.get("tms_order_id") or (
-            str(ctx["datatruck_order_id"]) if ctx.get("datatruck_order_id") is not None else None
-        ),
-        recommended_site_id,
-        recommended_true_cost,
-        candidates_json,
-        worst_true_cost,
-        gallons_to_pump,
-        fuel_pct_before,
-        driver["samsara_vehicle_id"],
-    )
-    event_id = int(inserted["id"]) if inserted else None
-    if event_id is not None:
-        selected = stored[0]
-        await advice_audit.record("plan_created", truck_unit=truck_unit, load_id=ctx["load_id"],
-                                  event_id=event_id, related_event_id=replaces_event_id,
-                                  key=f"created:{event_id}", details={
-                                      "site_id": recommended_site_id, "station_name": selected.get("station_name"),
-                                      "planned_gallons": gallons_to_pump, "fill_to_full": bool(selected.get("fill_to_full")),
-                                      "distance_miles": selected.get("distance_miles"),
-                                      "messaging_mode": settings.TELEGRAM_MESSAGING_MODE})
-        if replaces_event_id:
-            await advice_audit.record("replan_completed", truck_unit=truck_unit, event_id=replaces_event_id,
-                                      related_event_id=event_id, key=f"replan_completed:{replaces_event_id}",
-                                      details={"outcome":"replacement_recorded"})
-
+    if retry_existing is not None:
+        link_verified = verified_driver_links is None or _is_verified_driver_assignment(
+            driver=driver, truck_unit=str(truck_unit), quickmanage_driver=dt_driver,
+            verified_driver_links=verified_driver_links)
+        if (settings.TELEGRAM_MESSAGING_MODE == "silent" or suppress_driver_briefing
+                or alert_kind == "delivery" or not driver["driver_telegram_id"] or not link_verified):
+            return "skipped"
+        accepted = await fetch_one("""SELECT id FROM fuel_advice_audit
+            WHERE stop_event_id=$1 AND kind='message_sent'
+              AND details->>'chat_id'=$2
+              AND details->>'alert_type' NOT LIKE 'dispatch_%'
+            LIMIT 1""", retry_existing["id"], str(driver["driver_telegram_id"]))
+        if accepted is not None:
+            return "skipped"  # Delivered audit survives a crash before the ID-column update.
+        await advice_audit.record("plan_delivery_refreshed", truck_unit=truck_unit,
+            load_id=ctx["load_id"], event_id=retry_existing["id"], details={
+                "previous_plan": retry_existing["candidates"], "fresh_plan": stored,
+                "reason": "current_plan_has_no_accepted_driver_delivery"})
+        refreshed = await fetch_one("""UPDATE stop_events
+            SET candidates=$2::jsonb, recommended_true_cost=$3, worst_candidate_true_cost=$4
+            WHERE id=$1 AND status='pending'
+              AND briefing_driver_msg_id IS NULL AND approach_driver_msg_id IS NULL
+              AND delivery_driver_msg_id IS NULL AND red_flag_driver_msg_id IS NULL
+            RETURNING id""", retry_existing["id"], candidates_json,
+            recommended_true_cost, worst_true_cost)
+        if refreshed is None:
+            return "skipped"
+        event_id = int(refreshed["id"])
+    else:
+        inserted = await fetch_one(
+            """
+            INSERT INTO stop_events
+                (truck_unit, driver_id, load_id, datatruck_order_id, tms_order_id,
+                 recommended_site_id, recommended_true_cost, candidates,
+                 worst_candidate_true_cost, gallons, status, fuel_pct_before,
+                 samsara_vehicle_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, 'pending', $11, $12)
+            RETURNING id
+            """,
+            ctx["truck_unit"],
+            driver["driver_telegram_id"],
+            ctx["load_id"],
+            ctx["datatruck_order_id"],
+            ctx.get("tms_order_id") or (
+                str(ctx["datatruck_order_id"]) if ctx.get("datatruck_order_id") is not None else None
+            ),
+            recommended_site_id,
+            recommended_true_cost,
+            candidates_json,
+            worst_true_cost,
+            gallons_to_pump,
+            fuel_pct_before,
+            driver["samsara_vehicle_id"],
+        )
+        event_id = int(inserted["id"]) if inserted else None
+        if event_id is not None:
+            selected = stored[0]
+            await advice_audit.record("plan_created", truck_unit=truck_unit, load_id=ctx["load_id"],
+                                      event_id=event_id, related_event_id=replaces_event_id,
+                                      key=f"created:{event_id}", details={
+                                          "site_id": recommended_site_id, "station_name": selected.get("station_name"),
+                                          "planned_gallons": gallons_to_pump, "fill_to_full": bool(selected.get("fill_to_full")),
+                                          "distance_miles": selected.get("distance_miles"),
+                                          "messaging_mode": settings.TELEGRAM_MESSAGING_MODE})
+            if replaces_event_id:
+                await advice_audit.record("replan_completed", truck_unit=truck_unit, event_id=replaces_event_id,
+                                          related_event_id=event_id, key=f"replan_completed:{replaces_event_id}",
+                                          details={"outcome":"replacement_recorded"})
     # Build inline keyboard for the driver's copy only — skip for delivery follow-ups
     # (no stop to confirm) and when event_id is unknown (insert failed).
     _briefing_keyboard = None
@@ -1298,6 +1386,11 @@ async def _process_one_load_unlocked(
             truck_unit=ctx["truck_unit"],
             load_id=ctx["load_id"],
             recommended_site_id=recommended_site_id,
+            route_phase=order.get("route_phase"),
+            route_context_sha256=(proof or {}).get("route_context_sha256"),
+            planned_gallons=gallons_to_pump,
+            fill_to_full=bool(stored[0].get("fill_to_full")),
+            retry_event_id=event_id,
         )
         if not can_send_driver_briefing:
             log.info(
@@ -1308,11 +1401,8 @@ async def _process_one_load_unlocked(
             )
 
     if can_send_driver_briefing:
-        # queue_on_failure=True: a failed driver send (Telegram blip, circuit
-        # open) lands in alert_dlq and the dlq_retry job delivers it within
-        # ~10 min. Previously failures were dropped, and because the briefing
-        # fingerprint had already been claimed, the driver was PERMANENTLY
-        # silenced for this truck+load+stop — briefings vanished with no retry.
+        # A later sweep must recompute and verify any retry. Stored Telegram
+        # text must never become a replacement for current route evidence.
         driver_msg_id = await safe_send(
             bot=bot,
             chat_id=int(driver["driver_telegram_id"]),
@@ -1323,7 +1413,7 @@ async def _process_one_load_unlocked(
             load_id=ctx["load_id"],
             stop_event_id=event_id,
             msg_id_column=msg_col_driver,
-            queue_on_failure=True,
+            queue_on_failure=False,
             replace_previous_driver_alert=True,
         )
     elif driver["driver_telegram_id"] and alert_kind == "delivery":
@@ -1341,7 +1431,7 @@ async def _process_one_load_unlocked(
             ctx["truck_unit"],
             ctx["load_id"],
         )
-    if settings.TELEGRAM_DISPATCH_CHAT_ID is not None:
+    if retry_existing is None and settings.TELEGRAM_DISPATCH_CHAT_ID is not None:
         dispatch_msg_id = await safe_send(
             bot=bot,
             chat_id=settings.TELEGRAM_DISPATCH_CHAT_ID,
@@ -1373,7 +1463,7 @@ async def _process_one_load_unlocked(
             dispatch_msg_id,
         )
 
-    return "briefed"
+    return "skipped" if retry_existing is not None and driver_msg_id is None else "briefed"
 
 
 def _msg_id_columns_for(alert_kind: str) -> tuple[str, str]:
@@ -1391,26 +1481,179 @@ async def _claim_driver_briefing_fingerprint(
     truck_unit: str,
     load_id: str,
     recommended_site_id: int,
+    route_phase: str | None = None,
+    route_context_sha256: str | None = None,
+    planned_gallons: float | None = None,
+    fill_to_full: bool | None = None,
+    retry_event_id: int | None = None,
 ) -> bool:
-    """Remember an auto driver briefing so the same truck/load/stop is one-shot."""
+    """Append immutable claims; retry only a proven undelivered fresh plan.
+
+    A claim alone does not prove delivery. Its atomic audit links the claim to
+    its source event so a later current plan can retry a known failed attempt,
+    including after neutral expiry. Accepted or ambiguous attempts stay held.
+    """
+    if retry_event_id is None:
+        return False
     fingerprint = _driver_briefing_fingerprint(
         alert_kind=alert_kind,
         truck_unit=truck_unit,
         load_id=load_id,
         recommended_site_id=recommended_site_id,
+        route_phase=route_phase,
+        route_context_sha256=route_context_sha256,
+        planned_gallons=planned_gallons,
+        fill_to_full=fill_to_full,
     )
     row = await fetch_one(
         """
-        INSERT INTO alert_send_fingerprints
+        WITH claimed AS (INSERT INTO alert_send_fingerprints
             (fingerprint, alert_type, truck_unit, load_id)
-        VALUES ($1, $2, $3, $4)
+        SELECT $1, $2, $3, $4 FROM stop_events se
+        WHERE se.id=$5 AND se.status='pending' AND se.truck_unit=$3 AND se.load_id=$4
+          AND se.briefing_driver_msg_id IS NULL AND se.approach_driver_msg_id IS NULL
+          AND se.delivery_driver_msg_id IS NULL AND se.red_flag_driver_msg_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM fuel_advice_audit sent
+              WHERE sent.stop_event_id=se.id AND sent.kind='message_sent'
+                AND COALESCE(sent.details->>'alert_type','') NOT LIKE 'dispatch_%')
+          AND NOT EXISTS (SELECT 1 FROM fuel_advice_audit uncertain
+              WHERE uncertain.stop_event_id=se.id
+                AND COALESCE(uncertain.details->>'alert_type','') NOT LIKE 'dispatch_%'
+                AND (uncertain.kind='message_uncertain' OR (uncertain.kind='message_failed'
+                    AND COALESCE(uncertain.details->>'reason','')
+                        NOT IN ('circuit_open','rate_limited','telegram_rejected'))))
+          AND NOT EXISTS (SELECT 1 FROM fuel_advice_audit attempt
+              WHERE attempt.stop_event_id=se.id AND attempt.kind='message_attempted'
+                AND COALESCE(attempt.details->>'alert_type','') NOT LIKE 'dispatch_%'
+                AND NOT EXISTS (SELECT 1 FROM fuel_advice_audit terminal
+                    WHERE terminal.stop_event_id=attempt.stop_event_id
+                      AND ((terminal.kind='message_suppressed'
+                            AND terminal.details->>'reason'='transport_recipient_policy')
+                        OR (terminal.kind='message_failed' AND terminal.details->>'reason'
+                            IN ('circuit_open','rate_limited','telegram_rejected')))
+                      AND terminal.details->>'alert_type'=attempt.details->>'alert_type'
+                      AND (terminal.created_at,terminal.id)>(attempt.created_at,attempt.id)))
         ON CONFLICT (fingerprint) DO NOTHING
-        RETURNING fingerprint
+        RETURNING fingerprint), audited AS (
+            INSERT INTO fuel_advice_audit
+                (event_key,kind,truck_unit,load_id,stop_event_id,details)
+            SELECT 'driver_claim:' || fingerprint,'driver_delivery_claimed',$3,$4,$5,
+                   jsonb_build_object('fingerprint',fingerprint,'base_fingerprint',$1::text,
+                                      'alert_type',$6::text,'attempt','initial')
+            FROM claimed RETURNING id
+        ) SELECT fingerprint FROM claimed
         """,
         fingerprint,
         f"driver_{alert_kind}",
         truck_unit,
         load_id,
+        retry_event_id,
+        alert_kind,
+    )
+    if row is not None:
+        return True
+
+    window = int(datetime.now(timezone.utc).timestamp() // 300)
+    retry_fingerprint = hashlib.sha256(
+        f"{fingerprint}:event:{retry_event_id}:retry:{window}".encode("utf-8")
+    ).hexdigest()
+    row = await fetch_one(
+        """
+        WITH prior_claims AS (
+            SELECT a.stop_event_id,f.first_seen_at,a.id
+            FROM fuel_advice_audit a JOIN alert_send_fingerprints f
+              ON f.fingerprint=a.details->>'fingerprint'
+            WHERE a.kind='driver_delivery_claimed' AND a.truck_unit=$3 AND a.load_id=$4
+              AND a.details->>'base_fingerprint'=$1
+              AND a.details->>'alert_type'=$6
+        ), latest_claim AS (
+            SELECT * FROM prior_claims ORDER BY first_seen_at DESC,id DESC LIMIT 1
+        ), claimed AS (
+            INSERT INTO alert_send_fingerprints(fingerprint,alert_type,truck_unit,load_id)
+            SELECT $7,$2,$3,$4
+            FROM stop_events current_event
+            JOIN latest_claim last ON TRUE
+            JOIN stop_events source_event ON source_event.id=last.stop_event_id
+            WHERE current_event.id=$5 AND current_event.status='pending'
+              AND current_event.truck_unit=$3 AND current_event.load_id=$4
+              AND source_event.truck_unit=$3 AND source_event.load_id=$4
+              AND (source_event.id=current_event.id OR source_event.status='expired')
+              AND last.first_seen_at<NOW()-INTERVAL '5 minutes'
+              AND current_event.briefing_driver_msg_id IS NULL
+              AND current_event.approach_driver_msg_id IS NULL
+              AND current_event.delivery_driver_msg_id IS NULL
+              AND current_event.red_flag_driver_msg_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM stop_events historical
+                  WHERE historical.id IN (SELECT stop_event_id FROM prior_claims)
+                    AND (historical.briefing_driver_msg_id IS NOT NULL
+                      OR historical.approach_driver_msg_id IS NOT NULL
+                      OR historical.delivery_driver_msg_id IS NOT NULL
+                      OR historical.red_flag_driver_msg_id IS NOT NULL)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM fuel_advice_audit sent
+                  WHERE (sent.stop_event_id=current_event.id
+                      OR sent.stop_event_id IN (SELECT stop_event_id FROM prior_claims))
+                    AND sent.kind='message_sent'
+                    AND COALESCE(sent.details->>'alert_type','') NOT LIKE 'dispatch_%'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM fuel_advice_audit uncertain
+                  WHERE (uncertain.stop_event_id=current_event.id
+                      OR uncertain.stop_event_id IN (SELECT stop_event_id FROM prior_claims))
+                    AND COALESCE(uncertain.details->>'alert_type','') NOT LIKE 'dispatch_%'
+                    AND (uncertain.kind='message_uncertain' OR (uncertain.kind='message_failed'
+                        AND COALESCE(uncertain.details->>'reason','')
+                            NOT IN ('circuit_open','rate_limited','telegram_rejected')))
+              )
+              AND EXISTS (
+                  SELECT 1 FROM fuel_advice_audit terminal
+                  WHERE terminal.stop_event_id=source_event.id
+                    AND ((terminal.kind IN ('message_held','message_suppressed')
+                          AND NOT EXISTS (SELECT 1 FROM fuel_advice_audit attempted
+                              WHERE attempted.stop_event_id=source_event.id
+                                AND attempted.kind='message_attempted'
+                                AND attempted.details->>'alert_type'=$6
+                                AND attempted.created_at>=last.first_seen_at))
+                      OR (terminal.kind='message_suppressed'
+                          AND terminal.details->>'reason'='transport_recipient_policy')
+                      OR (terminal.kind='message_failed' AND terminal.details->>'reason'
+                          IN ('circuit_open','rate_limited','telegram_rejected')))
+                    AND terminal.details->>'alert_type'=$6
+                    AND terminal.created_at>=last.first_seen_at
+                    AND terminal.created_at<NOW()-INTERVAL '5 minutes'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM fuel_advice_audit attempt
+                  WHERE (attempt.stop_event_id=current_event.id
+                      OR attempt.stop_event_id IN (SELECT stop_event_id FROM prior_claims))
+                    AND attempt.kind='message_attempted'
+                    AND COALESCE(attempt.details->>'alert_type','') NOT LIKE 'dispatch_%'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM fuel_advice_audit terminal
+                        WHERE terminal.stop_event_id=attempt.stop_event_id
+                          AND ((terminal.kind='message_suppressed'
+                                AND terminal.details->>'reason'='transport_recipient_policy')
+                            OR (terminal.kind='message_failed' AND terminal.details->>'reason'
+                                IN ('circuit_open','rate_limited','telegram_rejected')))
+                          AND terminal.details->>'alert_type'=attempt.details->>'alert_type'
+                          AND (terminal.created_at,terminal.id)>(attempt.created_at,attempt.id)
+                    )
+              )
+            ON CONFLICT(fingerprint) DO NOTHING RETURNING fingerprint
+        ), audited AS (
+            INSERT INTO fuel_advice_audit
+                (event_key,kind,truck_unit,load_id,stop_event_id,related_event_id,details)
+            SELECT 'driver_claim:' || fingerprint,'driver_delivery_claimed',$3,$4,$5,
+                   (SELECT stop_event_id FROM latest_claim),
+                   jsonb_build_object('fingerprint',fingerprint,'base_fingerprint',$1::text,
+                                      'alert_type',$6::text,'attempt','fresh_retry')
+            FROM claimed RETURNING id
+        ) SELECT fingerprint FROM claimed
+        """,
+        fingerprint, f"driver_{alert_kind}", truck_unit, load_id,
+        retry_event_id, alert_kind, retry_fingerprint,
     )
     return row is not None
 
@@ -1421,6 +1664,10 @@ def _driver_briefing_fingerprint(
     truck_unit: str,
     load_id: str,
     recommended_site_id: int,
+    route_phase: str | None = None,
+    route_context_sha256: str | None = None,
+    planned_gallons: float | None = None,
+    fill_to_full: bool | None = None,
 ) -> str:
     payload = "\x1f".join([
         "driver_briefing",
@@ -1429,6 +1676,12 @@ def _driver_briefing_fingerprint(
         load_id,
         str(recommended_site_id),
     ])
+    if route_phase is not None or route_context_sha256 is not None or planned_gallons is not None or fill_to_full is not None:
+        payload += "\x1f" + "\x1f".join([
+            route_phase or "", route_context_sha256 or "",
+            format(float(planned_gallons), ".6f") if planned_gallons is not None else "",
+            str(bool(fill_to_full)) if fill_to_full is not None else "",
+        ])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1517,6 +1770,10 @@ async def _suppress_driver_briefing_for_parked_truck(
         )
         return True
 
+    speed = getattr(stats, "speed_mph", None)
+    if speed is not None and float(speed) >= settings.DRIVER_REST_SPEED_MPH:
+        return False
+
     row = await fetch_one(
         """
         SELECT candidates
@@ -1574,6 +1831,36 @@ def _selected_candidate(raw: Any) -> dict[str, Any] | None:
     return first if isinstance(first, dict) else None
 
 
+def _has_accepted_driver_alert(event: dict[str, Any]) -> bool:
+    return any(event.get(column) is not None for column in (
+        "briefing_driver_msg_id", "approach_driver_msg_id", "delivery_driver_msg_id", "red_flag_driver_msg_id"))
+
+
+def _same_event_recipient(event: dict[str, Any], driver: dict[str, Any]) -> bool:
+    return (event.get("driver_id") == driver.get("driver_telegram_id")
+            and bool(event.get("samsara_vehicle_id"))
+            and str(event["samsara_vehicle_id"]) == str(driver.get("samsara_vehicle_id")))
+
+
+def _same_pending_plan(existing: dict, leg: dict, order: dict) -> bool:
+    previous = _selected_candidate(existing["candidates"]) or {}
+    fresh = _selected_candidate(leg["candidates_json"]) or {}
+    old_proof = previous.get("plan", {}).get("route_evidence", {})
+    new_proof = fresh.get("plan", {}).get("route_evidence", {})
+    if order.get("tms_provider") == "quickmanage":
+        if not _same_quickmanage_context(old_proof, new_proof):
+            return False
+    return (old_proof.get("model") == "remaining_route_v1"
+            and str(existing["recommended_site_id"]) == str(leg["recommended_site_id"])
+            and int(existing["gallons"]) == int(leg["gallons"])
+            and bool(previous.get("fill_to_full")) == bool(fresh.get("fill_to_full")))
+
+
+def _same_quickmanage_context(previous: dict, fresh: dict) -> bool:
+    keys = ("tms_provider", "route_phase", "route_phase_status", "route_context_source", "route_context_sha256")
+    return all(previous.get(key) and previous.get(key) == fresh.get(key) for key in keys)
+
+
 def _float_or_none(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -1590,6 +1877,15 @@ def _is_active(order: dict[str, Any]) -> bool:
     if not isinstance(status, str):
         return False
     return status.strip().lower() in ACTIVE_STATUSES
+
+
+def _is_current(order: dict[str, Any]) -> bool:
+    status = str(order.get("raw_status") or order.get("status") or "").strip().lower()
+    if status in {"reserved", "upcoming"}:
+        return False
+    if order.get("tms_provider") == "quickmanage":
+        return status in {"dispatched", "dispatching", "in_transit"}
+    return _is_active(order)
 
 
 def _load_context(order: dict[str, Any]) -> dict[str, Any]:

@@ -20,6 +20,9 @@ def event(age=0):
         "tms_order_id": "trip",
         "samsara_vehicle_id": "v1",
         "checked_at": (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat(),
+        "telemetry_checked_at": (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat(),
+        "gps_age_minutes_at_check": 1,
+        "fuel_age_minutes_at_check": 1,
     }
     return {
         "id": 1,
@@ -182,3 +185,83 @@ def test_manual_briefing_cannot_bypass_advice_guard(monkeypatch):
     assert message.reply_text.call_count == 1
     assert "cannot be verified" in message.reply_text.call_args.args[0]
     assert "Pilot" not in message.reply_text.call_args.args[0]
+
+
+@pytest.mark.parametrize("age", [0, 600])
+@pytest.mark.parametrize("change", ["phase", "target", "unchanged", "truck", "driver", "reserved", "legacy_proof", "unresolved_context", "assignment_conflict", "lookup_delayed", "telemetry_stale", "missing_telemetry"])
+def test_quickmanage_phase_is_rechecked_even_when_same_pump_and_quantity(monkeypatch, age, change):
+    from copy import deepcopy
+    from dieselup.core.trip_context import route_context_signature
+
+    original = {
+        "id": "trip", "load_number": "L1", "status": "dispatched", "raw_status": "dispatched",
+        "truck_unit_number": "100", "driver_full_name": "Jane Driver", "tms_provider": "quickmanage",
+        "route_phase": "pickup_then_delivery", "route_phase_status": "dispatched",
+        "route_context_source": "quickmanage_status",
+        "stops": [
+            {"id": "pickup", "type": "pickup", "latitude": 40, "longitude": -99.8},
+            {"id": "delivery", "type": "delivery", "latitude": 40, "longitude": -99},
+        ],
+    }
+    row = event(age)
+    proof = row["candidates"][0]["plan"]["route_evidence"]
+    proof.update({key: original[key] for key in (
+        "tms_provider", "route_phase", "route_phase_status", "route_context_source")})
+    proof["route_context_sha256"] = route_context_signature(original)
+    fresh = deepcopy(original)
+    if change == "phase":
+        fresh.update(status="in_transit", raw_status="in_transit", route_phase="delivery_only", route_phase_status="in_transit")
+    elif change == "target":
+        fresh["stops"][0]["longitude"] = -99.7
+    elif change == "truck":
+        fresh["truck_unit_number"] = "200"
+    elif change == "driver":
+        fresh["driver_full_name"] = "Other Driver"
+    elif change == "reserved":
+        fresh.update(status="reserved", raw_status="reserved", route_phase="reserved", route_phase_status="reserved")
+    elif change == "legacy_proof":
+        proof.pop("route_context_sha256")
+    elif change == "unresolved_context":
+        fresh["stops"][0]["latitude"] = None
+    elif change == "assignment_conflict":
+        fresh["assignment_conflict"] = True
+    elif change == "telemetry_stale":
+        proof["gps_age_minutes_at_check"] = 6
+    elif change == "missing_telemetry":
+        proof.pop("telemetry_checked_at")
+    order_lookup = AsyncMock(return_value=fresh)
+    if change == "lookup_delayed":
+        async def delayed_lookup(*_):
+            proof["checked_at"] = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
+            return fresh
+        order_lookup.side_effect = delayed_lookup
+
+    class Tms:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        async def iter_orders(self): yield fresh
+        get_order = staticmethod(order_lookup)
+
+    class Samsara:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        get_vehicle_stats = staticmethod(AsyncMock(return_value=SimpleNamespace(
+            lat=40, lng=-99.9, gps_age_minutes=1, fuel_age_minutes=1, mpg_rolling=6.5)))
+
+    planner = AsyncMock(return_value=LaneBuyPlan([BuyLeg(
+        CandidateStop(1, "Pilot", None, "X", "NJ", 40, -99.4, 4, 4.5), 80, 10, 0, 4)], 4))
+    monkeypatch.setattr(advice_guard, "fetch_one", AsyncMock(return_value=row))
+    monkeypatch.setattr(advice_guard, "make_tms_client", Tms)
+    monkeypatch.setattr(advice_guard, "SamsaraClient", Samsara)
+    monkeypatch.setattr(advice_guard, "plan_remaining_route", planner)
+    monkeypatch.setattr(load_sync, "_build_samsara_unit_map", AsyncMock(return_value={
+        "100": [VehicleSummary("v1", "100 - Jane Driver", "100")]}))
+
+    refreshed = change in {"lookup_delayed", "telemetry_stale", "missing_telemetry"}
+    assert asyncio.run(advice_guard.validate_fuel_event(1, "100", -101)) == (change == "unchanged" or refreshed)
+    if age == 0 and not refreshed:
+        order_lookup.assert_awaited_once_with("trip")
+    if refreshed:
+        planner.assert_awaited_once()
+    if change in {"phase", "target", "legacy_proof", "unresolved_context"}:
+        planner.assert_not_awaited()

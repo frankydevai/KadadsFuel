@@ -27,7 +27,7 @@ from typing import Any
 
 from telegram import Bot, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError, TelegramError
 
 from dieselup import metrics
 from dieselup.circuit_breaker import CircuitOpenError, telegram_breaker
@@ -118,6 +118,13 @@ async def safe_send(
         metrics.incr(f"alerts_{alert_type}_rate_limited")
         metrics.incr("alerts_rate_limited_total")
         log.warning("send.skip.rate_limited retry_after=%ss %s", exc.retry_after, ctx)
+    except BadRequest as exc:
+        # BadRequest inherits NetworkError, but an API rejection is a known
+        # negative delivery response rather than a lost transport reply.
+        error_kind, error_msg = "telegram_rejected", f"{type(exc).__name__}: {exc}"
+        metrics.incr(f"alerts_{alert_type}_telegram_err")
+        metrics.incr("alerts_telegram_err_total")
+        log.warning("send.fail.telegram %s: %s — %s", type(exc).__name__, exc, ctx)
     except (TimedOut, NetworkError) as exc:
         error_kind, error_msg = "transport", f"{type(exc).__name__}: {exc}"
         metrics.incr(f"alerts_{alert_type}_transport_err")
@@ -134,7 +141,7 @@ async def safe_send(
             metrics.incr("alerts_suppressed_recipient_total")
             log.info("send.suppressed.recipient.transport %s", ctx)
             return None
-        error_kind, error_msg = "telegram", f"{type(exc).__name__}: {exc}"
+        error_kind, error_msg = "telegram_rejected", f"{type(exc).__name__}: {exc}"
         metrics.incr(f"alerts_{alert_type}_telegram_err")
         metrics.incr("alerts_telegram_err_total")
         log.warning("send.fail.telegram %s: %s — %s", type(exc).__name__, exc, ctx)
@@ -165,6 +172,12 @@ async def safe_send(
             log.exception("send.delivered.audit_failed msg_id=%s %s", msg.message_id, ctx)
         return msg.message_id
 
+    if is_fuel_advice(alert_type) and error_kind in {"transport", "unknown", "telegram"}:
+        # Telegram may have accepted the post before its response was lost.
+        # Preserve the attempt, hold delivery and never replay its stored text.
+        await audit("uncertain", reason=error_kind)
+        metrics.incr("alerts_uncertain_fuel_delivery_total")
+        return None
     await audit("failed", reason=error_kind)
     # Send failed. Enqueue to DLQ unless caller opted out (retry job does that).
     if queue_on_failure:

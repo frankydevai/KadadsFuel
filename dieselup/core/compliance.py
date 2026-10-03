@@ -61,6 +61,7 @@ from dieselup.config import settings
 from dieselup.core.operating_scope import allows, allowed_units, unit_key
 from dieselup.core import advice_audit
 from dieselup.core.route_progress import passed_stop_evidence
+from dieselup.core.advice_guard import quickmanage_route_context_state
 from dieselup.db import execute, fetch_all, fetch_one
 from dieselup.core.price_sources import pilot_price_rows
 
@@ -344,6 +345,19 @@ async def _resolve_one(
             await advice_audit.record("monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
                                       details={"reason": "Fresh GPS is required to detect a missed stop"})
             return None
+        if _event_get(event,'tms_order_id') or _event_get(event,'datatruck_order_id'):
+            order=await datatruck.get_order(_event_get(event,'tms_order_id') or _event_get(event,'datatruck_order_id'))
+            if order.get("assignment_conflict"):
+                await advice_audit.record("monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
+                                          details={"reason": "current_assignment_conflict"})
+                return None
+            from dieselup.core.load_sync import _extract_truck_unit
+            from dieselup.clients.samsara import extract_unit_digits
+            if extract_unit_digits(_extract_truck_unit(order) or '') != extract_unit_digits(event['truck_unit']):
+                return await _expire_event(event,age_hours,reason='trip_assignment_changed')
+            context_state = quickmanage_route_context_state(proof, order)
+            if context_state != "same":
+                return await _hold_or_expire_route_context(event, age_hours, context_state)
         from dieselup.core.stop_visits import observe_visit
         await observe_visit(event["id"], location, rec_coords)
         stats = await samsara.get_vehicle_stats(vehicle_id)
@@ -351,12 +365,6 @@ async def _resolve_one(
             await advice_audit.record("monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
                                       details={"reason": "Fresh fuel data is required to monitor fueling"})
             return None
-        if _event_get(event,'tms_order_id') or _event_get(event,'datatruck_order_id'):
-            order=await datatruck.get_order(_event_get(event,'tms_order_id') or _event_get(event,'datatruck_order_id'))
-            from dieselup.core.load_sync import _extract_truck_unit
-            from dieselup.clients.samsara import extract_unit_digits
-            if extract_unit_digits(_extract_truck_unit(order) or '') != extract_unit_digits(event['truck_unit']):
-                return await _expire_event(event,age_hours,reason='trip_assignment_changed')
         # A truck may have fueled and left between compliance polls. Use the
         # brain's persisted observation before declaring a route bypass.
         observed = await fetch_one("""SELECT classification, site_id, gallons, fuel_pct_end,detected_at,finalized_at
@@ -430,12 +438,19 @@ async def _resolve_one(
     if verified_route:
         order_id = _event_get(event, "tms_order_id") or _event_get(event, "datatruck_order_id")
         order = await datatruck.get_order(order_id)
+        if order.get("assignment_conflict"):
+            await advice_audit.record("monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
+                                      details={"reason": "current_assignment_conflict"})
+            return None
         if _delivery_completed(order):
             return await _expire_event(event, age_hours, reason="trip_completed_without_verified_fueling")
         from dieselup.core.load_sync import _extract_truck_unit
         from dieselup.clients.samsara import extract_unit_digits
         if extract_unit_digits(_extract_truck_unit(order) or "") != extract_unit_digits(event["truck_unit"]):
             return await _expire_event(event, age_hours, reason="trip_assignment_changed")
+        context_state = quickmanage_route_context_state(proof, order)
+        if context_state != "same":
+            return await _hold_or_expire_route_context(event, age_hours, context_state)
         stats = await samsara.get_vehicle_stats(vehicle_id)
         if stats.fuel_age_minutes is None or not 0 <= stats.fuel_age_minutes <= settings.MAX_ADVICE_FUEL_AGE_MINUTES:
             await advice_audit.record("monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
@@ -524,6 +539,17 @@ async def _resolve_one(
     return None
 
 
+async def _hold_or_expire_route_context(event: Any, age_hours: float | None, state: str) -> str | None:
+    if state == "unverified":
+        await advice_audit.record(
+            "monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
+            details={"reason": "current_route_context_unverified"},
+        )
+        return None
+    reason = "legacy_plan_requires_route_refresh" if state == "legacy" else "current_route_phase_changed"
+    return await _expire_event(event, age_hours, reason=reason)
+
+
 def _event_get(event: Any, key: str) -> Any:
     """Tolerant field access for asyncpg Records and plain dicts alike."""
     try:
@@ -554,12 +580,10 @@ def _miles_from_plan_position(event: Any, location: Any) -> float | None:
 
 
 async def _expire_event(event: Any, age_hours: float | None, *, reason: str) -> str:
-    """Force-resolve a stale pending event as 'expired' (zero dollar impact).
+    """Expire operational advice neutrally while preserving send-claim history.
 
-    Also releases the driver-briefing fingerprint for this truck/load/site so
-    the replacement plan can re-brief the driver even if it picks the same
-    stop — without this, the replan went dispatch-only and the driver was left
-    with no live plan at all.
+    A replacement instruction must use current route evidence. The load-sync
+    retry gate may claim a fresh attempt only for a proven unsuccessful send.
     """
     log.warning(
         "compliance: event %d truck %s load %s is %.1fh old — force-resolving "
@@ -572,24 +596,8 @@ async def _expire_event(event: Any, age_hours: float | None, *, reason: str) -> 
         actual_site_id=None,
         actual_true_cost=None,
         dollar_impact=0.0,
+        evidence={"reason": reason},
     )
-    try:
-        from dieselup.core.load_sync import _driver_briefing_fingerprint
-        fingerprint = _driver_briefing_fingerprint(
-            alert_kind="briefing",
-            truck_unit=str(event["truck_unit"]),
-            load_id=str(event["load_id"]),
-            recommended_site_id=int(event["recommended_site_id"]),
-        )
-        await execute(
-            "DELETE FROM alert_send_fingerprints WHERE fingerprint = $1",
-            fingerprint,
-        )
-    except Exception:  # noqa: BLE001 — fingerprint release is best-effort
-        log.exception(
-            "compliance: failed to release briefing fingerprint for event %d",
-            event["id"],
-        )
     return "expired"
 
 

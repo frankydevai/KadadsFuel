@@ -60,6 +60,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("QUICKMANAGE_CLIENT_SECRET", "QM_CLIENT_SECRET"),
     )
     QUICKMANAGE_CREDENTIALS: str = ""  # optional client_id:client_secret shortcut
+    # Public address queries require the owner's approval. Keep disabled until
+    # that permission is granted, and confine it to the named trial trucks.
+    CENSUS_GEOCODING_ENABLED: bool = False
+    CENSUS_GEOCODING_TRUCK_UNITS: str = "6682,8089,8217"
     SAMSARA_API_TOKEN: str
     PILOT_ACCOUNT_NUMBER: str = ""
     LOVES_PRICE_CUSTOMER: str = ""

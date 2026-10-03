@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cached_property
+import heapq
 import hashlib
 import json
 import math
-from typing import Any
+from typing import Any, Sequence
 
 from dieselup.clients.routing import RoutingError
 from dieselup.clients.valhalla import ValhallaClient
@@ -17,6 +19,7 @@ from dieselup.core.ifta import true_cost_per_gallon
 from dieselup.core.lane_plan import BuyLeg, LaneBuyPlan
 from dieselup.core.optimizer import (
     CandidateStop,
+    EARTH_RADIUS_MILES,
     fetch_corridor_candidates,
     haversine_miles,
 )
@@ -58,40 +61,144 @@ def decode_shape(encoded: str) -> list[tuple[float, float]]:
     return values
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectionSegment:
+    index: int
+    a: tuple[float, float]
+    b: tuple[float, float]
+    length: float
+    walked: float
+    scale: float
+    dx: float
+    dy: float
+    bounds: tuple[float, float, float, float]
+
+    def project(self, point: tuple[float, float], last_index: int) -> tuple[float, float, int, bool]:
+        # Keep the original projection and distance formulas exactly. The
+        # spatial index only eliminates segments that cannot be the winner.
+        a, b = self.a, self.b
+        px, py = (point[1] - a[1]) * self.scale, point[0] - a[0]
+        t = (px * self.dx + py * self.dy) / (self.dx * self.dx + self.dy * self.dy)
+        clipped = min(1.0, max(0.0, t))
+        q = (a[0] + clipped * (b[0] - a[0]), a[1] + clipped * (b[1] - a[1]))
+        distance = haversine_miles(*point, *q)
+        progress = self.walked + clipped * self.length
+        outside = (self.index == 0 and t < 0) or (self.index == last_index and t > 1)
+        outside = outside or (progress <= 1e-6 and distance > 0.05)
+        return distance, progress, self.index, outside
+
+
+def _segment_bounds(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float, float, float]:
+    # The computed affine q can round just outside its endpoint interval.
+    # Widen outward so the box also encloses those floating-point results.
+    lat_pad = 8 * math.ulp(max(1.0, abs(a[0]), abs(b[0])))
+    lon_pad = 8 * math.ulp(max(1.0, abs(a[1]), abs(b[1])))
+    return (min(a[0], b[0]) - lat_pad, max(a[0], b[0]) + lat_pad,
+            min(a[1], b[1]) - lon_pad, max(a[1], b[1]) + lon_pad)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectionNode:
+    bounds: tuple[float, float, float, float]
+    min_cos_lat: float
+    first_index: int
+    segments: tuple[_ProjectionSegment, ...] = ()
+    children: tuple[_ProjectionNode, ...] = ()
+
+    def lower_bound(self, point: tuple[float, float], point_cos: float) -> float:
+        lat_lo, lat_hi, lon_lo, lon_hi = self.bounds
+        if (not -90 <= lat_lo <= lat_hi <= 90 or not -90 <= point[0] <= 90
+                or not -180 <= point[1] <= 180):
+            # At a padded pole or for unbounded inputs, preserve a full search.
+            # In particular, huge-longitude modulo reduction must not differ
+            # from the original haversine's trigonometric argument reduction.
+            return 0.0
+        lat_delta = max(lat_lo - point[0], point[0] - lat_hi, 0.0)
+        longitude = (point[1] + 180) % 360 - 180
+        if any(lon_lo <= longitude + shift <= lon_hi for shift in (-360, 0, 360)):
+            lon_delta = 0.0
+        else:
+            lon_delta = min(abs((longitude - edge + 180) % 360 - 180)
+                            for edge in (lon_lo, lon_hi))
+        # Every affine q lies in this box. The independent minima of latitude,
+        # circular longitude and cos(q latitude) bound its spherical haversine
+        # term below. They need not occur at the same q. The absolute rounding
+        # allowance lowers the bound; it never changes a winning projection.
+        h = (math.sin(math.radians(lat_delta) / 2) ** 2
+             + point_cos * self.min_cos_lat * math.sin(math.radians(lon_delta) / 2) ** 2)
+        h = max(0.0, min(1.0, h - 64 * math.ulp(1.0)))
+        return 2 * EARTH_RADIUS_MILES * math.asin(math.sqrt(h))
+
+
+def _projection_tree(segments: tuple[_ProjectionSegment, ...]) -> _ProjectionNode:
+    bounds = (min(s.bounds[0] for s in segments), max(s.bounds[1] for s in segments),
+              min(s.bounds[2] for s in segments), max(s.bounds[3] for s in segments))
+    min_cos = max(0.0, min(math.cos(math.radians(bounds[0])), math.cos(math.radians(bounds[1]))))
+    first = min(s.index for s in segments)
+    if len(segments) <= 8:
+        return _ProjectionNode(bounds, min_cos, first, segments=segments)
+    # Split by spatial extent, not original order; loops and retraced roads
+    # still retain their original progress and tie ordering in the leaves.
+    axis = 0 if bounds[1] - bounds[0] >= bounds[3] - bounds[2] else 2
+    ordered = sorted(segments, key=lambda s: s.bounds[axis] + s.bounds[axis + 1])
+    middle = len(ordered) // 2
+    children = (_projection_tree(tuple(ordered[:middle])), _projection_tree(tuple(ordered[middle:])))
+    return _ProjectionNode(bounds, min_cos, first, children=children)
+
+
 @dataclass(frozen=True)
 class RouteLeg:
-    shape: list[tuple[float, float]]
+    shape: Sequence[tuple[float, float]]
     road_miles: float
 
-    def project(self, point: tuple[float, float]) -> tuple[float, float, bool]:
-        """(progress, distance from route, outside endpoint). Geometry only
-        selects/order stations; all fuel burn uses directed road distances.
-        """
-        best = None
+    def __post_init__(self) -> None:
+        # Cached geometry belongs to this frozen leg, including when callers
+        # supply a mutable outer list or mutable point lists.
+        object.__setattr__(self, "shape", tuple(tuple(point) for point in self.shape))
+
+    @cached_property
+    def _projection_index(self) -> _ProjectionNode:
+        segments = []
         walked = 0.0
         for index, (a, b) in enumerate(zip(self.shape, self.shape[1:])):
             length = haversine_miles(*a, *b)
             if length <= 1e-9:
                 continue
             scale = math.cos(math.radians((a[0] + b[0]) / 2))
-            dx, dy = (b[1] - a[1]) * scale, b[0] - a[0]
-            px, py = (point[1] - a[1]) * scale, point[0] - a[0]
-            t = (px * dx + py * dy) / (dx * dx + dy * dy)
-            clipped = min(1.0, max(0.0, t))
-            q = (a[0] + clipped * (b[0] - a[0]), a[1] + clipped * (b[1] - a[1]))
-            distance = haversine_miles(*point, *q)
-            progress = walked + clipped * length
-            outside = (index == 0 and t < 0) or (index == len(self.shape) - 2 and t > 1)
-            # Stops whose closest point is the departure endpoint are not
-            # ahead, unless the truck is already at that station.
-            outside = outside or (progress <= 1e-6 and distance > 0.05)
-            value = (distance, progress, outside)
-            if best is None or value[:2] < best[:2]:
-                best = value
+            segments.append(_ProjectionSegment(index, a, b, length, walked, scale,
+                                               (b[1] - a[1]) * scale, b[0] - a[0],
+                                               _segment_bounds(a, b)))
             walked += length
-        if best is None:
+        if not segments:
             raise RoutingError("Valhalla route geometry has no usable segments")
-        return best[1], best[0], best[2]
+        return _projection_tree(tuple(segments))
+
+    def project(self, point: tuple[float, float]) -> tuple[float, float, bool]:
+        """Exact (progress, route distance, outside endpoint), using local search.
+
+        Geometry only selects/orders stations; fuel burn uses road distances.
+        Every approach vertex is still checked, without sampling or shortcuts.
+        """
+        root = self._projection_index
+        queue = [(0.0, root.first_index, root)]
+        best = None
+        point_cos = math.cos(math.radians(point[0]))
+        last_index = len(self.shape) - 2
+        while queue:
+            bound, _, node = heapq.heappop(queue)
+            if best is not None and bound > best[0]:
+                continue
+            for segment in node.segments:
+                value = segment.project(point, last_index)
+                # The original scan retained the earliest segment on an exact
+                # distance/progress tie, including that segment's outside flag.
+                if best is None or value[:3] < best[:3]:
+                    best = value
+            for child in node.children:
+                bound = child.lower_bound(point, point_cos)
+                if best is None or bound <= best[0]:
+                    heapq.heappush(queue, (bound, child.first_index, child))
+        return best[1], best[0], best[3]
 
 
 async def remaining_geometry(

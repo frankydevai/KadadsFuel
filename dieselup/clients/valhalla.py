@@ -1,7 +1,7 @@
-"""Thin async wrapper around pyvalhalla's Actor.
+"""Async Valhalla truck routing with bounded HTTP retries.
 
-Valhalla is a routing dependency, not a bot-critical dependency: every public method logs and
-returns None on failure so a bad tile/config/route never crashes the poll loop.
+HTTP failures raise RoutingError so planning holds without inventing a route.
+The optional local Actor adapter returns None when its configuration fails.
 """
 
 from __future__ import annotations
@@ -261,7 +261,10 @@ class ValhallaClient:
                         json=payload,
                         headers={"X-Valhalla-Key": settings.VALHALLA_API_SECRET},
                     )
-                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                    # Server disconnects and truncated replies are protocol
+                    # errors, not NetworkError subclasses. Retry the same
+                    # truck request, then preserve the typed routing hold.
                     if attempt < 2:
                         await asyncio.sleep(0.25 * (2**attempt))
                         continue

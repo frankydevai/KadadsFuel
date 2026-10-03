@@ -339,3 +339,43 @@ def test_truck_lookup_must_prove_one_exact_record_and_consistent_unit(items):
             })
 
     assert asyncio.run(run())["assignment_conflict"] is True
+
+
+@pytest.mark.parametrize("placeholder", ["00000000-0000-0000-0000-000000000000", "00000000000000000000000000000000"])
+def test_nil_uuid_unassigned_delivery_does_not_conflict_with_real_pickup_truck(placeholder):
+    truck_id = "11111111-1111-1111-1111-111111111111"
+    async def run():
+        async with QuickManageClient() as client:
+            async def forbidden(*args):
+                pytest.fail("An unassigned nil UUID must not trigger a truck lookup")
+            client._post = forbidden
+            return await client._normalize_trip({
+                "id": "nil-delivery", "status": "dispatched", "truck_number": "8089",
+                "truck_id": placeholder,
+                "stops": [{"pickup": True, "assigned_truck_id": truck_id,
+                           "assigned_truck": {"id": truck_id, "unit": "8089"}},
+                          {"pickup": False, "assigned_truck_id": placeholder}],
+            })
+    row = asyncio.run(run())
+    assert row["assignment_conflict"] is False
+    assert row["truck_id"] == truck_id
+    assert row["assigned_truck_ids"] == [truck_id]
+    assert row["stops"][1]["assigned_truck_id"] is None
+    assert row["stops"][1]["assigned_truck_ids"] == []
+
+
+@pytest.mark.parametrize("delivery", [
+    {"assigned_truck_id": "00000000-0000-0000-0000-000000000001"},
+    {"assigned_truck_id": "00000000-0000-0000-0000-000000000000",
+     "assigned_truck": {"unit": "8217"}},
+])
+def test_nil_placeholder_exception_does_not_hide_real_id_or_unit_conflicts(delivery):
+    async def run():
+        async with QuickManageClient() as client:
+            return await client._normalize_trip({
+                "id": "real-conflict", "status": "dispatched", "truck_number": "8089",
+                "stops": [{"pickup": True, "assigned_truck": {
+                    "id": "11111111-1111-1111-1111-111111111111", "unit": "8089"}},
+                          {"pickup": False, **delivery}],
+            })
+    assert asyncio.run(run())["assignment_conflict"] is True

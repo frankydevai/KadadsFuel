@@ -10,6 +10,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import time
 from typing import Any, AsyncIterator
+from uuid import UUID
 
 import httpx
 
@@ -427,7 +428,20 @@ def _clean(value: Any) -> str | None:
 
 
 def _truck_ids(*values: Any) -> list[str]:
-    return sorted({text for value in values if (text := _clean(value))})
+    ids = set()
+    for value in values:
+        text = _clean(value)
+        if text is None:
+            continue
+        try:
+            if UUID(text).int == 0:
+                # QuickManage uses the nil UUID for an unassigned stop. It is
+                # absence of an assignment, not a second physical truck.
+                continue
+        except ValueError:
+            pass
+        ids.add(text)
+    return sorted(ids)
 
 
 def _truck_units(truck: dict[str, Any]) -> list[str]:

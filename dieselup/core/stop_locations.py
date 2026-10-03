@@ -17,6 +17,7 @@ import re
 import time
 from typing import Any
 import unicodedata
+from uuid import UUID
 
 from dieselup.core.trip_context import (
     TripContextError, _quickmanage_navigation_stops, completion_state,
@@ -25,6 +26,18 @@ from dieselup.core.trip_context import (
 
 class StopLocationError(RuntimeError):
     """A complete, current provider result could not be verified."""
+
+
+def _truck_assignment_id(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if UUID(text).int == 0:
+            return None
+    except ValueError:
+        pass
+    return text
 
 
 _STATES = dict(zip(
@@ -349,21 +362,19 @@ class StopLocationResolver:
         if any(s.get("assigned_truck_unit") not in (None, "")
                and unit_key(s["assigned_truck_unit"]) != unit_key(unit) for s in required):
             return result
-        trip_id = str(order.get("truck_id") or "").strip()
+        trip_id = _truck_assignment_id(order.get("truck_id"))
         ids = {trip_id} if trip_id else set()
         order_ids = order.get("assigned_truck_ids") or []
         if not isinstance(order_ids, list):
             return result
-        ids.update(str(value).strip() for value in order_ids
-                   if value not in (None, ""))
+        ids.update(truck_id for value in order_ids if (truck_id := _truck_assignment_id(value)))
         for stop in required:
             values = stop.get("assigned_truck_ids") or []
             if not isinstance(values, list):
                 return result
-            stop_ids = {str(value).strip() for value in values
-                        if value not in (None, "")}
-            if stop.get("assigned_truck_id") not in (None, ""):
-                stop_ids.add(str(stop["assigned_truck_id"]).strip())
+            stop_ids = {truck_id for value in values if (truck_id := _truck_assignment_id(value))}
+            if truck_id := _truck_assignment_id(stop.get("assigned_truck_id")):
+                stop_ids.add(truck_id)
             ids.update(stop_ids)
             # A bare stop ID has no proven link to the selected physical unit.
             # Normalization resolves it first; direct callers must provide the

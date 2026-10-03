@@ -278,6 +278,37 @@ def test_known_trip_id_proves_same_required_stop_assignment(selected_scope):
     assert result["stops"][0]["coordinate_source"] == "samsara_address"
 
 
+@pytest.mark.parametrize("placeholder", ["00000000-0000-0000-0000-000000000000", "00000000000000000000000000000000"])
+def test_nil_delivery_assignment_does_not_block_saved_facility_lookup(selected_scope, placeholder):
+    truck_id = "11111111-1111-1111-1111-111111111111"
+    client = SimpleNamespace(_get_json=AsyncMock(return_value=page([facility()])))
+    original = order(truck_id=truck_id, assigned_truck_ids=[truck_id, placeholder], stops=[
+        stop(type="pickup", assigned_truck_id=truck_id, assigned_truck_unit="8089"),
+        stop(type="delivery", assigned_truck_id=placeholder, assigned_truck_ids=[placeholder]),
+    ])
+    result = asyncio.run(StopLocationResolver(client).enrich_order(original))
+    assert all(s["coordinate_source"] == "samsara_address" for s in result["stops"])
+    assert result["stops"][1]["assigned_truck_id"] == placeholder
+    assert original["stops"][1]["coordinate_source"] == "zip_centroid"
+
+
+def test_nil_trip_id_without_any_stop_assignment_allows_saved_facility_lookup(selected_scope):
+    placeholder = "00000000-0000-0000-0000-000000000000"
+    client = SimpleNamespace(_get_json=AsyncMock(return_value=page([facility()])))
+    original = order(truck_id=placeholder, assigned_truck_ids=[placeholder],
+                     stops=[stop(assigned_truck_id=placeholder)])
+    result = asyncio.run(StopLocationResolver(client).enrich_order(original))
+    assert result["stops"][0]["coordinate_source"] == "samsara_address"
+
+
+def test_nonzero_uuid_still_blocks_mixed_assignment_location_queries(selected_scope):
+    client = SimpleNamespace(_get_json=AsyncMock(return_value=page([facility()])))
+    original = order(truck_id="11111111-1111-1111-1111-111111111111", stops=[
+        stop(assigned_truck_id="00000000-0000-0000-0000-000000000001", assigned_truck_unit="8089")])
+    assert asyncio.run(StopLocationResolver(client).enrich_order(original)) == original
+    client._get_json.assert_not_awaited()
+
+
 def test_only_phase_required_stop_unit_is_checked_without_rewriting_history(selected_scope):
     client = SimpleNamespace(_get_json=AsyncMock(return_value=page([facility()])))
     original = order("in_transit", stops=[

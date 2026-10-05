@@ -58,7 +58,7 @@ def test_other_stop_only_alerts_on_confirmed_more_expensive_fueling(monkeypatch,
     monkeypatch.setattr(observed_fueling,'analysis',AsyncMock(return_value=(facts,{'site_id':2} if actual else None)))
     marked=AsyncMock();alert=AsyncMock()
     monkeypatch.setattr(compliance,'_mark_resolved',marked);monkeypatch.setattr(compliance,'_stamp_fuel_delta',AsyncMock());monkeypatch.setattr(compliance,'_send_wrong_stop_alert',alert)
-    event={'id':10,'candidates':[{'your_price':3.5,'price_date':date}]}
+    event={'id':10,'briefing_driver_msg_id':900,'candidates':[{'your_price':3.5,'price_date':date}]}
     asyncio.run(compliance._resolve_observed_other_fueling(event,{'gallons':80,'fuel_pct_end':90,'site_id':2},None,None))
     assert bool(alert.call_count)==expected_alert
     assert marked.call_args.kwargs['dollar_impact']==(24 if actual==3.2 else -24 if actual==3.8 else 0)

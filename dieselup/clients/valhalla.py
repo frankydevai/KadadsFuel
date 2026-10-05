@@ -197,7 +197,10 @@ class ValhallaClient:
             "locations": locations,
             "costing": "truck",
             "costing_options": {"truck": TRUCK_OPTS},
-            "directions_options": {"units": "miles"},
+            # Fuel planning consumes complete shapes and leg summaries. Skip
+            # unused narration so large responses are less likely to truncate.
+            "units": "miles",
+            "directions_type": "none",
             "alternates": max(0, int(alternates or 0)),
         }
         data = await self._actor_call("route", payload)

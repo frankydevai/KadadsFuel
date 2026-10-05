@@ -43,6 +43,12 @@ def gauge(name: str, value: float) -> None:
     """Set the current value of a gauge."""
     with _lock:
         _gauges[name] = float(value)
+        if name.endswith('_last_heartbeat_mono') or name in {
+            'valhalla_last_success_mono', 'valhalla_last_failure_mono',
+        }:
+            # macOS monotonic time can pause during system sleep. Pair each
+            # completed-work timestamp atomically with real elapsed time.
+            _gauges[name[:-5] + '_unix'] = time.time()
 
 
 class Timer:

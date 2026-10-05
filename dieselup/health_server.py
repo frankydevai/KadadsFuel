@@ -33,11 +33,12 @@ from dieselup.circuit_breaker import (
 
 log = logging.getLogger(__name__)
 
-# Sweep heartbeats are recorded as monotonic timestamps in metrics gauges.
+# Sweep heartbeats have paired monotonic and Unix timestamps in metrics gauges.
 # If the most recent recorded heartbeat is older than STALE_AFTER_SECONDS
 # we report unhealthy (503).
 STALE_AFTER_SECONDS = 300.0  # 5 min
 _STARTED_MONO = time.monotonic()
+_STARTED_UNIX = time.time()
 # Each scheduled job must progress independently. Allow its interval plus
 # bounded execution time, rather than using the most recent job to mask stalls.
 _JOB_MAX_AGE = {
@@ -48,14 +49,27 @@ _JOB_MAX_AGE = {
 }
 
 
+def _timestamp_age(gauges: dict, key: str, now_mono: float, now_unix: float) -> float:
+    """Retain elapsed active time and count suspension, without negative ages."""
+    ages = [0.0, now_mono - float(gauges[key])]
+    wall = gauges.get(key[:-5] + '_unix')
+    if wall is not None:
+        ages.append(now_unix - float(wall))
+    return max(ages)
+
+
 def _job_statuses() -> dict[str, Any]:
     gauges = metrics.snapshot().get("gauges", {})
-    now = time.monotonic()
+    now, wall_now = time.monotonic(), time.time()
+    startup_age = max(0.0, now - _STARTED_MONO, wall_now - _STARTED_UNIX)
     return {
         job: {
-            "age_seconds": round(now - gauges[job + "_last_heartbeat_mono"], 1)
+            "age_seconds": round(_timestamp_age(gauges, job + "_last_heartbeat_mono", now, wall_now), 1)
             if job + "_last_heartbeat_mono" in gauges else None,
-            "stale": now - gauges.get(job + "_last_heartbeat_mono", _STARTED_MONO) > max_age,
+            "stale": (
+                _timestamp_age(gauges, job + "_last_heartbeat_mono", now, wall_now)
+                if job + "_last_heartbeat_mono" in gauges else startup_age
+            ) > max_age,
             "max_age_seconds": max_age,
         }
         for job, max_age in _JOB_MAX_AGE.items()
@@ -70,7 +84,7 @@ def _seconds_since_last_sweep() -> float:
     """
     snap = metrics.snapshot()
     g = snap.get("gauges", {})
-    now = time.monotonic()
+    now, wall_now = time.monotonic(), time.time()
     ages = []
     for key in (
         "load_sync_last_heartbeat_mono",
@@ -79,7 +93,7 @@ def _seconds_since_last_sweep() -> float:
     ):
         ts = g.get(key)
         if ts is not None:
-            ages.append(now - float(ts))
+            ages.append(_timestamp_age(g, key, now, wall_now))
     if not ages:
         return float("inf")
     return min(ages)
@@ -91,6 +105,8 @@ def _ok_status() -> tuple[int, str]:
     age = _seconds_since_last_sweep()
     snap = metrics.snapshot()
     counters = snap.get("counters", {})
+    if snap.get("gauges", {}).get("singleton_leader_active") == 0:
+        return 503, "BLOCKED — database bot leadership is not verified"
     if snap.get("gauges", {}).get("bot_paused", 0):
         return 503, "PAUSED — automated fuel planning is paused by an administrator"
     if snap.get("gauges", {}).get("fuel_prices_stale", 0):
@@ -117,7 +133,8 @@ def _routing_status() -> dict[str, Any]:
     gauges = metrics.snapshot().get("gauges", {})
     success = gauges.get("valhalla_last_success_mono")
     failure = gauges.get("valhalla_last_failure_mono")
-    age = None if success is None else max(0.0, time.monotonic() - success)
+    age = None if success is None else _timestamp_age(
+        gauges, 'valhalla_last_success_mono', time.monotonic(), time.time())
     status = "unverified"
     if not valhalla_configured or (failure is not None and (success is None or failure >= success)):
         status = "red"

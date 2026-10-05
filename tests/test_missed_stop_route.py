@@ -36,7 +36,7 @@ def test_monitor_checks_freshness_and_persisted_fueling_before_scoring_a_miss(mo
     event = {"id": 10, "truck_unit": "100", "load_id": "L1", "tms_order_id": "trip",
         "samsara_vehicle_id": "v1", "candidates": json.dumps([stop]), "recommended_site_id": 1,
         "recommended_true_cost": 3, "worst_candidate_true_cost": 4, "gallons": 80,
-        "fuel_pct_before": 50, "approach_ping_sent_at": None,
+        "fuel_pct_before": 50, "approach_ping_sent_at": None, "briefing_driver_msg_id": 900,
         "recommended_at": datetime.now(timezone.utc)}
     observed = None
     if case in {"filled_then_left", "fuel_elsewhere"}:

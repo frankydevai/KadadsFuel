@@ -187,7 +187,7 @@ async def _resolve_pending_events(bot: Bot) -> None:
         SELECT id, truck_unit, driver_id, load_id, datatruck_order_id, tms_order_id,
                recommended_site_id, recommended_true_cost,
                worst_candidate_true_cost, gallons, candidates,
-               approach_ping_sent_at, briefing_driver_msg_id,
+               approach_ping_sent_at, briefing_driver_msg_id, approach_driver_msg_id,
                delivery_driver_msg_id, fuel_pct_before, recommended_at,
                samsara_vehicle_id
         FROM stop_events
@@ -365,6 +365,7 @@ async def _resolve_one(
             await advice_audit.record("monitor_held", truck_unit=event["truck_unit"], event_id=event["id"],
                                       details={"reason": "Fresh fuel data is required to monitor fueling"})
             return None
+        instruction_delivered = await _instruction_delivered(event, driver_telegram_id)
         # A truck may have fueled and left between compliance polls. Use the
         # brain's persisted observation before declaring a route bypass.
         observed = await fetch_one("""SELECT classification, site_id, gallons, fuel_pct_end,detected_at,finalized_at
@@ -374,6 +375,12 @@ async def _resolve_one(
         if observed and observed.get('finalized_at') is None:
             await advice_audit.record('monitor_held',event_id=event['id'],details={'reason':'Fueling is in progress; final quantity awaits a stable reading'})
             return None
+        if observed and not instruction_delivered:
+            return await _expire_unadvised(event, bot, "advice_not_delivered_before_fueling", {
+                "fueling_observed": True, "classification": observed.get("classification"),
+                "site_id": observed.get("site_id"), "actual_gallons": observed.get("gallons"),
+                "fuel_pct_end": observed.get("fuel_pct_end"),
+            })
         if observed and observed.get("classification") == "recommended":
             actual = float(observed["gallons"])
             await _mark_resolved(event_id=event["id"], status="saved", actual_site_id=event["recommended_site_id"],
@@ -481,6 +488,10 @@ async def _resolve_one(
                 age_hours,
                 reason=f"unreliable_missed_stop_distance_{round(distance_miles)}mi",
             )
+        if not await _instruction_delivered(event, driver_telegram_id):
+            return await _expire_unadvised(event, bot, "advice_not_delivered_before_passage", {
+                "route_passage_evidence": missed_evidence,
+            })
         visited = await advice_audit.fetch_one("SELECT id FROM fuel_advice_audit WHERE stop_event_id=$1 AND kind='stop_visited' LIMIT 1", event["id"])
         if visited:
             missed_evidence = {**missed_evidence, "visited": True, "reason": "visited_without_confirmed_fueling"}
@@ -548,6 +559,48 @@ async def _hold_or_expire_route_context(event: Any, age_hours: float | None, sta
         return None
     reason = "legacy_plan_requires_route_refresh" if state == "legacy" else "current_route_phase_changed"
     return await _expire_event(event, age_hours, reason=reason)
+
+
+async def _instruction_delivered(event: Any, recipient_id: int | None) -> bool:
+    """Claims, warning IDs and uncertain attempts are not an accepted plan."""
+    for column in ("briefing_driver_msg_id", "approach_driver_msg_id", "delivery_driver_msg_id"):
+        value = _event_get(event, column)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return True
+    group_id = _event_get(event, "driver_id") or recipient_id
+    if group_id is None:
+        return False
+    row = await fetch_one("""SELECT kind,details->>'alert_type' AS alert_type,
+        details->>'chat_id' AS chat_id,details->>'message_id' AS message_id
+        FROM fuel_advice_audit WHERE stop_event_id=$1 AND kind='message_sent'
+          AND details->>'chat_id'=$2
+          AND regexp_replace(details->>'alert_type','^(retry_)+','')
+              IN ('briefing','approach','delivery','delivery_complete')
+          AND details->>'message_id' ~ '^[1-9][0-9]*$'
+        ORDER BY created_at,id LIMIT 1""", event["id"], str(group_id))
+    if row is None or _event_get(row, "kind") != "message_sent":
+        return False
+    alert_type = str(_event_get(row, "alert_type") or "")
+    while alert_type.startswith("retry_"):
+        alert_type = alert_type[6:]
+    message_id = str(_event_get(row, "message_id") or "")
+    return (_event_get(row, "chat_id") == str(group_id)
+            and alert_type in {"briefing", "approach", "delivery", "delivery_complete"}
+            and message_id.isdecimal() and int(message_id) > 0)
+
+
+async def _expire_unadvised(event: Any, bot: Bot, reason: str, evidence: dict) -> str:
+    """Keep real observations while resolving an unreceived plan neutrally."""
+    await _mark_resolved(event_id=event["id"], status="expired", actual_site_id=evidence.get("site_id"),
+        actual_true_cost=None, dollar_impact=0, evidence={"reason": reason, **evidence})
+    if evidence.get("fueling_observed"):
+        await _stamp_fuel_delta(event_id=event["id"], fuel_pct_after=float(evidence["fuel_pct_end"]),
+            actual_gallons=float(evidence["actual_gallons"]))
+    # stop_expired's reason is also a durable request for the regular replan
+    # sweep if this immediate check is interrupted or cannot verify a route.
+    from dieselup.core.fuel_replan import replan_truck
+    await replan_truck(bot, event["truck_unit"], event["id"])
+    return "expired"
 
 
 def _event_get(event: Any, key: str) -> Any:
@@ -645,6 +698,12 @@ async def _stamp_fuel_delta(
 
 
 async def _resolve_observed_other_fueling(event,observed,bot,driver_telegram_id,*,location=None):
+    if not await _instruction_delivered(event, driver_telegram_id):
+        return await _expire_unadvised(event, bot, "advice_not_delivered_before_fueling", {
+            "fueling_observed": True, "classification": observed.get("classification"),
+            "site_id": observed.get("site_id"), "actual_gallons": observed.get("gallons"),
+            "fuel_pct_end": observed.get("fuel_pct_end"),
+        })
     from dieselup.core.observed_fueling import analysis
     advised = _selected_stop_from_event(event) or {}
     facts, actual_stop = await analysis(event,observed,advised)
@@ -1173,6 +1232,8 @@ async def _send_red_flag_alert(
                 truck_unit=truck_unit,
                 load_id=load_id,
                 extra={"event_id": event_id},
+                stop_event_id=event_id,
+                msg_id_column="red_flag_driver_msg_id",
                 queue_on_failure=False,
                 replace_previous_driver_alert=True,
             )

@@ -13,7 +13,10 @@ async def run_requested_replans(bot):
     requests = await fetch_all("""
         SELECT DISTINCT ON (a.truck_unit) a.truck_unit, a.load_id, a.stop_event_id
         FROM fuel_advice_audit a
-        WHERE (a.kind IN ('missed_detected','stop_visited_no_fill') OR (a.kind='stop_lost' AND a.details->'bypass_evidence'->>'method'='ordered_road_route'))
+        WHERE (a.kind IN ('missed_detected','stop_visited_no_fill')
+          OR (a.kind='stop_lost' AND a.details->'bypass_evidence'->>'method'='ordered_road_route')
+          OR (a.kind='stop_expired' AND a.details->>'reason' IN
+              ('advice_not_delivered_before_passage','advice_not_delivered_before_fueling')))
           AND ($1::text[] IS NULL OR ltrim(upper(a.truck_unit),'0')=ANY($1))
           AND NOT EXISTS (SELECT 1 FROM fuel_advice_audit done
               WHERE done.kind='replan_completed' AND done.truck_unit=a.truck_unit AND done.created_at>=a.created_at)

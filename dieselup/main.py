@@ -457,14 +457,19 @@ async def _acquire_singleton_lock() -> Any:
 async def _release_singleton_lock(conn: Any) -> None:
     try:
         if not conn.is_closed():
-            await conn.execute("SELECT pg_advisory_unlock($1)", APP_SINGLETON_LOCK_ID,
-                               timeout=LEADER_CHECK_TIMEOUT_SECONDS)
+            # asyncpg can wait for a previous cancellation before its query
+            # timeout starts. Bound the whole operation as well as the query.
+            async with asyncio.timeout(LEADER_CHECK_TIMEOUT_SECONDS):
+                await conn.execute("SELECT pg_advisory_unlock($1)", APP_SINGLETON_LOCK_ID,
+                                   timeout=LEADER_CHECK_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 — shutdown should continue
         log.warning("Failed to release app singleton lock: %s", type(exc).__name__)
+        with suppress(Exception): conn.terminate()
     finally:
         pool = await get_pool()
         try:
-            await pool.release(conn, timeout=LEADER_CHECK_TIMEOUT_SECONDS)
+            async with asyncio.timeout(LEADER_CHECK_TIMEOUT_SECONDS):
+                await pool.release(conn, timeout=LEADER_CHECK_TIMEOUT_SECONDS)
         except Exception as exc:
             log.warning("Failed to return singleton connection: %s", type(exc).__name__)
             with suppress(Exception): conn.terminate()

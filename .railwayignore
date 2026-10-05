@@ -3,3 +3,17 @@
 .git
 __pycache__
 *.pyc
+.pytest_cache
+.runtime
+.venv
+venv
+.DS_Store
+.ruff_cache
+outputs
+work
+private
+LOCAL-RUNNING.md
+StartKadads.command
+StopKadads.command
+start_local.py
+supervise.py

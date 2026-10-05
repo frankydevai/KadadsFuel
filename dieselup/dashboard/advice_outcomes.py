@@ -54,7 +54,11 @@ WITH facts AS (
    a.financial->>'price_source' AS price_source,
    (a.financial->>'fueling_at')::timestamptz AS fueling_at,
    COALESCE(a.financial->>'fueling_confirmed'='true',FALSE) AS fueled_elsewhere,
-   a.replacement_id, a.replaces_id, a.hold_reason
+   a.replacement_id, a.replaces_id, a.neutral_expiry_reason,
+   CASE a.neutral_expiry_reason
+     WHEN 'advice_not_delivered_before_passage' THEN 'Fuel advice was not confirmed delivered before the truck passed this stop.'
+     WHEN 'advice_not_delivered_before_fueling' THEN 'Fueling was observed before this advice was confirmed delivered; no driver penalty.'
+     ELSE a.hold_reason END AS hold_reason
  FROM stop_events se
  LEFT JOIN LATERAL (
    SELECT min(created_at) FILTER (WHERE kind='stop_visited') AS visit_at,
@@ -67,7 +71,10 @@ WITH facts AS (
      max(related_event_id) FILTER (WHERE kind='replan_completed') AS replacement_id,
      max(related_event_id) FILTER (WHERE kind='plan_created') AS replaces_id,
      (array_agg(details->>'reason' ORDER BY id DESC)
-       FILTER (WHERE kind IN ('monitor_held','replan_held') AND details ? 'reason'))[1] AS hold_reason
+       FILTER (WHERE kind IN ('monitor_held','replan_held') AND details ? 'reason'))[1] AS hold_reason,
+     (array_agg(details->>'reason' ORDER BY created_at DESC,id DESC)
+       FILTER (WHERE kind='stop_expired' AND details->>'reason' IN
+         ('advice_not_delivered_before_passage','advice_not_delivered_before_fueling')))[1] AS neutral_expiry_reason
    FROM fuel_advice_audit WHERE stop_event_id=se.id
  ) a ON TRUE
  LEFT JOIN LATERAL (
@@ -81,11 +88,12 @@ WITH facts AS (
    AND ($3::text IS NULL OR se.load_id=$3)
 ), outcomes AS (
  SELECT *, CASE WHEN visited_at IS NOT NULL THEN 'visited'
-                 WHEN missed_at IS NOT NULL AND route_verified THEN 'missed'
+                 WHEN missed_at IS NOT NULL AND route_verified AND neutral_expiry_reason IS NULL THEN 'missed'
                  WHEN status='pending' THEN 'pending' ELSE 'unconfirmed' END AS outcome,
     CASE WHEN driver_name IS NOT NULL AND snapshot_group=driver_id::text
          THEN md5(lower(driver_name) || ':' || snapshot_group) END AS driver_key,
-    CASE WHEN visited_at IS NOT NULL THEN visited_at ELSE missed_at END AS outcome_at
+    CASE WHEN visited_at IS NOT NULL THEN visited_at
+         WHEN neutral_expiry_reason IS NULL THEN missed_at END AS outcome_at
  FROM facts
 ), projected AS (
  SELECT *, CASE

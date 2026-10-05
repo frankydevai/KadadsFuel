@@ -227,10 +227,9 @@ class QuickManageClient:
             coordinate_source = "exact"
             if lat is None or lng is None:
                 coordinate_source = "missing"
-                coords = _geocode_zip(address.get("zip_code"))
-                if coords is not None:
-                    lat, lng = coords
-                    coordinate_source = "zip_centroid"
+                # ZIP centers are rejected by the routing guard. Keep the
+                # full address for approved facility/Census matching instead
+                # of reading or downloading ZIP data on the event loop.
             stops.append(
                 {
                     "id": _clean(raw.get("id")) or str(index),
